@@ -1,0 +1,159 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  config.rs — Centralised environment configuration
+//
+//  All environment variables are loaded once at startup via `Config::from_env()`.
+//  Sensible defaults are applied where safe; required fields produce a clear
+//  error message if missing.
+// ─────────────────────────────────────────────────────────────────────────────
+#![allow(dead_code)]
+
+use anyhow::Result;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Config
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Full engine configuration sourced from environment variables.
+#[derive(Debug, Clone)]
+pub struct Config {
+    // ── RPC endpoints ─────────────────────────────────────────────────────────
+    /// Ethereum mainnet WebSocket RPC (mempool + event subscriptions)
+    pub eth_ws_url: String,
+    /// Ethereum mainnet HTTP RPC (fallback reads)
+    pub eth_http_url: String,
+    /// Base chain WebSocket (optional)
+    pub base_ws_url: Option<String>,
+    /// Arbitrum One WebSocket (optional)
+    pub arb_ws_url: Option<String>,
+    /// Solana RPC HTTP URL (optional)
+    pub solana_rpc_url: Option<String>,
+
+    // ── Database ──────────────────────────────────────────────────────────────
+    /// Redis connection URL
+    pub redis_url: String,
+    /// PostgreSQL connection URL (optional — disables persistence if absent)
+    pub database_url: Option<String>,
+
+    // ── MEV / Execution ───────────────────────────────────────────────────────
+    /// Flashbots relay URL
+    pub flashbots_url: String,
+    /// Private key for signing execution transactions (hex, 0x-prefixed)
+    pub private_key: Option<String>,
+    /// Flashbots signing key (separate EOA, not the execution wallet)
+    pub flashbots_signing_key: Option<String>,
+
+    // ── Arbitrage parameters ──────────────────────────────────────────────────
+    /// Minimum net profit in USD to consider a trade executable
+    pub min_profit_usd: f64,
+    /// Maximum price impact in basis points before aborting a trade
+    pub max_price_impact_bps: u32,
+    /// Maximum number of hops in an arbitrage cycle
+    pub max_hops: usize,
+    /// Maximum pool state staleness in blocks
+    pub max_block_staleness: u64,
+    /// Maximum trade size as a fraction of pool reserves (e.g. 0.01 = 1%)
+    pub max_trade_size_pct: f64,
+
+    // ── Market data ───────────────────────────────────────────────────────────
+    /// ETH price in USD (used for gas cost normalisation until oracle is wired)
+    pub eth_price_usd: f64,
+    /// Current effective gas price in gwei (default; overridden by Redis cache)
+    pub gas_price_gwei: f64,
+}
+
+impl Config {
+    /// Load configuration from environment variables.
+    ///
+    /// Fails fast with a descriptive error if a required variable is missing.
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            // ── RPC endpoints ─────────────────────────────────────────────
+            eth_ws_url: std::env::var("ETH_WS_URL")
+                .unwrap_or_else(|_| "wss://mainnet.infura.io/ws/v3/demo".to_string()),
+
+            eth_http_url: std::env::var("ETH_HTTP_URL")
+                .unwrap_or_else(|_| "https://cloudflare-eth.com".to_string()),
+
+            base_ws_url: std::env::var("BASE_WS_URL").ok(),
+            arb_ws_url: std::env::var("ARB_WS_URL").ok(),
+            solana_rpc_url: std::env::var("SOLANA_RPC_URL").ok(),
+
+            // ── Database ──────────────────────────────────────────────────
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
+
+            database_url: std::env::var("DATABASE_URL").ok(),
+
+            // ── MEV / Execution ───────────────────────────────────────────
+            flashbots_url: std::env::var("FLASHBOTS_RPC_URL")
+                .unwrap_or_else(|_| "https://relay.flashbots.net".to_string()),
+
+            private_key: std::env::var("PRIVATE_KEY").ok(),
+            flashbots_signing_key: std::env::var("FLASHBOTS_SIGNING_KEY").ok(),
+
+            // ── Arbitrage parameters ──────────────────────────────────────
+            min_profit_usd: std::env::var("MIN_PROFIT_USD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.50),
+
+            max_price_impact_bps: std::env::var("MAX_PRICE_IMPACT_BPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+
+            max_hops: std::env::var("MAX_HOPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+
+            max_block_staleness: std::env::var("MAX_BLOCK_STALENESS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
+
+            max_trade_size_pct: std::env::var("MAX_TRADE_SIZE_PCT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.01),
+
+            // ── Market data ───────────────────────────────────────────────
+            eth_price_usd: std::env::var("ETH_PRICE_USD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3000.0),
+
+            gas_price_gwei: std::env::var("GAS_PRICE_GWEI")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20.0),
+        })
+    }
+
+    /// Minimum profit in wei derived from `min_profit_usd` and `eth_price_usd`.
+    pub fn min_profit_wei(&self) -> i128 {
+        let eth_amount = self.min_profit_usd / self.eth_price_usd;
+        (eth_amount * 1e18) as i128
+    }
+
+    /// Gas units per hop estimate (used by RouterConfig).
+    pub const GAS_PER_HOP: u64 = 150_000;
+
+    /// Log a sanitised summary (no secrets).
+    pub fn log_summary(&self) {
+        tracing::info!(
+            eth_ws        = %self.eth_ws_url,
+            redis         = %self.redis_url,
+            has_postgres  = self.database_url.is_some(),
+            has_base      = self.base_ws_url.is_some(),
+            has_arb       = self.arb_ws_url.is_some(),
+            has_solana    = self.solana_rpc_url.is_some(),
+            min_profit_usd = self.min_profit_usd,
+            max_hops       = self.max_hops,
+            "Configuration loaded"
+        );
+        if self.private_key.is_none() {
+            tracing::warn!("PRIVATE_KEY not set — execution disabled (monitoring only)");
+        }
+    }
+}

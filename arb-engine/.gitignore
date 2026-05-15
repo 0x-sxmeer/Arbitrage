@@ -1,0 +1,31 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  .gitignore for arb-engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Rust build artifacts
+/target/
+engine/target/
+**/*.rs.bk
+
+# Environment — NEVER commit private keys or API keys
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/settings.json
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Foundry / Solidity
+contracts/evm/out/
+contracts/evm/cache/
+contracts/evm/broadcast/
+
+# Logs
+*.log
+logs/
