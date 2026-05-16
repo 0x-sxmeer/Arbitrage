@@ -12,7 +12,7 @@
 
 use anyhow::{bail, Context, Result};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect, RootProvider};
-use alloy::transports::ws::WsTransport;
+use alloy::pubsub::PubSubFrontend;
 use alloy::primitives::{Address, Bytes, U256 as AlloyU256};
 use alloy::rpc::types::TransactionRequest;
 use std::str::FromStr;
@@ -46,7 +46,7 @@ pub struct EvmConfig {
 pub struct EvmAdapter {
     config: EvmConfig,
     /// WebSocket provider for real-time operations (lazy-initialized)
-    ws_provider: tokio::sync::RwLock<Option<RootProvider<WsTransport>>>,
+    ws_provider: tokio::sync::RwLock<Option<RootProvider<PubSubFrontend>>>,
     /// Tracks the last observed block number
     last_block: std::sync::atomic::AtomicU64,
 }
@@ -67,7 +67,7 @@ impl EvmAdapter {
     }
 
     /// Ensure the WebSocket provider is connected. Returns a clone of the provider.
-    async fn get_or_connect_ws(&self) -> Result<RootProvider<WsTransport>> {
+    async fn get_or_connect_ws(&self) -> Result<RootProvider<PubSubFrontend>> {
         // Check if we already have a connection
         {
             let guard = self.ws_provider.read().await;
@@ -141,7 +141,7 @@ impl EvmAdapter {
     /// Fetch V2 pool reserves via `getReserves()` using a live provider.
     async fn fetch_v2_state_live(
         &self,
-        provider: &RootProvider<WsTransport>,
+        provider: &RootProvider<PubSubFrontend>,
         pool: &Pool,
     ) -> Result<PoolState> {
         let pool_addr = Address::from_str(&pool.id)
@@ -192,7 +192,7 @@ impl EvmAdapter {
     /// Fetch V3 pool state via `slot0()` + `liquidity()` using a live provider.
     async fn fetch_v3_state_live(
         &self,
-        provider: &RootProvider<WsTransport>,
+        provider: &RootProvider<PubSubFrontend>,
         pool: &Pool,
     ) -> Result<PoolState> {
         let pool_addr = Address::from_str(&pool.id)
@@ -306,7 +306,7 @@ impl EvmAdapter {
     }
 
     /// Get the WebSocket provider for external use (e.g., mempool subscription).
-    pub async fn get_provider(&self) -> Result<RootProvider<WsTransport>> {
+    pub async fn get_provider(&self) -> Result<RootProvider<PubSubFrontend>> {
         self.get_or_connect_ws().await
     }
 

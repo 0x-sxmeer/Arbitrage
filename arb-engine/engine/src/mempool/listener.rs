@@ -133,8 +133,8 @@ impl MempoolListener {
             Err(e) => warn!("Could not fetch block number: {}", e),
         }
 
-        // ── Subscribe to full pending transactions ────────────────────────────
-        let sub = provider.subscribe_full_pending_transactions()
+        // ── Subscribe to pending transaction hashes ────────────────────────────
+        let sub = provider.subscribe_pending_transactions()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to subscribe to pending txs: {}", e))?;
 
@@ -143,7 +143,13 @@ impl MempoolListener {
 
         info!("🚀 Real-time mempool stream active — listening for pending transactions");
 
-        while let Some(tx) = stream.next().await {
+        while let Some(raw_hash) = stream.next().await {
+            // Alchemy only sends the hash, so we instantly fetch the full transaction data
+            let tx = match provider.get_transaction_by_hash(raw_hash).await {
+                Ok(Some(t)) => t,
+                _ => continue, // Skip if the tx was already mined or dropped
+            };
+
             tx_count += 1;
             self.metrics.inc_txs_seen();
 
