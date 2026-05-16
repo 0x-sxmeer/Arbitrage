@@ -13,10 +13,10 @@
 use anyhow::{bail, Context, Result};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect, RootProvider};
 use alloy::pubsub::PubSubFrontend;
-use alloy::primitives::{Address, Bytes, U256 as AlloyU256};
+use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::TransactionRequest;
 use std::str::FromStr;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 
 use crate::pool::{ChainId, Pool, PoolState, PoolType, U256};
 
@@ -328,14 +328,55 @@ impl EvmAdapter {
             relay      = %relay,
             num_txs    = bundle_txs.len(),
             target_block = target_block,
-            "📦 Submitting Flashbots bundle (simulation — no real tx sent)"
+            "📦 Submitting Flashbots bundle via eth_sendBundle"
         );
 
-        // Simulate bundle ID
-        let bundle_hash = format!("0x{:064x}", target_block);
-        info!(bundle_hash = %bundle_hash, "✓ Bundle submitted (simulated)");
+        let hex_txs: Vec<String> = bundle_txs.iter()
+            .map(|tx| format!("0x{}", hex::encode(tx)))
+            .collect();
 
-        Ok(bundle_hash)
+        let block_hex = format!("0x{:x}", target_block);
+        
+        let params = serde_json::json!([{
+            "txs": hex_txs,
+            "blockNumber": block_hex,
+        }]);
+
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendBundle",
+            "params": params
+        });
+
+        let payload_string = serde_json::to_string(&payload)?;
+        
+        // Generate a random signer for the Flashbots reputation identity
+        // In production, this should be a stable key loaded from config
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let body_hash = alloy::primitives::keccak256(payload_string.as_bytes());
+        let signature = alloy::signers::Signer::sign_message(&signer, body_hash.as_slice()).await?;
+        let header_value = format!("{}:{}", signer.address(), hex::encode(signature.as_bytes()));
+
+        let client = reqwest::Client::new();
+        let res = client.post(relay)
+            .header("Content-Type", "application/json")
+            .header("X-Flashbots-Signature", header_value)
+            .body(payload_string)
+            .send()
+            .await
+            .context("Failed to send Flashbots request")?;
+
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        
+        if !status.is_success() {
+            bail!("Flashbots submission failed with status {}: {}", status, text);
+        }
+
+        info!(response = %text, "✓ Bundle submitted successfully");
+
+        Ok(text)
     }
 }
 

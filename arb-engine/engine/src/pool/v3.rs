@@ -231,3 +231,61 @@ mod tests {
         assert!((fee_factor - 0.997).abs() < 0.0001, "fee_factor = {}", fee_factor);
     }
 }
+
+impl Pool {
+    /// Simulates how the reserves and price change after a pending transaction
+    /// using strict integer math to prevent precision drift.
+    pub fn simulate_swap(&mut self, token_in: String, amount_in: U256) {
+        if self.pool_type != crate::pool::PoolType::ConcentratedLiquidity {
+            return;
+        }
+        
+        let zero_for_one = token_in.to_lowercase() == self.token_a.address.to_lowercase();
+        
+        if let (Some(sqrt_price_x96), Some(liquidity)) = (self.state.sqrt_price_x96, self.state.liquidity) {
+            if liquidity == 0 { return; }
+            if amount_in.is_zero() { return; }
+
+            // fee is in bps (e.g., 30 for 0.3%)
+            let fee_bps = U256::from(self.fee_bps);
+            let denominator = U256::from(crate::pool::FEE_DENOMINATOR);
+            
+            // amount_in_after_fee = amount_in * (10000 - fee_bps) / 10000
+            let amount_in_after_fee = amount_in
+                .saturating_mul(denominator.saturating_sub(fee_bps))
+                / denominator;
+
+            let liq = U256::from(liquidity);
+
+            let new_sqrt_price_x96 = if zero_for_one {
+                // Selling token0 for token1 (price drops)
+                // sqrt_P_new = (L * 2^96 * sqrt_P) / (L * 2^96 + amount_in * sqrt_P)
+                let num1 = liq << 96;
+                // We use checked_mul to prevent overflow on very large trades.
+                // If it overflows, we can fallback to the equivalent alternative formula:
+                // sqrt_P_new = (L * 2^96) / ((L * 2^96 / sqrt_P) + amount_in)
+                match amount_in_after_fee.checked_mul(sqrt_price_x96) {
+                    Some(product) => {
+                        let denom = num1.saturating_add(product);
+                        if denom.is_zero() { return; }
+                        (num1.saturating_mul(sqrt_price_x96)) / denom
+                    }
+                    None => {
+                        let num1_div_p = num1 / sqrt_price_x96;
+                        let denom = num1_div_p.saturating_add(amount_in_after_fee);
+                        if denom.is_zero() { return; }
+                        num1 / denom
+                    }
+                }
+            } else {
+                // Selling token1 for token0 (price rises)
+                // sqrt_P_new = sqrt_P + (amount_in * 2^96) / L
+                let quotient = (amount_in_after_fee << 96) / liq;
+                sqrt_price_x96.saturating_add(quotient)
+            };
+
+            self.state.sqrt_price_x96 = Some(new_sqrt_price_x96);
+            self.state.tick = Some(sqrt_price_x96_to_tick(new_sqrt_price_x96));
+        }
+    }
+}

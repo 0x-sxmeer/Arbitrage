@@ -23,11 +23,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use alloy::rpc::types::Transaction;
 use futures_util::StreamExt;
-use anyhow::Result;
+use anyhow::{Result, Context};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+
+use alloy::sol;
+
+sol! {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
+/// Decodes the calldata of a pending Uniswap V3 swap
+pub fn decode_v3_swap(input_data: &[u8]) -> Result<ExactInputSingleParams> {
+    use alloy::sol_types::SolCall;
+    let decoded = exactInputSingleCall::abi_decode(input_data, false)
+        .context("Failed to decode exactInputSingle calldata")?;
+        
+    Ok(decoded.params)
+}
 use tracing::{debug, error, info, warn};
 
 use crate::arb::opportunity::ArbitrageOpportunity;
@@ -53,6 +78,7 @@ const METRICS_LOG_INTERVAL: u64 = 100;
 
 pub struct MempoolListener {
     ws_url:        String,
+    solana_ws_url: Option<String>,
     redis_cache:   Arc<RedisCache>,
     /// Shared liquidity graph — updated on every detected swap
     graph:         Arc<RwLock<LiquidityGraph>>,
@@ -68,6 +94,7 @@ pub struct MempoolListener {
 impl MempoolListener {
     pub fn new(
         ws_url: impl Into<String>,
+        solana_ws_url: Option<String>,
         redis_cache: Arc<RedisCache>,
         graph: Arc<RwLock<LiquidityGraph>>,
         router_config: RouterConfig,
@@ -77,6 +104,7 @@ impl MempoolListener {
     ) -> Self {
         Self {
             ws_url: ws_url.into(),
+            solana_ws_url,
             redis_cache,
             graph,
             router_config,
@@ -88,6 +116,30 @@ impl MempoolListener {
 
     /// Run forever — subscribes to pending txs, reconnects on failure.
     pub async fn run(&self) -> Result<()> {
+        let evm_task = self.run_evm_stream();
+        
+        let solana_task = async {
+            if let Some(ref url) = self.solana_ws_url {
+                info!(url = %url, "🚀 Starting Solana mempool stream (Cross-Chain Phase 2 placeholder)");
+                // In Phase 2: connect tokio-tungstenite and subscribe to logsSubscribe or programSubscribe
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    debug!("Solana stream placeholder heartbeat");
+                }
+            } else {
+                // Keep task alive but do nothing
+                std::future::pending::<()>().await;
+            }
+        };
+
+        tokio::select! {
+            res = evm_task => res,
+            _ = solana_task => Ok(()),
+        }
+    }
+
+    /// Internal EVM stream loop
+    async fn run_evm_stream(&self) -> Result<()> {
         let mut reconnect_delay = INITIAL_RECONNECT_MS;
 
         loop {
@@ -234,8 +286,51 @@ impl MempoolListener {
         }
 
         self.metrics.inc_txs_filtered();
+        if input.len() < 4 { return; }
 
-        // Decode calldata
+        let selector = format!("0x{}", hex::encode(&input[..4]));
+
+        if selector == "0x414bf389" { // EXACT_INPUT_SINGLE_SELECTOR
+            // 1. Decode the Calldata
+            let params = match decode_v3_swap(input) {
+                Ok(p) => {
+                    self.metrics.inc_txs_decoded();
+                    p
+                }
+                Err(e) => {
+                    debug!("Calldata decode failed for {}: {}", tx_hash, e);
+                    return;
+                }
+            };
+
+            let token_in = params.tokenIn.to_string();
+            let token_out = params.tokenOut.to_string();
+            let fee_u32 = params.fee.to_string().parse::<u32>().unwrap();
+            let fee_bps = fee_tier_to_bps(fee_u32);
+            let amount_in_u256 = U256::from_dec_str(&params.amountIn.to_string()).unwrap_or_default();
+
+            info!(
+                tx_hash   = %tx_hash,
+                token_in  = %token_in,
+                token_out = %token_out,
+                fee_tier  = fee_u32,
+                amount_in = %params.amountIn,
+                gas_gwei  = gas_price_gwei,
+                "🔍 Detected pending exactInputSingle swap"
+            );
+
+            self.evaluate_arb_opportunity(
+                &token_in,
+                &token_out,
+                fee_bps,
+                gas_price_gwei,
+                amount_in_u256,
+            )
+            .await;
+            return;
+        }
+
+        // Decode calldata (fallback for ExactInput multi-hop)
         let decoded = match calldata_decoder::decode_calldata(input) {
             Ok(d) => {
                 self.metrics.inc_txs_decoded();
@@ -248,27 +343,7 @@ impl MempoolListener {
         };
 
         match decoded {
-            DecodedCall::ExactInputSingle(params) => {
-                info!(
-                    tx_hash   = %tx_hash,
-                    token_in  = %params.token_in,
-                    token_out = %params.token_out,
-                    fee_tier  = params.fee,
-                    amount_in = params.amount_in,
-                    gas_gwei  = gas_price_gwei,
-                    "🔍 Detected pending exactInputSingle swap"
-                );
-
-                let fee_bps = fee_tier_to_bps(params.fee);
-
-                self.evaluate_arb_opportunity(
-                    &params.token_in,
-                    &params.token_out,
-                    fee_bps,
-                    gas_price_gwei,
-                )
-                .await;
-            }
+            DecodedCall::ExactInputSingle(_) => {} // Handled above
 
             DecodedCall::ExactInput(params) => {
                 let route: Vec<String> = params
@@ -296,6 +371,7 @@ impl MempoolListener {
                         &last.token_out,
                         fee_bps,
                         gas_price_gwei,
+                        U256::from(params.amount_in),
                     )
                     .await;
                 }
@@ -326,6 +402,7 @@ impl MempoolListener {
         token_out: &str,
         fee_bps: u32,
         gas_gwei: f64,
+        amount_in: U256,
     ) {
         let pool_cache_key = format!("pool:ethereum:{}:{}:{}", token_in, token_out, fee_bps);
 
@@ -357,7 +434,7 @@ impl MempoolListener {
         };
 
         // ── Step 2: Use cached pool, fetch from chain, or build placeholder ──
-        let pool = match cached_pool {
+        let mut pool = match cached_pool {
             Some(p) => p,
             None => {
                 // Try on-chain fetch via EVM adapter if available
@@ -396,6 +473,9 @@ impl MempoolListener {
                 }
             }
         };
+
+        // 3. Simulate the post-swap state
+        pool.simulate_swap(token_in.to_string(), amount_in);
 
         // ── Step 3: Upsert pool into LiquidityGraph ───────────────────────────
         {

@@ -168,6 +168,7 @@ async fn main() {
 
     let listener = MempoolListener::new(
         config.eth_ws_url.clone(),
+        config.solana_rpc_url.clone(),
         redis_cache.clone(),
         graph.clone(),
         router_config,

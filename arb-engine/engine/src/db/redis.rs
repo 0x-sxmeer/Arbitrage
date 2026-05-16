@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::pool::{ChainId, Pool};
 
