@@ -157,6 +157,118 @@ impl LiquidityGraph {
         let rate = amount_out.low_u128() as f64 / amount_in.low_u128() as f64;
         if rate <= 0.0 { None } else { Some(rate) }
     }
+
+    /// Basic 2-hop (Triangular/Cyclic) arbitrage finder required for Phase 1 completion
+    pub fn find_opportunities(&self, start_token: &str, config: &RouterConfig) -> Vec<ArbitrageOpportunity> {
+        let mut opportunities = Vec::new();
+
+        // Get all pools connected to our start token (e.g., WETH)
+        // Since we store pools globally, we iterate through edges starting from start_token
+        let first_hops: Vec<&LiquidityEdge> = self.edges.iter()
+            .filter(|e| e.token_in == start_token)
+            .collect();
+
+        for edge_1 in first_hops {
+            let intermediate_token = &edge_1.token_out;
+
+            // Find a way back to the start token
+            let second_hops: Vec<&LiquidityEdge> = self.edges.iter()
+                .filter(|e| e.token_in == *intermediate_token && e.token_out == start_token)
+                .collect();
+
+            for edge_2 in second_hops {
+                if edge_1.pool.id != edge_2.pool.id {
+                    let opt = self.evaluate_route(start_token, intermediate_token, &edge_1.pool, &edge_2.pool, config);
+                    if let Some(mut arb) = opt {
+                        arb.calculate_nev(config.eth_price_usd);
+                        if arb.is_executable {
+                            opportunities.push(arb);
+                        }
+                    }
+                }
+            }
+        }
+        opportunities
+    }
+
+    fn evaluate_route(
+        &self,
+        start_token: &str,
+        intermediate_token: &str,
+        pool1: &Pool,
+        pool2: &Pool,
+        config: &RouterConfig
+    ) -> Option<ArbitrageOpportunity> {
+        let input = config.reference_amount;
+        
+        let zero_for_one_1 = start_token == pool1.token_a.address;
+        let amount_out_1 = match pool1.pool_type {
+            PoolType::ConstantProduct => v2::get_amount_out(pool1, input, zero_for_one_1).ok()?,
+            PoolType::ConcentratedLiquidity => v3::get_amount_out_v3(pool1, input, zero_for_one_1).ok()?,
+            PoolType::StableSwap => v2::get_amount_out(pool1, input, zero_for_one_1).ok()?,
+        };
+        
+        let impact_1 = match pool1.pool_type {
+            PoolType::ConstantProduct => v2::price_impact_bps(pool1, input, zero_for_one_1),
+            PoolType::ConcentratedLiquidity => v3::price_impact_bps_v3(pool1, input, zero_for_one_1),
+            PoolType::StableSwap => v2::price_impact_bps(pool1, input, zero_for_one_1),
+        };
+        let fee_1 = input * U256::from(pool1.fee_bps) / U256::from(10_000u32);
+
+        let zero_for_one_2 = intermediate_token == pool2.token_a.address;
+        let amount_out_2 = match pool2.pool_type {
+            PoolType::ConstantProduct => v2::get_amount_out(pool2, amount_out_1, zero_for_one_2).ok()?,
+            PoolType::ConcentratedLiquidity => v3::get_amount_out_v3(pool2, amount_out_1, zero_for_one_2).ok()?,
+            PoolType::StableSwap => v2::get_amount_out(pool2, amount_out_1, zero_for_one_2).ok()?,
+        };
+
+        let impact_2 = match pool2.pool_type {
+            PoolType::ConstantProduct => v2::price_impact_bps(pool2, amount_out_1, zero_for_one_2),
+            PoolType::ConcentratedLiquidity => v3::price_impact_bps_v3(pool2, amount_out_1, zero_for_one_2),
+            PoolType::StableSwap => v2::price_impact_bps(pool2, amount_out_1, zero_for_one_2),
+        };
+        let fee_2 = amount_out_1 * U256::from(pool2.fee_bps) / U256::from(10_000u32);
+
+        let step1 = SwapStep {
+            pool_id: pool1.id.clone(),
+            dex: pool1.dex.name().to_string(),
+            chain: pool1.chain,
+            token_in: start_token.to_string(),
+            token_out: intermediate_token.to_string(),
+            amount_in: input,
+            expected_amount_out: amount_out_1,
+            fee_bps: pool1.fee_bps,
+            step_price_impact_bps: impact_1,
+        };
+
+        let step2 = SwapStep {
+            pool_id: pool2.id.clone(),
+            dex: pool2.dex.name().to_string(),
+            chain: pool2.chain,
+            token_in: intermediate_token.to_string(),
+            token_out: start_token.to_string(),
+            amount_in: amount_out_1,
+            expected_amount_out: amount_out_2,
+            fee_bps: pool2.fee_bps,
+            step_price_impact_bps: impact_2,
+        };
+        
+        let total_fees = fee_1 + fee_2;
+        let max_impact = impact_1.max(impact_2);
+
+        Some(ArbitrageOpportunity::new(
+            vec![step1, step2],
+            start_token.to_string(),
+            pool1.chain,
+            input,
+            amount_out_2,
+            config.gas_per_hop * 2,
+            config.gas_price_gwei,
+            total_fees,
+            max_impact,
+            0,
+        ))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

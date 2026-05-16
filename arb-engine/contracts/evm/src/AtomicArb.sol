@@ -236,7 +236,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
         uint256 netProfit = finalAmount - repayAmount;
 
         // ── Step 4: Repay Aave flash loan ─────────────────────────────────────
-        IERC20(asset).safeApprove(address(aavePool), repayAmount);
+        IERC20(asset).forceApprove(address(aavePool), repayAmount);
 
         // ── Step 5: Update accounting ─────────────────────────────────────────
         totalProfitAccumulated += netProfit;
@@ -268,7 +268,8 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
         uint256 amountIn,
         uint256 amountOutMin
     ) internal returns (uint256 amountOut) {
-        IERC20(tokenIn).safeApprove(router, amountIn);
+        // FIX: Use forceApprove instead of safeApprove for OpenZeppelin v5 compatibility
+        IERC20(tokenIn).forceApprove(router, amountIn);
 
         if (isV3) {
             IUniswapV3Router.ExactInputSingleParams memory v3Params =
@@ -295,7 +296,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
         }
 
         // Clear approval (security: never leave dangling approvals)
-        IERC20(tokenIn).safeApprove(router, 0);
+        IERC20(tokenIn).forceApprove(router, 0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
