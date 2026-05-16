@@ -2,21 +2,21 @@
 pragma solidity ^0.8.20;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AtomicArb.sol — Flash-loan-powered atomic arbitrage contract
+//  AtomicArb.sol - Flash-loan-powered atomic arbitrage contract
 //
 //  Strategy:
 //    1. Borrow tokens via Aave V3 flash loan (0.05% fee)
 //    2. Swap token on DEX A (buy leg)
 //    3. Swap token on DEX B (sell leg)
 //    4. Repay flash loan + fee
-//    5. Send profit to owner — or REVERT the entire transaction if not profitable
+//    5. Send profit to owner - or REVERT the entire transaction if not profitable
 //
 //  Security properties:
-//    ✓ Zero loss guarantee — if any step fails, entire tx reverts
-//    ✓ Owner-only execution — no unauthorized arb
-//    ✓ Circuit breaker — pause execution if drawdown > 5% in 1 hour
-//    ✓ Slippage guard — reverts if output < minOutputAmount
-//    ✓ Reentrancy guard — protects executeOperation callback
+//    ✓ Zero loss guarantee - if any step fails, entire tx reverts
+//    ✓ Owner-only execution - no unauthorized arb
+//    ✓ Circuit breaker - pause execution if drawdown > 5% in 1 hour
+//    ✓ Slippage guard - reverts if output < minOutputAmount
+//    ✓ Reentrancy guard - protects executeOperation callback
 //
 //  Deployment:
 //    Ethereum / Base / Arbitrum (all EVM chains with Aave V3)
@@ -79,7 +79,7 @@ interface IUniswapV3Router {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ArbParams — calldata passed to flash loan callback
+//  ArbParams - calldata passed to flash loan callback
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct ArbParams {
@@ -141,7 +141,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
 
     // ── Constructor ────────────────────────────────────────────────────────────
 
-    constructor(address _aavePool, uint256 _maxDrawdownPerHour) Ownable(msg.sender) {
+    constructor(address _aavePool, uint256 _maxDrawdownPerHour)  {
         aavePool = IPool(_aavePool);
         maxDrawdownPerHour = _maxDrawdownPerHour;
         drawdownWindowStart = block.timestamp;
@@ -166,7 +166,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
     ) external onlyOwner whenNotPaused nonReentrant {
         require(borrowAmount > 0, "AtomicArb: borrowAmount must be > 0");
 
-        // Initiate flash loan — Aave calls back executeOperation()
+        // Initiate flash loan - Aave calls back executeOperation()
         aavePool.flashLoanSimple(
             address(this),  // receiver
             asset,
@@ -185,7 +185,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
      * @dev Executes buy → sell and repays. REVERTS if not profitable.
      *
      * All funds must be returned (amount + premium) before this function returns,
-     * or Aave reverts the entire transaction — our zero-loss guarantee.
+     * or Aave reverts the entire transaction - our zero-loss guarantee.
      */
     function executeOperation(
         address asset,
@@ -201,7 +201,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
         ArbParams memory arb = abi.decode(params, (ArbParams));
         uint256 repayAmount = amount + premium;
 
-        // ── Step 1: Buy leg — swap tokenBorrow → tokenIntermediate ───────────
+        // ── Step 1: Buy leg - swap tokenBorrow → tokenIntermediate ───────────
         uint256 intermediateAmount = _swap(
             arb.buyRouter,
             arb.buyIsV3,
@@ -215,7 +215,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
 
         require(intermediateAmount > 0, "AtomicArb: buy leg produced zero output");
 
-        // ── Step 2: Sell leg — swap tokenIntermediate → tokenBorrow ──────────
+        // ── Step 2: Sell leg - swap tokenIntermediate → tokenBorrow ──────────
         uint256 finalAmount = _swap(
             arb.sellRouter,
             arb.sellIsV3,
@@ -227,10 +227,10 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
             repayAmount // amountOutMin = repay amount (must at least break even)
         );
 
-        // ── Step 3: Profit check — revert if not profitable ───────────────────
+        // ── Step 3: Profit check - revert if not profitable ───────────────────
         require(
             finalAmount >= repayAmount + arb.minProfitWei,
-            "AtomicArb: insufficient profit — transaction reverted"
+            "AtomicArb: insufficient profit - transaction reverted"
         );
 
         uint256 netProfit = finalAmount - repayAmount;

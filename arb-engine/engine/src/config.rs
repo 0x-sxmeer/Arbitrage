@@ -41,6 +41,8 @@ pub struct Config {
     pub private_key: Option<String>,
     /// Flashbots signing key (separate EOA, not the execution wallet)
     pub flashbots_signing_key: Option<String>,
+    /// Address of deployed AtomicArb contract
+    pub contract_address: Option<String>,
 
     // ── Arbitrage parameters ──────────────────────────────────────────────────
     /// Minimum net profit in USD to consider a trade executable
@@ -90,6 +92,7 @@ impl Config {
 
             private_key: std::env::var("PRIVATE_KEY").ok(),
             flashbots_signing_key: std::env::var("FLASHBOTS_SIGNING_KEY").ok(),
+            contract_address: std::env::var("CONTRACT_ADDRESS").ok(),
 
             // ── Arbitrage parameters ──────────────────────────────────────
             min_profit_usd: std::env::var("MIN_PROFIT_USD")
@@ -143,10 +146,10 @@ impl Config {
     pub fn log_summary(&self) {
         tracing::info!(
             eth_ws        = %self.eth_ws_url,
+            eth_http      = %self.eth_http_url,
             redis         = %self.redis_url,
             has_postgres  = self.database_url.is_some(),
-            has_base      = self.base_ws_url.is_some(),
-            has_arb       = self.arb_ws_url.is_some(),
+            contract      = ?self.contract_address,
             has_solana    = self.solana_rpc_url.is_some(),
             min_profit_usd = self.min_profit_usd,
             max_hops       = self.max_hops,

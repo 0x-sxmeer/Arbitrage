@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use futures_util::StreamExt;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
@@ -35,7 +35,7 @@ use crate::arb::router::{find_arbitrage_cycles, LiquidityGraph, RouterConfig};
 use crate::chains::evm::EvmAdapter;
 use crate::db::postgres::PostgresStore;
 use crate::db::redis::RedisCache;
-use crate::mempool::calldata_decoder::{self, is_uniswap_router, decode_uniswap_v3_swap};
+use crate::mempool::calldata_decoder::{is_uniswap_router, decode_uniswap_v3_swap};
 use crate::metrics::EngineMetrics;
 use crate::pool::{fee_tier_to_bps, ChainId, DexProtocol, Pool, PoolState, PoolType, Token, U256};
 
@@ -152,7 +152,12 @@ impl MempoolListener {
             .map_err(|e| anyhow::anyhow!("WebSocket connection failed: {}", e))?;
 
         info!("✓ WebSocket connected. Subscribing to pending transactions...");
-        info!("🔎 Watching Uniswap V3 router addresses");
+        info!(
+            router_v1 = %crate::mempool::calldata_decoder::UNISWAP_V3_ROUTER_V1,
+            router_v2 = %crate::mempool::calldata_decoder::UNISWAP_V3_ROUTER_V2,
+            universal = %crate::mempool::calldata_decoder::UNISWAP_UNIVERSAL_ROUTER,
+            "🔎 Watching Uniswap V3 router addresses"
+        );
 
         // Fetch and log current block
         match provider.get_block_number().await {
@@ -399,7 +404,7 @@ impl MempoolListener {
 
         self.metrics.inc_router_scans();
 
-        let mut opportunities: Vec<ArbitrageOpportunity> = {
+        let opportunities: Vec<ArbitrageOpportunity> = {
             let graph = self.graph.read().await;
             
             // Assuming WETH as the start token for our flash loan
@@ -474,8 +479,24 @@ impl MempoolListener {
                 "📦 EXECUTABLE ARB FOUND! Initiating execution pipeline."
             );
             
+            // Trigger the flash loan on the local Anvil fork
             if let Some(ref adapter) = self.evm_adapter {
-                let _ = adapter.submit_flashbots_bundle(vec![vec![0x00]], adapter.current_block() + 1).await;
+                // We spawn this so it doesn't block the mempool stream!
+                let adapter_clone = adapter.clone();
+                let arb_clone = opp.clone();
+                
+                tokio::spawn(async move {
+                    match adapter_clone.execute_arbitrage(&arb_clone).await {
+                        Ok(()) => {
+                            tracing::info!(id = %arb_clone.id, "✅ Execution task completed");
+                        }
+                        Err(e) => {
+                            tracing::error!(id = %arb_clone.id, error = %e, "❌ Execution task failed");
+                        }
+                    }
+                });
+            } else {
+                warn!("No EVM adapter configured — execution skipped (monitoring only)");
             }
         }
     }

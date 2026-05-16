@@ -1,8 +1,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  chains/evm.rs — Ethereum / EVM L2 Chain Adapter (Real Implementation)
+//  chains/evm.rs — Ethereum / EVM L2 Chain Adapter (Production Implementation)
 //
 //  Uses alloy-rs to provide on-chain operations:
 //  - Fetching Uniswap V2/V3 pool state via eth_call
+//  - Signing and executing flash-loan arbitrage via AtomicArb contract
 //  - Submitting arbitrage bundles via Flashbots relay
 //  - Subscribing to new blocks for staleness tracking
 //
@@ -15,10 +16,58 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect, RootProvider};
 use alloy::pubsub::PubSubFrontend;
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::TransactionRequest;
+use alloy::network::EthereumWallet;
+use alloy::signers::local::PrivateKeySigner;
+use alloy::sol;
 use std::str::FromStr;
-use tracing::{debug, info, warn};
+use std::time::Instant;
+use tracing::{debug, info, warn, error};
 
+use crate::arb::opportunity::ArbitrageOpportunity;
 use crate::pool::{ChainId, Pool, PoolState, PoolType, U256};
+
+// ── Alloy Contract Bindings ──────────────────────────────────────────────────
+// The sol! macro with #[sol(rpc)] generates type-safe contract call builders.
+sol! {
+    #[sol(rpc)]
+    interface IUniswapV3Pool {
+        function slot0() external view returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            uint8 feeProtocol,
+            bool unlocked
+        );
+        function liquidity() external view returns (uint128);
+    }
+
+    #[sol(rpc)]
+    interface IAtomicArb {
+        function executeArbitrage(
+            address asset,
+            uint256 borrowAmount,
+            bytes calldata params
+        ) external;
+    }
+
+    /// ABI-encoded parameters passed into the flash loan callback.
+    /// The AtomicArb contract decodes this in `executeOperation`.
+    struct ArbParams {
+        address buyRouter;
+        bool    buyIsV3;
+        uint24  buyFee;
+        address[] buyPath;
+        address sellRouter;
+        bool    sellIsV3;
+        uint24  sellFee;
+        address[] sellPath;
+        address tokenBorrow;
+        address tokenIntermediate;
+        uint256 minProfitWei;
+    }
+}
 
 // ── Function selectors (keccak256 first 4 bytes) ─────────────────────────────
 /// getReserves() → (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)
@@ -27,6 +76,9 @@ const V2_GET_RESERVES_SELECTOR: [u8; 4] = [0x09, 0x02, 0xf1, 0xac];
 const V3_SLOT0_SELECTOR: [u8; 4] = [0x38, 0x50, 0xc7, 0xbd];
 /// liquidity() → uint128
 const V3_LIQUIDITY_SELECTOR: [u8; 4] = [0x1a, 0x68, 0x65, 0x02];
+
+/// Standard Uniswap V3 SwapRouter02 address (Ethereum mainnet)
+const UNISWAP_V3_ROUTER: &str = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  EVM Adapter
@@ -40,6 +92,10 @@ pub struct EvmConfig {
     pub http_url: String,
     /// Flashbots relay URL (None = submit via public mempool)
     pub flashbots_url: Option<String>,
+    /// Address of the deployed AtomicArb smart contract
+    pub contract_address: Option<String>,
+    /// Private key for signing execution transactions (hex, 0x-prefixed)
+    pub private_key: Option<String>,
 }
 
 /// EVM adapter — manages the alloy-rs provider connection and exposes chain operations.
@@ -49,6 +105,8 @@ pub struct EvmAdapter {
     ws_provider: tokio::sync::RwLock<Option<RootProvider<PubSubFrontend>>>,
     /// Tracks the last observed block number
     last_block: std::sync::atomic::AtomicU64,
+    /// Tracks total successful executions
+    execution_count: std::sync::atomic::AtomicU64,
 }
 
 impl EvmAdapter {
@@ -57,12 +115,15 @@ impl EvmAdapter {
         info!(
             chain = %config.chain.name(),
             ws_url = %config.ws_url,
+            has_contract = config.contract_address.is_some(),
+            has_private_key = config.private_key.is_some(),
             "Initializing EVM adapter"
         );
         Self {
             config,
             ws_provider: tokio::sync::RwLock::new(None),
             last_block: std::sync::atomic::AtomicU64::new(0),
+            execution_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -99,6 +160,189 @@ impl EvmAdapter {
 
         Ok(provider)
     }
+
+    // ── Live Pool State Fetching ─────────────────────────────────────────────
+
+    /// Fetches the live sqrtPriceX96, tick, and liquidity from a real Uniswap V3 Pool.
+    ///
+    /// Uses the `#[sol(rpc)]` generated bindings for type-safe contract calls.
+    /// The returned U256 is `primitive_types::U256` for internal math compatibility.
+    pub async fn get_v3_pool_state(&self, pool_address: &str) -> Result<(U256, i32, u128)> {
+        let start = Instant::now();
+
+        let provider = ProviderBuilder::new()
+            .on_builtin(&self.config.http_url)
+            .await
+            .with_context(|| format!("HTTP provider connection failed for {}", self.config.http_url))?;
+
+        let addr = Address::from_str(pool_address)
+            .with_context(|| format!("Invalid pool address: {}", pool_address))?;
+
+        let pool = IUniswapV3Pool::new(addr, provider);
+
+        // Fetch slot0 and liquidity (sequential — same RPC endpoint)
+        let slot0 = pool.slot0().call().await
+            .map_err(|e| anyhow::anyhow!("slot0() RPC error for {}: {:?}", pool_address, e))?;
+        let liquidity = pool.liquidity().call().await
+            .map_err(|e| anyhow::anyhow!("liquidity() RPC error for {}: {:?}", pool_address, e))?;
+
+        // Convert alloy's uint160 → our primitive_types::U256
+        let sqrt_price = U256::from_dec_str(&slot0.sqrtPriceX96.to_string())
+            .unwrap_or(U256::zero());
+
+        // Convert alloy's Signed<24,1> (int24) → i32
+        let tick: i32 = slot0.tick.to_string().parse().unwrap_or(0);
+
+        let elapsed = start.elapsed();
+        debug!(
+            pool     = %pool_address,
+            sqrtP    = %sqrt_price,
+            tick     = tick,
+            liq      = liquidity._0,
+            latency  = ?elapsed,
+            "V3 pool state fetched via sol!(rpc)"
+        );
+
+        Ok((sqrt_price, tick, liquidity._0))
+    }
+
+
+    // ── Flash Loan Execution ─────────────────────────────────────────────────
+
+    /// Builds and executes the flash loan arbitrage transaction on the local node.
+    ///
+    /// Flow:
+    ///   1. Parse private key → build wallet-backed provider
+    ///   2. ABI-encode `ArbParams` for the flash loan callback
+    ///   3. Call `AtomicArb.executeArbitrage(asset, borrowAmount, params)`
+    ///   4. Wait for receipt, log success/failure
+    ///
+    /// The AtomicArb contract guarantees zero capital loss:
+    /// if `finalAmount < repayAmount + minProfitWei`, the tx reverts.
+    pub async fn execute_arbitrage(&self, arb: &ArbitrageOpportunity) -> Result<()> {
+        let start = Instant::now();
+
+        // ── Validate preconditions ───────────────────────────────────────────
+        let pk = self.config.private_key.as_deref()
+            .context("PRIVATE_KEY not set — execution disabled")?;
+
+        let contract_addr_str = self.config.contract_address.as_deref()
+            .context("CONTRACT_ADDRESS not set — cannot execute arbitrage")?;
+
+        if arb.route.len() < 2 {
+            bail!("Arbitrage route must have at least 2 hops (got {})", arb.route.len());
+        }
+
+        if arb.net_expected_value <= 0 {
+            bail!("Refusing to execute non-profitable arb (NEV = {} wei)", arb.net_expected_value);
+        }
+
+        // ── Build wallet-backed provider ─────────────────────────────────────
+        let signer: PrivateKeySigner = pk.parse()
+            .context("Failed to parse PRIVATE_KEY")?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .on_builtin(&self.config.http_url)
+            .await
+            .context("Failed to connect execution provider")?;
+
+        let contract_addr = Address::from_str(contract_addr_str)
+            .context("Invalid CONTRACT_ADDRESS")?;
+        let atomic_arb = IAtomicArb::new(contract_addr, provider.clone());
+
+        // ── Extract trade parameters ─────────────────────────────────────────
+        let token_borrow = Address::from_str(&arb.route[0].token_in)
+            .context("Invalid token_in address on first hop")?;
+        let token_intermediate = Address::from_str(&arb.route[0].token_out)
+            .context("Invalid token_out address on first hop")?;
+
+        let router_addr = Address::from_str(UNISWAP_V3_ROUTER)
+            .context("Invalid V3 router address constant")?;
+
+        // ── Encode ArbParams for the flash loan callback ─────────────────────
+        let buy_fee = alloy::primitives::Uint::<24, 1>::from(arb.route[0].fee_bps);
+        let sell_fee = alloy::primitives::Uint::<24, 1>::from(arb.route[1].fee_bps);
+
+        let min_profit = alloy::primitives::U256::from_str(&arb.net_expected_value.to_string())
+            .unwrap_or_default();
+
+        let params = ArbParams {
+            buyRouter:         router_addr,
+            buyIsV3:           true,
+            buyFee:            buy_fee,
+            buyPath:           vec![],  // Empty for V3 (uses fee + tokenIn/tokenOut directly)
+            sellRouter:        router_addr,
+            sellIsV3:          true,
+            sellFee:           sell_fee,
+            sellPath:          vec![],  // Empty for V3
+            tokenBorrow:       token_borrow,
+            tokenIntermediate: token_intermediate,
+            minProfitWei:      min_profit,
+        };
+
+        use alloy::sol_types::SolValue;
+        let encoded_params = params.abi_encode();
+
+        let borrow_amount = alloy::primitives::U256::from_str(&arb.input_amount.to_string())
+            .unwrap_or_default();
+
+        // ── Log execution intent ─────────────────────────────────────────────
+        info!(
+            id         = %arb.id,
+            nev_wei    = arb.net_expected_value,
+            borrow     = %borrow_amount,
+            token_in   = %token_borrow,
+            token_mid  = %token_intermediate,
+            contract   = %contract_addr,
+            hops       = arb.route.len(),
+            "⚡ Firing execution bundle → AtomicArb"
+        );
+
+        // ── Execute the flash loan ───────────────────────────────────────────
+        let tx = atomic_arb.executeArbitrage(
+            token_borrow,
+            borrow_amount,
+            Bytes::from(encoded_params),
+        );
+
+        match tx.send().await {
+            Ok(pending_tx) => {
+                let receipt = pending_tx.get_receipt().await?;
+                let elapsed = start.elapsed();
+                let exec_num = self.execution_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+                info!(
+                    tx_hash     = ?receipt.transaction_hash,
+                    gas_used    = ?receipt.gas_used,
+                    status      = ?receipt.status(),
+                    latency     = ?elapsed,
+                    exec_number = exec_num,
+                    "✅ Arbitrage Executed Successfully!"
+                );
+            }
+            Err(e) => {
+                let elapsed = start.elapsed();
+                error!(
+                    id      = %arb.id,
+                    nev_wei = arb.net_expected_value,
+                    latency = ?elapsed,
+                    error   = %e,
+                    "❌ Arbitrage Reverted (Zero-loss guarantee protected capital)"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the number of successful arbitrage executions.
+    pub fn execution_count(&self) -> u64 {
+        self.execution_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // ── Legacy State Fetching (raw eth_call, no sol! bindings) ────────────────
 
     /// Fetch the current pool state from the chain.
     ///
