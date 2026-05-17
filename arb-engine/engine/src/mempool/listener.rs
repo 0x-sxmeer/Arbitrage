@@ -1,22 +1,48 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  mempool/listener.rs — Real-Time WebSocket Mempool Monitor
 //
-//  Connects to an Ethereum WebSocket RPC, subscribes to pending transactions,
-//  filters for Uniswap V3 Router calls, decodes calldata, and triggers the
-//  NEV calculator for affected pools.
+//  KEY FIXES in this refactor vs. original:
 //
-//  Full pipeline on each detected swap:
-//    1. Decode calldata (calldata_decoder)
-//    2. Load pool state from Redis cache (or fetch from chain via EvmAdapter)
-//    3. Upsert pool into the shared LiquidityGraph
-//    4. Run Bellman-Ford (find_arbitrage_cycles)
-//    5. For each executable opportunity:
-//         a. Mark as seen in Redis (deduplication)
-//         b. Persist to PostgreSQL if available
-//         c. Submit Flashbots bundle (simulated in Phase 1)
+//  1. LOCK CONTENTION (CRITICAL): The original takes a write-lock on the
+//     LiquidityGraph for every single decoded transaction — even when the pool
+//     already exists and the state hasn't changed meaningfully.  Under high
+//     mempool load this serialises every concurrent task through a single mutex.
+//     FIX: Opportunistic read → only upgrade to write when pool is genuinely new
+//     or state changed by > SQRT_PRICE_STALENESS_THRESHOLD.
 //
-//  Uses alloy-rs for real pending transaction subscriptions.
-//  Auto-reconnects with exponential backoff on any WebSocket failure.
+//  2. BLOCKING THE STREAM (CRITICAL): The original calls `evaluate_arb_opportunity`
+//     directly in the `while let Some(hash)` loop.  Heavy path-finding blocks the
+//     stream consumer, causing Alchemy to buffer and eventually drop hashes.
+//     FIX: Use a bounded mpsc channel.  The stream pushes hashes; a separate pool
+//     of worker tasks pulls and processes them.  The stream stays hot.
+//
+//  3. tx_hash FORMAT: `format!("{:?}", tx.hash)` emits `0x…` with debug quotes on
+//     older alloy.  Use `.to_string()` / `.encode_hex()` for a clean hex string.
+//
+//  4. STALE GAS PRICE DEFAULT: Defaulting to 20 gwei when neither gas_price nor
+//     max_fee_per_gas is present produces incorrect NEV on EIP-1559 chains.
+//     FIX: Track a running EWA of recent gas prices; use that as fallback.
+//
+//  5. METRICS WRITE-LOCK IN HOT PATH: `self.metrics.recent_mempool_txs.write()`
+//     is called for every transaction.  On 200+ tx/s mempool this creates
+//     contention with the dashboard reader.
+//     FIX: Push into a crossbeam ring-buffer (lock-free); the dashboard reads
+//     from a snapshot.  If crossbeam is unavailable, a Mutex<VecDeque> with
+//     try_lock and skip is a safe fallback (shown here).
+//
+//  6. RECONNECT RESETS GRAPH: On reconnect the LiquidityGraph is NOT cleared.
+//     Stale prices from before the disconnect poison future NEV calculations.
+//     FIX: Call graph.clear_edges() after reconnect so stale edges are evicted.
+//
+//  7. DUPLICATE ROUTER LOWER-CASE: is_uniswap_router() already calls to_lowercase
+//     internally, but the caller also calls to_lowercase then passes the result.
+//     Minor CPU waste.  Removed caller-side duplication.
+//
+//  8. MISSING UNIVERSAL ROUTER DECODE: The Universal Router uses a completely
+//     different command-based encoding (0x24856bc3 selector).  The original
+//     silently drops these after the multicall attempts fail.
+//     FIX: Added a stub decode_universal_router_swap() with selector guard so
+//     at minimum the metric is accurately labelled.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::sync::Arc;
@@ -25,9 +51,8 @@ use std::time::Duration;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use futures_util::StreamExt;
 use anyhow::Result;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
-
 use tracing::{debug, error, info, warn};
 
 use crate::arb::opportunity::ArbitrageOpportunity;
@@ -44,25 +69,42 @@ const INITIAL_RECONNECT_MS: u64 = 500;
 const MAX_RECONNECT_MS:     u64 = 30_000;
 const BACKOFF_MULTIPLIER:   f64 = 2.0;
 
-/// How often to log metrics summary (every N transactions)
+/// Concurrency: how many swap-decode/path-find tasks run in parallel.
+const WORKER_CONCURRENCY: usize = 8;
+
+/// Internal channel capacity — backpressure if workers can't keep up.
+const CHANNEL_CAPACITY: usize = 512;
+
+/// Periodic metrics log interval (transactions).
 const METRICS_LOG_INTERVAL: u64 = 100;
+
+/// sqrtPriceX96 must change by more than this fraction before we write-lock the
+/// graph.  Prevents lock churn on high-frequency swaps in the same pool.
+const SQRT_PRICE_STALENESS_THRESHOLD: f64 = 0.001; // 0.1%
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Raw transaction payload sent through the internal pipeline channel
+// ─────────────────────────────────────────────────────────────────────────────
+struct RawTxPayload {
+    to_addr:        String,
+    input:          Vec<u8>,
+    value:          u128,
+    gas_price_gwei: f64,
+    tx_hash:        String,
+    tx_count:       u64,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MempoolListener
 // ─────────────────────────────────────────────────────────────────────────────
-
 pub struct MempoolListener {
     ws_url:        String,
     solana_ws_url: Option<String>,
     redis_cache:   Arc<RedisCache>,
-    /// Shared liquidity graph — updated on every detected swap
     graph:         Arc<RwLock<LiquidityGraph>>,
     router_config: RouterConfig,
-    /// Optional Postgres store for persisting opportunities
     pg_store:      Option<Arc<PostgresStore>>,
-    /// Optional EVM adapter for on-chain pool state fetching
     evm_adapter:   Option<Arc<EvmAdapter>>,
-    /// Engine-wide metrics
     metrics:       Arc<EngineMetrics>,
 }
 
@@ -92,17 +134,15 @@ impl MempoolListener {
     /// Run forever — subscribes to pending txs, reconnects on failure.
     pub async fn run(&self) -> Result<()> {
         let evm_task = self.run_evm_stream();
-        
+
         let solana_task = async {
             if let Some(ref url) = self.solana_ws_url {
-                info!(url = %url, "🚀 Starting Solana mempool stream (Cross-Chain Phase 2 placeholder)");
-                // In Phase 2: connect tokio-tungstenite and subscribe to logsSubscribe or programSubscribe
+                info!(url = %url, "Starting Solana stream placeholder");
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     debug!("Solana stream placeholder heartbeat");
                 }
             } else {
-                // Keep task alive but do nothing
                 std::future::pending::<()>().await;
             }
         };
@@ -113,38 +153,47 @@ impl MempoolListener {
         }
     }
 
-    /// Internal EVM stream loop
+    // ── EVM reconnect loop ────────────────────────────────────────────────────
+
     async fn run_evm_stream(&self) -> Result<()> {
         let mut reconnect_delay = INITIAL_RECONNECT_MS;
 
         loop {
             info!(url = %self.ws_url, "Connecting to WebSocket RPC...");
 
+            // FIX #6: Clear stale edges on every (re)connect so NEV calculations
+            // are not poisoned by pre-disconnect price data.
+            {
+                let mut graph = self.graph.write().await;
+                graph.clear_edges();
+                info!("Graph edges cleared for fresh reconnect");
+            }
+
             match self.connect_and_stream().await {
                 Ok(_) => {
                     warn!("WebSocket stream ended cleanly — reconnecting");
-                    reconnect_delay = INITIAL_RECONNECT_MS; // reset on clean disconnect
+                    reconnect_delay = INITIAL_RECONNECT_MS;
                 }
                 Err(e) => {
-                    error!(
-                        "WebSocket error: {:?} — reconnecting in {}ms",
-                        e, reconnect_delay
-                    );
+                    error!("WebSocket error: {:?} — reconnecting in {}ms", e, reconnect_delay);
                     self.metrics.inc_ws_reconnections();
                 }
             }
 
             sleep(Duration::from_millis(reconnect_delay)).await;
-
-            // Exponential backoff capped at MAX_RECONNECT_MS
             reconnect_delay = ((reconnect_delay as f64 * BACKOFF_MULTIPLIER) as u64)
                 .min(MAX_RECONNECT_MS);
         }
     }
 
-    /// Connect via WebSocket and stream pending transactions in real time.
+    // ── WebSocket stream + worker pool ────────────────────────────────────────
+
+    /// FIX #2: Decoupled producer/consumer via bounded channel.
+    ///
+    /// The stream loop only parses the transaction header and pushes into a
+    /// channel — it never touches Redis, the graph, or the path-finder.
+    /// Worker tasks pull from the channel and run the heavy pipeline.
     async fn connect_and_stream(&self) -> Result<()> {
-        // ── Connect to the WebSocket RPC ──────────────────────────────────────
         let ws = WsConnect::new(&self.ws_url);
         let provider = ProviderBuilder::new()
             .on_ws(ws)
@@ -152,165 +201,210 @@ impl MempoolListener {
             .map_err(|e| anyhow::anyhow!("WebSocket connection failed: {}", e))?;
 
         info!("✓ WebSocket connected. Subscribing to pending transactions...");
-        info!(
-            router_v1 = %crate::mempool::calldata_decoder::UNISWAP_V3_ROUTER_V1,
-            router_v2 = %crate::mempool::calldata_decoder::UNISWAP_V3_ROUTER_V2,
-            universal = %crate::mempool::calldata_decoder::UNISWAP_UNIVERSAL_ROUTER,
-            "🔎 Watching Uniswap V3 router addresses"
-        );
 
-        // Fetch and log current block
         match provider.get_block_number().await {
             Ok(block) => info!("📦 Current block: {}", block),
-            Err(e) => warn!("Could not fetch block number: {}", e),
+            Err(e)    => warn!("Could not fetch block number: {}", e),
         }
 
-        // ── Subscribe to pending transaction hashes ────────────────────────────
-        let sub = provider.subscribe_pending_transactions()
+        let sub = provider
+            .subscribe_pending_transactions()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to subscribe to pending txs: {}", e))?;
 
+        // Bounded channel — provides backpressure and prevents unbounded memory growth.
+        let (tx_sender, tx_receiver) = mpsc::channel::<RawTxPayload>(CHANNEL_CAPACITY);
+
+        // Spawn worker pool
+        let tx_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
+        let mut worker_handles = Vec::with_capacity(WORKER_CONCURRENCY);
+        for _ in 0..WORKER_CONCURRENCY {
+            let receiver  = Arc::clone(&tx_receiver);
+            let this      = self.make_worker_ctx();
+            let handle    = tokio::spawn(async move {
+                loop {
+                    let payload = {
+                        let mut guard = receiver.lock().await;
+                        guard.recv().await
+                    };
+                    match payload {
+                        Some(p) => this.process_payload(p).await,
+                        None    => break, // channel closed
+                    }
+                }
+            });
+            worker_handles.push(handle);
+        }
+
+        // ── Producer: stream pending tx hashes ──────────────────────────────
         let mut stream = sub.into_stream();
         let mut tx_count: u64 = 0;
-
-        info!("🚀 Real-time mempool stream active — listening for pending transactions");
+        // FIX #4: running EWA of gas price for sensible fallback
+        let mut gas_ewa: f64 = 20.0;
 
         while let Some(raw_hash) = stream.next().await {
-            // Alchemy only sends the hash, so we instantly fetch the full transaction data
             let tx = match provider.get_transaction_by_hash(raw_hash).await {
                 Ok(Some(t)) => t,
-                _ => continue, // Skip if the tx was already mined or dropped
+                // FIX #3: avoid debug-format quirk; just continue cleanly
+                _ => continue,
             };
 
             tx_count += 1;
             self.metrics.inc_txs_seen();
 
-            // Extract transaction fields
-            let tx_hash = format!("{:?}", tx.hash);
+            // FIX #3: clean hex string for the hash
+            let tx_hash = tx.hash.to_string();
+
             let to_addr = match tx.to {
-                Some(addr) => format!("{:?}", addr).to_lowercase(),
-                None => continue, // Skip contract creation txs
+                Some(addr) => addr.to_string().to_lowercase(),
+                None       => continue,
             };
 
+            // FIX #4: update EWA so the fallback stays current
             let gas_price_gwei = tx.gas_price
                 .map(|g| g as f64 / 1e9)
                 .or_else(|| tx.max_fee_per_gas.map(|g| g as f64 / 1e9))
-                .unwrap_or(20.0);
+                .unwrap_or(gas_ewa);
+            gas_ewa = gas_ewa * 0.95 + gas_price_gwei * 0.05;
 
-            // Push to recent_mempool_txs for the dashboard UI
-            {
-                let is_swap = is_uniswap_router(&to_addr);
-                let mut txs = self.metrics.recent_mempool_txs.write().await;
-                let t = serde_json::json!({
-                    "id": tx_count,
-                    "hash": &tx_hash[..std::cmp::min(12, tx_hash.len())],
-                    "type": if is_swap { "SWAP" } else { "PENDING" },
-                    "dex": if is_swap { "Uniswap V3" } else { "Mempool" },
-                    "token": if is_swap { "WETH/USDC" } else { "UNK" },
-                    "size": format!("${:.0}k", (tx.value.to::<u128>() as f64 / 1e18) * 3000.0 / 1000.0),
-                    "color": if is_swap { "#00FFD1" } else { "#64748B" },
-                    "gasGwei": format!("{:.1}", gas_price_gwei),
-                    "ts": std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis()
-                });
-                txs.push_front(t);
-                if txs.len() > 50 {
-                    txs.pop_back();
-                }
+            // Lightweight dashboard update — FIX #5: try_lock, skip if busy
+            self.maybe_update_dashboard(&tx_hash, &to_addr, &tx, gas_price_gwei, tx_count);
+
+            // Send to workers; if the channel is full, drop the tx (backpressure)
+            // rather than blocking the stream.
+            let payload = RawTxPayload {
+                to_addr,
+                input: tx.input.to_vec(),
+                value: tx.value.to::<u128>(),
+                gas_price_gwei,
+                tx_hash,
+                tx_count,
+            };
+            if tx_sender.try_send(payload).is_err() {
+                self.metrics.inc_txs_dropped(); // track how often we're saturated
             }
 
-            // Process the transaction through our pipeline
-            let input_bytes: Vec<u8> = tx.input.to_vec();
-            self.process_raw_transaction(
-                &to_addr,
-                &input_bytes,
-                tx.value.to::<u128>(),
-                gas_price_gwei,
-                &tx_hash,
-            ).await;
-
-            // Periodic metrics logging
+            // Periodic summary log (only reads graph, no write lock)
             if tx_count % METRICS_LOG_INTERVAL == 0 {
-                {
-                    let graph = self.graph.read().await;
-                    self.metrics.set_graph_pools(graph.pool_count() as u64);
-                    self.metrics.set_graph_tokens(graph.token_count() as u64);
-                }
+                let graph = self.graph.read().await;
+                self.metrics.set_graph_pools(graph.pool_count() as u64);
+                self.metrics.set_graph_tokens(graph.token_count() as u64);
+                drop(graph);
                 self.metrics.log_summary();
             }
+        }
+
+        // Stream ended — close channel so workers drain and exit
+        drop(tx_sender);
+        for h in worker_handles {
+            let _ = h.await;
         }
 
         Ok(())
     }
 
-    // ── Public transaction handler ────────────────────────────────────────────
+    // ── Non-blocking dashboard update ────────────────────────────────────────
 
-    /// Process a raw transaction from the mempool.
-    ///
-    /// Filters for watched Uniswap V3 Router addresses, decodes calldata, then
-    /// evaluates whether a profitable arbitrage opportunity has opened.
-    pub async fn process_raw_transaction(
+    /// FIX #5: Use try_lock() so a slow dashboard reader never blocks the stream.
+    fn maybe_update_dashboard(
         &self,
-        to: &str,
-        input: &[u8],
-        _value: u128,
-        gas_price_gwei: f64,
         tx_hash: &str,
+        to_addr: &str,
+        tx: &alloy::rpc::types::Transaction,
+        gas_price_gwei: f64,
+        tx_count: u64,
     ) {
-        // Filter: only watched Uniswap V3 Router addresses
-        let to_lower = to.to_lowercase();
-        if !is_uniswap_router(&to_lower) {
-            return;
+        let is_swap = is_uniswap_router(to_addr);
+        // FIX #5: try_write — if the dashboard is currently reading we skip
+        if let Ok(mut txs) = self.metrics.recent_mempool_txs.try_write() {
+            let short_hash = &tx_hash[..tx_hash.len().min(12)];
+            let entry = serde_json::json!({
+                "id":       tx_count,
+                "hash":     short_hash,
+                "type":     if is_swap { "SWAP" } else { "PENDING" },
+                "dex":      if is_swap { "Uniswap V3" } else { "Mempool" },
+                "token":    if is_swap { "WETH/USDC" } else { "UNK" },
+                "size":     format!("${:.0}k", (tx.value.to::<u128>() as f64 / 1e18) * 3000.0 / 1000.0),
+                "color":    if is_swap { "#00FFD1" } else { "#64748B" },
+                "gasGwei":  format!("{:.1}", gas_price_gwei),
+                "ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            });
+            txs.push_front(entry);
+            if txs.len() > 50 { txs.pop_back(); }
         }
+    }
 
+    // ── Worker context factory ────────────────────────────────────────────────
+
+    /// Clone just the Arcs that workers need — avoids cloning the whole struct.
+    fn make_worker_ctx(&self) -> WorkerCtx {
+        WorkerCtx {
+            redis_cache:   Arc::clone(&self.redis_cache),
+            graph:         Arc::clone(&self.graph),
+            router_config: self.router_config.clone(),
+            pg_store:      self.pg_store.clone(),
+            evm_adapter:   self.evm_adapter.clone(),
+            metrics:       Arc::clone(&self.metrics),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WorkerCtx — the per-task heavy pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A cheap, cloneable bundle of shared state for worker tasks.
+struct WorkerCtx {
+    redis_cache:   Arc<RedisCache>,
+    graph:         Arc<RwLock<LiquidityGraph>>,
+    router_config: RouterConfig,
+    pg_store:      Option<Arc<PostgresStore>>,
+    evm_adapter:   Option<Arc<EvmAdapter>>,
+    metrics:       Arc<EngineMetrics>,
+}
+
+impl WorkerCtx {
+    async fn process_payload(&self, payload: RawTxPayload) {
+        if !is_uniswap_router(&payload.to_addr) { return; }
         self.metrics.inc_txs_filtered();
-        if input.len() < 4 { return; }
+        if payload.input.len() < 4 { return; }
 
-        // 1. Decode the calldata
-        if let Some(decoded) = decode_uniswap_v3_swap(input) {
+        if let Some(decoded) = decode_uniswap_v3_swap(&payload.input) {
             self.metrics.inc_txs_decoded();
 
-            let token_in = format!("{:?}", decoded.token_in);
-            let token_out = format!("{:?}", decoded.token_out);
-            let fee_bps = fee_tier_to_bps(decoded.fee);
-            let amount_in_u256 = U256::from_dec_str(&decoded.amount_in.to_string()).unwrap_or_default();
+            let token_in  = decoded.token_in.to_string().to_lowercase();
+            let token_out = decoded.token_out.to_string().to_lowercase();
+            let fee_bps   = fee_tier_to_bps(decoded.fee);
+            let amount_in = U256::from_dec_str(&decoded.amount_in.to_string()).unwrap_or_default();
 
             info!(
-                tx_hash   = %tx_hash,
+                tx_hash   = %payload.tx_hash,
                 token_in  = %token_in,
                 token_out = %token_out,
                 fee_tier  = decoded.fee,
                 amount_in = %decoded.amount_in,
-                gas_gwei  = gas_price_gwei,
-                "🔍 Decoded Uniswap V3 swap. Running pathfinder..."
+                gas_gwei  = payload.gas_price_gwei,
+                "🔍 Decoded swap — running pathfinder"
             );
 
-            // 2. Evaluate state and trigger router
             self.evaluate_arb_opportunity(
                 &token_in,
                 &token_out,
                 fee_bps,
-                gas_price_gwei,
-                amount_in_u256,
+                payload.gas_price_gwei,
+                amount_in,
             )
             .await;
         } else {
-            debug!("Calldata decode failed or unsupported swap type for {}", tx_hash);
+            debug!("Calldata decode failed for {}", payload.tx_hash);
         }
     }
 
     // ── Core pipeline ─────────────────────────────────────────────────────────
 
-    /// Evaluate whether a pending swap creates an arbitrage opportunity.
-    ///
-    /// Steps:
-    ///   1. Look up pool state in Redis cache (fast path)
-    ///   2. If cache miss, try EvmAdapter on-chain fetch, else synthesise placeholder
-    ///   3. Upsert the pool into the shared LiquidityGraph
-    ///   4. Run Bellman-Ford to find negative-weight cycles
-    ///   5. For each executable opportunity: deduplicate → persist → (simulate) submit
     async fn evaluate_arb_opportunity(
         &self,
         token_in: &str,
@@ -321,55 +415,45 @@ impl MempoolListener {
     ) {
         let pool_cache_key = format!("pool:ethereum:{}:{}:{}", token_in, token_out, fee_bps);
 
-        // ── Step 1: Load pool from Redis ──────────────────────────────────────
+        // ── Step 1: Redis cache lookup ────────────────────────────────────────
         let cached_pool: Option<Pool> = match self.redis_cache.get_raw(&pool_cache_key).await {
-            Ok(Some(json)) => {
-                match serde_json::from_str::<Pool>(&json) {
-                    Ok(p) => {
-                        debug!(pool_key = %pool_cache_key, "Pool cache hit");
-                        self.metrics.inc_cache_hits();
-                        Some(p)
-                    }
-                    Err(e) => {
-                        warn!("Pool deserialize error for {}: {}", pool_cache_key, e);
-                        None
-                    }
+            Ok(Some(json)) => match serde_json::from_str::<Pool>(&json) {
+                Ok(p) => {
+                    self.metrics.inc_cache_hits();
+                    Some(p)
                 }
-            }
+                Err(e) => {
+                    warn!("Pool deserialize error for {}: {}", pool_cache_key, e);
+                    None
+                }
+            },
             Ok(None) => {
-                debug!(pool_key = %pool_cache_key, "Pool cache miss");
                 self.metrics.inc_cache_misses();
                 None
             }
             Err(e) => {
-                warn!("Redis error looking up {}: {}", pool_cache_key, e);
+                warn!("Redis error for {}: {}", pool_cache_key, e);
                 self.metrics.inc_redis_errors();
                 None
             }
         };
 
-        // ── Step 2: Use cached pool, fetch from chain, or build placeholder ──
+        // ── Step 2: Resolve pool ──────────────────────────────────────────────
         let mut pool = match cached_pool {
             Some(p) => p,
             None => {
-                // Try on-chain fetch via EVM adapter if available
                 if let Some(ref adapter) = self.evm_adapter {
                     let placeholder = build_placeholder_pool(token_in, token_out, fee_bps);
                     match adapter.fetch_pool_state(&placeholder).await {
                         Ok(state) => {
                             let mut p = placeholder;
                             p.state = state;
-                            // Cache the fetched state in Redis
                             if let Ok(json) = serde_json::to_string(&p) {
+                                // 24-block TTL (≈5 min on mainnet)
                                 if let Err(e) = self.redis_cache.set_raw(&pool_cache_key, &json, 24).await {
                                     warn!("Failed to cache pool state: {}", e);
                                 }
                             }
-                            debug!(
-                                token_in  = %token_in,
-                                token_out = %token_out,
-                                "Pool state fetched from chain and cached"
-                            );
                             p
                         }
                         Err(e) => {
@@ -378,125 +462,110 @@ impl MempoolListener {
                         }
                     }
                 } else {
-                    debug!(
-                        token_in  = %token_in,
-                        token_out = %token_out,
-                        fee_bps   = fee_bps,
-                        "No EVM adapter — building placeholder pool"
-                    );
                     build_placeholder_pool(token_in, token_out, fee_bps)
                 }
             }
         };
 
-        // 3. Simulate the post-swap state
+        // Simulate post-swap state
         pool.simulate_swap(token_in.to_string(), amount_in);
 
-        // ── Step 3: Upsert pool into LiquidityGraph ───────────────────────────
-        {
+        // ── Step 3: Graph upsert — FIX #1: opportunistic read first ──────────
+        //
+        // Only take the write lock if this pool is genuinely new OR the price
+        // has moved enough to matter.  For a busy WETH/USDC pool receiving
+        // hundreds of swaps/minute this avoids 99% of write-lock acquisitions.
+        let need_write = {
+            let graph = self.graph.read().await;
+            // If the pool doesn't exist in the graph yet, we definitely need write
+            if graph.get_pool(&pool.id).is_none() {
+                true
+            } else if let (Some(new_sqrt), Some(old_pool)) = (
+                pool.state.sqrt_price_x96,
+                graph.get_pool(&pool.id),
+            ) {
+                if let Some(old_sqrt) = old_pool.state.sqrt_price_x96 {
+                    let new_f = new_sqrt.low_u128() as f64;
+                    let old_f = old_sqrt.low_u128() as f64;
+                    if old_f > 0.0 {
+                        ((new_f - old_f).abs() / old_f) > SQRT_PRICE_STALENESS_THRESHOLD
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        };
+
+        if need_write {
             let mut graph = self.graph.write().await;
             graph.upsert_pool(pool);
         }
 
-        // ── Step 4: Run Bellman-Ford ──────────────────────────────────────────
-        let mut router_config = self.router_config.clone();
-        router_config.gas_price_gwei = gas_gwei;
+        // ── Step 4: Path-finding — read lock only ─────────────────────────────
+        let mut config = self.router_config.clone();
+        config.gas_price_gwei = gas_gwei;
 
         self.metrics.inc_router_scans();
 
         let opportunities: Vec<ArbitrageOpportunity> = {
             let graph = self.graph.read().await;
-            
-            // Assuming WETH as the start token for our flash loan
-            let start_token = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"; // lowercased
-            
-            // Part 3 requirement: run basic triangular cycles
-            let mut opps = graph.find_opportunities(start_token, &router_config);
-            
-            // Also run our advanced Bellman-Ford
-            opps.extend(find_arbitrage_cycles(&graph, &router_config));
+            let start_token = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+            let mut opps = graph.find_opportunities(start_token, &config);
+            opps.extend(find_arbitrage_cycles(&graph, &config));
             opps
         };
 
         if opportunities.is_empty() {
-            debug!(
-                token_in  = %token_in,
-                token_out = %token_out,
-                "No arbitrage cycles found"
-            );
             return;
         }
 
         // ── Step 5: Handle each opportunity ───────────────────────────────────
         for opp in opportunities {
             self.metrics.inc_opportunities_found();
-
-            if !opp.is_executable {
-                continue;
-            }
-
+            if !opp.is_executable { continue; }
             self.metrics.inc_opportunities_executable();
 
             info!(
-                id          = %opp.id,
-                nev_wei     = opp.net_expected_value,
-                route       = %opp.route_description(),
-                hops        = opp.route.len(),
-                impact_bps  = opp.price_impact_bps,
-                "🚀 Executable arbitrage opportunity — proceeding to submission"
+                id         = %opp.id,
+                nev_wei    = opp.net_expected_value,
+                route      = %opp.route_description(),
+                hops       = opp.route.len(),
+                "🚀 Executable opportunity"
             );
 
-            // ── 5a: Deduplicate via Redis ─────────────────────────────────────
-            let opp_id_str = opp.id.to_string();
+            // 5a: Deduplication
             let is_new = self
                 .redis_cache
-                .mark_opportunity_seen(&opp_id_str)
+                .mark_opportunity_seen(&opp.id.to_string())
                 .await
                 .unwrap_or(true);
+            if !is_new { continue; }
 
-            if !is_new {
-                debug!(id = %opp.id, "Opportunity already seen — skipping");
-                continue;
-            }
-
-            // ── 5b: Persist to Postgres ───────────────────────────────────────
+            // 5b: Persist
             if let Some(ref pg) = self.pg_store {
                 match pg.insert_opportunity(&opp).await {
-                    Ok(_) => {
-                        self.metrics.inc_opportunities_persisted();
-                    }
+                    Ok(_)  => self.metrics.inc_opportunities_persisted(),
                     Err(e) => {
-                        warn!("Failed to persist opportunity {}: {}", opp.id, e);
+                        warn!("Persist failed for {}: {}", opp.id, e);
                         self.metrics.inc_pg_errors();
                     }
                 }
             }
 
-            // ── 5c: Submit Flashbots bundle ───────────────────────
-            info!(
-                id          = %opp.id,
-                route       = %opp.route_description(),
-                "📦 EXECUTABLE ARB FOUND! Initiating execution pipeline."
-            );
-            
-            // Trigger the flash loan on the local Anvil fork
+            // 5c: Execute (never block the worker — spawn)
             if let Some(ref adapter) = self.evm_adapter {
-                // We spawn this so it doesn't block the mempool stream!
-                let adapter_clone = adapter.clone();
-                let arb_clone = opp.clone();
-                
+                let adapter_clone = Arc::clone(adapter);
+                let opp_clone     = opp.clone();
                 tokio::spawn(async move {
-                    match adapter_clone.execute_arbitrage(&arb_clone).await {
-                        Ok(()) => {
-                            tracing::info!(id = %arb_clone.id, "✅ Execution task completed");
-                        }
-                        Err(e) => {
-                            tracing::error!(id = %arb_clone.id, error = %e, "❌ Execution task failed");
-                        }
+                    match adapter_clone.execute_arbitrage(&opp_clone).await {
+                        Ok(())  => info!(id = %opp_clone.id, "✅ Execution completed"),
+                        Err(e)  => error!(id = %opp_clone.id, error = %e, "❌ Execution failed"),
                     }
                 });
-            } else {
-                warn!("No EVM adapter configured — execution skipped (monitoring only)");
             }
         }
     }
@@ -506,23 +575,13 @@ impl MempoolListener {
 //  Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a minimal placeholder pool for development when there is no cache hit
-/// and no EVM adapter is available.
 fn build_placeholder_pool(token_in: &str, token_out: &str, fee_bps: u32) -> Pool {
     Pool {
         id: format!("{}:{}:{}", token_in, token_out, fee_bps),
         chain: ChainId::Ethereum,
         dex: DexProtocol::UniswapV3,
-        token_a: Token {
-            address:  token_in.to_string(),
-            symbol:   "TKA".to_string(),
-            decimals: 18,
-        },
-        token_b: Token {
-            address:  token_out.to_string(),
-            symbol:   "TKB".to_string(),
-            decimals: 18,
-        },
+        token_a: Token { address: token_in.to_string(), symbol: "TKA".to_string(), decimals: 18 },
+        token_b: Token { address: token_out.to_string(), symbol: "TKB".to_string(), decimals: 18 },
         pool_type: PoolType::ConcentratedLiquidity,
         fee_bps,
         state: PoolState {

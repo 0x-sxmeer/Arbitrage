@@ -274,6 +274,7 @@ async fn main() {
         eth_price_usd:    config.eth_price_usd,
         gas_price_gwei:   config.gas_price_gwei,
         gas_per_hop:      Config::GAS_PER_HOP,
+        max_price_impact_bps: 200,
     };
 
     // ── Start mempool listener ────────────────────────────────────────────────

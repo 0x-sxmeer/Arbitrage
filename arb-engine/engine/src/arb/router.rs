@@ -1,25 +1,59 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  arb/router.rs — Bellman-Ford Arbitrage Pathfinder
+//  arb/router.rs — Bellman-Ford Arbitrage Pathfinder (REFACTORED)
 //
-//  Strategy: Model the token swap graph as a directed weighted graph where:
-//    - Nodes  = tokens
-//    - Edges  = pool swaps (pool P allows swapping token A → token B)
-//    - Weight = -log(exchange_rate)   (negative log-price)
+//  KEY FIXES vs. original:
 //
-//  A negative-weight CYCLE in this graph = an arbitrage opportunity.
-//  Bellman-Ford detects negative cycles in O(V × E) time.
+//  1. VIRTUAL-SOURCE BELLMAN-FORD IS MATHEMATICALLY WRONG (CRITICAL)
+//     The original initialises all dist[i] = 0.0 (virtual source).  This means
+//     every node is "reachable at cost 0" and the algorithm finds phantom
+//     negative cycles where none exist — specifically, any two pools with
+//     combined neg_log_rate < 0 will trigger a false positive even without
+//     forming a true CYCLE.
+//     FIX: Classic single-source BF.  We iterate over all tokens as source and
+//     stop as soon as we detect a genuine cycle anchored to that source.  Use
+//     the "relaxation with predecessor tracking" only once the cycle node is
+//     verified to be reachable from the source.
 //
-//  Why -log(rate)?
-//    Profit from a cycle = product of exchange rates.
-//    Product > 1 (profitable) ⟺ Σ log(rates) > 0 ⟺ Σ -log(rates) < 0.
-//    So a profitable cycle = a negative-weight cycle in the -log graph.
+//  2. NEG_LOG_RATE IGNORES DEX FEE TIERS (CRITICAL)
+//     The original computes `compute_rate` from v2/v3 math (which does subtract
+//     the fee), but then the Bellman-Ford ALSO subtracts fees again in
+//     `reconstruct_cycle` via `fee = current_amount * fee_bps / 10_000`.
+//     Double-counting fees = artificially pessimistic NEV → real opportunities
+//     discarded.
+//     FIX: Fee is baked into v2::get_amount_out / v3::get_amount_out_v3 already.
+//     The reconstruct path uses the same math — do NOT subtract fee separately.
+//     The NEV formula now only adds gas cost on top.
+//
+//  3. CYCLE RECONSTRUCTION CAN LOOP INFINITELY (CRITICAL)
+//     If `pred_edge` contains a chain that never closes back to `cycle_entry`
+//     (e.g. due to numerical noise in dist), the inner `for` loop in
+//     `reconstruct_cycle` will silently collect `max_hops` arbitrary edges that
+//     do NOT form a valid cycle, then pass them on as a valid opportunity.
+//     FIX: Verify closure: after collecting edges, assert
+//     `steps.last().token_out == start_token`.  Discard if not closed.
+//
+//  4. FLOATING-POINT EPSILON TOO LOOSE
+//     The original uses `dist[u] + neg_log_rate < dist[v] - 1e-10` which is
+//     adequate, but 1e-10 may be too tight for f64 accumulated error across
+//     long chains.  Upgraded to 1e-9 with a comment.
+//
+//  5. LiquidityGraph MISSING get_pool() ACCESSOR
+//     listener.rs fix #1 needs `graph.get_pool(&id)`.  Added here.
+//
+//  6. RATE COMPUTATION USES low_u128() WHICH TRUNCATES LARGE U256
+//     For amounts > 2^128, low_u128() silently wraps.  For typical 1-ETH
+//     probe amounts this is fine, but document the assumption and add a guard.
+//
+//  7. TWO-HOP FINDER (`find_opportunities`) DOESN'T CAP PRICE IMPACT
+//     High-impact paths will lose money in practice.  Added configurable
+//     max_price_impact_bps guard.
 // ─────────────────────────────────────────────────────────────────────────────
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::arb::opportunity::{ArbitrageOpportunity, SwapStep};
 use crate::pool::{v2, v3, Pool, PoolType, U256};
@@ -28,32 +62,26 @@ use crate::pool::{v2, v3, Pool, PoolType, U256};
 //  Graph structures
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A directed edge in the liquidity graph: token_in → token_out via pool.
+/// A directed edge: token_in → token_out via a specific pool.
 #[derive(Debug, Clone)]
 struct LiquidityEdge {
-    pool:        Arc<Pool>,
-    token_in:    String,
-    token_out:   String,
-    /// -log(effective exchange rate after fees)
+    pool:         Arc<Pool>,
+    token_in:     String,
+    token_out:    String,
+    /// -ln(effective_rate_after_fees).  Negative when profitable.
     neg_log_rate: f64,
 }
 
 /// The full liquidity graph across all monitored pools and chains.
 pub struct LiquidityGraph {
-    /// All unique token addresses (nodes)
-    tokens: Vec<String>,
-    /// Map: token_address → node index
+    tokens:      Vec<String>,
     token_index: HashMap<String, usize>,
-    /// All directed swap edges
-    edges: Vec<LiquidityEdge>,
-    /// Pools keyed by ID for fast lookup
-    pools: HashMap<String, Arc<Pool>>,
+    edges:       Vec<LiquidityEdge>,
+    pools:       HashMap<String, Arc<Pool>>,
 }
 
 impl Default for LiquidityGraph {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl LiquidityGraph {
@@ -66,29 +94,22 @@ impl LiquidityGraph {
         }
     }
 
-    /// Drop all edges and pool entries, keeping the token-node index.
-    /// Call periodically to purge stale pools without losing address mappings.
+    /// Purge all edges/pools — keeps token index to avoid re-allocating.
     pub fn clear_edges(&mut self) {
         self.edges.clear();
         self.pools.clear();
     }
 
-    /// Insert or update a pool in the graph.
-    /// Adds two directed edges (both swap directions).
+    /// Insert or update a pool.  Adds two directed edges (both directions).
     pub fn upsert_pool(&mut self, pool: Pool) {
         let pool_arc = Arc::new(pool);
-
-        // Ensure both token nodes exist
         self.ensure_token(&pool_arc.token_a.address);
         self.ensure_token(&pool_arc.token_b.address);
-
-        // Remove stale edges from this pool
         self.edges.retain(|e| e.pool.id != pool_arc.id);
 
-        // Compute effective exchange rates
-        let unit = U256::from(10u64.pow(18)); // 1 token in base units (18 dec normalised)
+        // FIX #6: use 1 ETH as probe — document u128 assumption
+        let unit = U256::from(10u64.pow(18)); // 1 token in 18-decimal units (< 2^60, safe)
 
-        // Edge A → B
         if let Some(rate_ab) = self.compute_rate(&pool_arc, unit, true) {
             self.edges.push(LiquidityEdge {
                 pool:         Arc::clone(&pool_arc),
@@ -98,7 +119,6 @@ impl LiquidityGraph {
             });
         }
 
-        // Edge B → A
         if let Some(rate_ba) = self.compute_rate(&pool_arc, unit, false) {
             self.edges.push(LiquidityEdge {
                 pool:         Arc::clone(&pool_arc),
@@ -111,20 +131,17 @@ impl LiquidityGraph {
         self.pools.insert(pool_arc.id.clone(), pool_arc);
     }
 
-    /// Remove a pool from the graph.
     pub fn remove_pool(&mut self, pool_id: &str) {
         self.edges.retain(|e| e.pool.id != pool_id);
         self.pools.remove(pool_id);
     }
 
-    /// Number of pools currently in the graph.
-    pub fn pool_count(&self) -> usize {
-        self.pools.len()
-    }
+    pub fn pool_count(&self)  -> usize { self.pools.len()  }
+    pub fn token_count(&self) -> usize { self.tokens.len() }
 
-    /// Number of token nodes.
-    pub fn token_count(&self) -> usize {
-        self.tokens.len()
+    /// FIX #5: Accessor needed by listener for staleness check.
+    pub fn get_pool(&self, pool_id: &str) -> Option<&Arc<Pool>> {
+        self.pools.get(pool_id)
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -137,53 +154,60 @@ impl LiquidityGraph {
         }
     }
 
-    /// Simulate a unit swap and return the effective exchange rate (output/input).
-    /// Returns None if the pool cannot be swapped.
+    /// Simulate a unit swap and return effective rate (output/input, post-fee).
+    /// FIX #2: fee IS already baked into v2/v3 math.  No separate deduction.
     fn compute_rate(&self, pool: &Pool, amount_in: U256, zero_for_one: bool) -> Option<f64> {
         let amount_out = match pool.pool_type {
-            PoolType::ConstantProduct => {
-                v2::get_amount_out(pool, amount_in, zero_for_one).ok()?
-            }
-            PoolType::ConcentratedLiquidity => {
-                v3::get_amount_out_v3(pool, amount_in, zero_for_one).ok()?
-            }
-            PoolType::StableSwap => {
-                // StableSwap: approximate as V2 for now
-                v2::get_amount_out(pool, amount_in, zero_for_one).ok()?
-            }
+            PoolType::ConstantProduct    => v2::get_amount_out(pool, amount_in, zero_for_one).ok()?,
+            PoolType::ConcentratedLiquidity => v3::get_amount_out_v3(pool, amount_in, zero_for_one).ok()?,
+            PoolType::StableSwap         => v2::get_amount_out(pool, amount_in, zero_for_one).ok()?,
         };
 
         if amount_in.is_zero() { return None; }
-        let rate = amount_out.low_u128() as f64 / amount_in.low_u128() as f64;
-        if rate <= 0.0 { None } else { Some(rate) }
+
+        // FIX #6: guard against amounts that exceed u128 (shouldn't happen at 1 ETH)
+        let in_u128  = amount_in.low_u128();
+        let out_u128 = amount_out.low_u128();
+        if amount_in  != U256::from(in_u128)
+        || amount_out != U256::from(out_u128) {
+            warn!("compute_rate: U256 overflow in low_u128 — skipping edge");
+            return None;
+        }
+
+        let rate = out_u128 as f64 / in_u128 as f64;
+        if rate <= 0.0 || !rate.is_finite() { None } else { Some(rate) }
     }
 
-    /// Basic 2-hop (Triangular/Cyclic) arbitrage finder required for Phase 1 completion
-    pub fn find_opportunities(&self, start_token: &str, config: &RouterConfig) -> Vec<ArbitrageOpportunity> {
+    // ── Two-hop scanner ───────────────────────────────────────────────────────
+
+    /// FIX #7: Added max_price_impact_bps guard.
+    pub fn find_opportunities(
+        &self,
+        start_token: &str,
+        config: &RouterConfig,
+    ) -> Vec<ArbitrageOpportunity> {
         let mut opportunities = Vec::new();
 
-        // Get all pools connected to our start token (e.g., WETH)
-        // Since we store pools globally, we iterate through edges starting from start_token
         let first_hops: Vec<&LiquidityEdge> = self.edges.iter()
             .filter(|e| e.token_in == start_token)
             .collect();
 
-        for edge_1 in first_hops {
-            let intermediate_token = &edge_1.token_out;
+        for edge_1 in &first_hops {
+            let mid = &edge_1.token_out;
 
-            // Find a way back to the start token
             let second_hops: Vec<&LiquidityEdge> = self.edges.iter()
-                .filter(|e| e.token_in == *intermediate_token && e.token_out == start_token)
+                .filter(|e| e.token_in == *mid && e.token_out == start_token)
                 .collect();
 
-            for edge_2 in second_hops {
-                if edge_1.pool.id != edge_2.pool.id {
-                    let opt = self.evaluate_route(start_token, intermediate_token, &edge_1.pool, &edge_2.pool, config);
-                    if let Some(mut arb) = opt {
-                        arb.calculate_nev(config.eth_price_usd);
-                        if arb.is_executable {
-                            opportunities.push(arb);
-                        }
+            for edge_2 in &second_hops {
+                if edge_1.pool.id == edge_2.pool.id { continue; }
+
+                if let Some(mut arb) = self.evaluate_two_hop(
+                    start_token, mid, &edge_1.pool, &edge_2.pool, config,
+                ) {
+                    arb.calculate_nev(config.eth_price_usd);
+                    if arb.is_executable {
+                        opportunities.push(arb);
                     }
                 }
             }
@@ -191,80 +215,71 @@ impl LiquidityGraph {
         opportunities
     }
 
-    fn evaluate_route(
+    fn evaluate_two_hop(
         &self,
         start_token: &str,
         intermediate_token: &str,
         pool1: &Pool,
         pool2: &Pool,
-        config: &RouterConfig
+        config: &RouterConfig,
     ) -> Option<ArbitrageOpportunity> {
         let input = config.reference_amount;
-        
-        let zero_for_one_1 = start_token == pool1.token_a.address;
-        let amount_out_1 = match pool1.pool_type {
-            PoolType::ConstantProduct => v2::get_amount_out(pool1, input, zero_for_one_1).ok()?,
-            PoolType::ConcentratedLiquidity => v3::get_amount_out_v3(pool1, input, zero_for_one_1).ok()?,
-            PoolType::StableSwap => v2::get_amount_out(pool1, input, zero_for_one_1).ok()?,
-        };
-        
-        let impact_1 = match pool1.pool_type {
-            PoolType::ConstantProduct => v2::price_impact_bps(pool1, input, zero_for_one_1),
-            PoolType::ConcentratedLiquidity => v3::price_impact_bps_v3(pool1, input, zero_for_one_1),
-            PoolType::StableSwap => v2::price_impact_bps(pool1, input, zero_for_one_1),
-        };
-        let fee_1 = input * U256::from(pool1.fee_bps) / U256::from(10_000u32);
 
-        let zero_for_one_2 = intermediate_token == pool2.token_a.address;
-        let amount_out_2 = match pool2.pool_type {
-            PoolType::ConstantProduct => v2::get_amount_out(pool2, amount_out_1, zero_for_one_2).ok()?,
-            PoolType::ConcentratedLiquidity => v3::get_amount_out_v3(pool2, amount_out_1, zero_for_one_2).ok()?,
-            PoolType::StableSwap => v2::get_amount_out(pool2, amount_out_1, zero_for_one_2).ok()?,
-        };
+        let zfo1 = start_token == pool1.token_a.address;
+        let out1 = sim_out(pool1, input, zfo1)?;
+        let impact1 = sim_impact(pool1, input, zfo1);
 
-        let impact_2 = match pool2.pool_type {
-            PoolType::ConstantProduct => v2::price_impact_bps(pool2, amount_out_1, zero_for_one_2),
-            PoolType::ConcentratedLiquidity => v3::price_impact_bps_v3(pool2, amount_out_1, zero_for_one_2),
-            PoolType::StableSwap => v2::price_impact_bps(pool2, amount_out_1, zero_for_one_2),
-        };
-        let fee_2 = amount_out_1 * U256::from(pool2.fee_bps) / U256::from(10_000u32);
+        // FIX #7: reject paths with extreme single-hop impact
+        if impact1 > config.max_price_impact_bps {
+            return None;
+        }
+
+        let zfo2 = intermediate_token == pool2.token_a.address;
+        let out2 = sim_out(pool2, out1, zfo2)?;
+        let impact2 = sim_impact(pool2, out1, zfo2);
+
+        if impact2 > config.max_price_impact_bps {
+            return None;
+        }
 
         let step1 = SwapStep {
-            pool_id: pool1.id.clone(),
-            dex: pool1.dex.name().to_string(),
-            chain: pool1.chain,
-            token_in: start_token.to_string(),
-            token_out: intermediate_token.to_string(),
-            amount_in: input,
-            expected_amount_out: amount_out_1,
-            fee_bps: pool1.fee_bps,
-            step_price_impact_bps: impact_1,
+            pool_id:               pool1.id.clone(),
+            dex:                   pool1.dex.name().to_string(),
+            chain:                 pool1.chain,
+            token_in:              start_token.to_string(),
+            token_out:             intermediate_token.to_string(),
+            amount_in:             input,
+            expected_amount_out:   out1,
+            fee_bps:               pool1.fee_bps,
+            step_price_impact_bps: impact1,
         };
 
         let step2 = SwapStep {
-            pool_id: pool2.id.clone(),
-            dex: pool2.dex.name().to_string(),
-            chain: pool2.chain,
-            token_in: intermediate_token.to_string(),
-            token_out: start_token.to_string(),
-            amount_in: amount_out_1,
-            expected_amount_out: amount_out_2,
-            fee_bps: pool2.fee_bps,
-            step_price_impact_bps: impact_2,
+            pool_id:               pool2.id.clone(),
+            dex:                   pool2.dex.name().to_string(),
+            chain:                 pool2.chain,
+            token_in:              intermediate_token.to_string(),
+            token_out:             start_token.to_string(),
+            amount_in:             out1,
+            expected_amount_out:   out2,
+            fee_bps:               pool2.fee_bps,
+            step_price_impact_bps: impact2,
         };
-        
-        let total_fees = fee_1 + fee_2;
-        let max_impact = impact_1.max(impact_2);
+
+        // FIX #2: do NOT add fee_bps-derived fee here — it's already inside out1/out2.
+        // total_swap_fees_wei passed to ArbitrageOpportunity::new() is an informational
+        // figure only (used for display).  Pass 0 so NEV isn't double-counted.
+        let max_impact = impact1.max(impact2);
 
         Some(ArbitrageOpportunity::new(
             vec![step1, step2],
             start_token.to_string(),
             pool1.chain,
             input,
-            amount_out_2,
+            out2,
             config.gas_per_hop * 2,
             config.gas_price_gwei,
-            total_fees,
+            U256::zero(), // fees already baked into swap math
             max_impact,
             0,
         ))
@@ -272,43 +287,44 @@ impl LiquidityGraph {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Bellman-Ford Arbitrage Finder
+//  RouterConfig
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Configuration for the arbitrage router.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
-    /// Maximum number of hops in an arbitrage cycle (2 = two-pool, 3 = three-pool)
-    pub max_hops: usize,
-    /// Minimum cycle profit rate to consider (e.g. 0.001 = 0.1%)
-    pub min_profit_rate: f64,
-    /// Reference trade size (normalized, in 18-decimal units)
-    pub reference_amount: U256,
-    /// ETH price in USD for NEV calculation
-    pub eth_price_usd: f64,
-    /// Current gas price in gwei
-    pub gas_price_gwei: f64,
-    /// Gas units per hop (rough estimate)
-    pub gas_per_hop: u64,
+    pub max_hops:              usize,
+    pub min_profit_rate:       f64,
+    pub reference_amount:      U256,
+    pub eth_price_usd:         f64,
+    pub gas_price_gwei:        f64,
+    pub gas_per_hop:           u64,
+    /// FIX #7: reject legs with more than this many bps price impact
+    pub max_price_impact_bps:  u32,
 }
 
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
-            max_hops:         3,
-            min_profit_rate:  0.001,  // 0.1%
-            reference_amount: U256::from(1_000_000_000_000_000_000u128), // 1 ETH
-            eth_price_usd:    3000.0,
-            gas_price_gwei:   20.0,
-            gas_per_hop:      150_000,
+            max_hops:             3,
+            min_profit_rate:      0.001,
+            reference_amount:     U256::from(1_000_000_000_000_000_000u128), // 1 ETH
+            eth_price_usd:        3000.0,
+            gas_price_gwei:       20.0,
+            gas_per_hop:          150_000,
+            max_price_impact_bps: 200, // 2% maximum per hop
         }
     }
 }
 
-/// Runs Bellman-Ford on the liquidity graph to find negative-weight cycles
-/// (arbitrage opportunities).
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bellman-Ford Cycle Finder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// FIX #1: Proper single-source Bellman-Ford.
 ///
-/// Returns a list of profitable opportunities sorted by NEV descending.
+/// We run BF from each token individually (handles disconnected components).
+/// "Virtual source" initialisation was REMOVED because it produced false
+/// positives — any path with total_neg_log < 0 was flagged as a cycle.
 pub fn find_arbitrage_cycles(
     graph: &LiquidityGraph,
     config: &RouterConfig,
@@ -318,88 +334,78 @@ pub fn find_arbitrage_cycles(
     }
 
     let n = graph.tokens.len();
-
-    // Bellman-Ford: relax all edges (n-1) times, then one more pass to detect
-    // negative cycles. We track the predecessor edge to reconstruct paths.
-    let inf = f64::INFINITY;
-    let mut dist = vec![inf; n];
-    let mut pred_edge: Vec<Option<usize>> = vec![None; n];
-
-    // Start from every node (handles disconnected components)
-    // For efficiency we use a virtual source with 0-cost edges
-    let virtual_dist = 0.0;
-    for i in 0..n {
-        dist[i] = virtual_dist; // treat all nodes as equally reachable
-    }
-
-    // n-1 relaxation passes
-    for _ in 0..(n.saturating_sub(1)) {
-        let mut updated = false;
-        for (ei, edge) in graph.edges.iter().enumerate() {
-            let u = match graph.token_index.get(&edge.token_in) {
-                Some(&i) => i,
-                None => continue,
-            };
-            let v = match graph.token_index.get(&edge.token_out) {
-                Some(&i) => i,
-                None => continue,
-            };
-            if dist[u] + edge.neg_log_rate < dist[v] {
-                dist[v] = dist[u] + edge.neg_log_rate;
-                pred_edge[v] = Some(ei);
-                updated = true;
-            }
-        }
-        if !updated { break; }
-    }
-
-    // One more pass: any node whose distance still decreases is on a negative cycle
-    let mut cycle_starts: Vec<usize> = Vec::new();
-    for edge in graph.edges.iter() {
-        let u = match graph.token_index.get(&edge.token_in) {
-            Some(&i) => i,
-            None => continue,
-        };
-        let v = match graph.token_index.get(&edge.token_out) {
-            Some(&i) => i,
-            None => continue,
-        };
-        if dist[u] + edge.neg_log_rate < dist[v] - 1e-10 {
-            if !cycle_starts.contains(&v) {
-                cycle_starts.push(v);
-            }
-        }
-    }
-
-    debug!("Bellman-Ford found {} potential negative cycles", cycle_starts.len());
-
-    // Reconstruct cycles and build ArbitrageOpportunity for each
     let mut opportunities: Vec<ArbitrageOpportunity> = Vec::new();
+    let mut seen_cycle_ids: std::collections::HashSet<String> = Default::default();
 
-    for start_node in cycle_starts {
-        if let Some(opp) = reconstruct_cycle(graph, config, start_node, &pred_edge) {
-            opportunities.push(opp);
+    // Run BF from each token as source to cover disconnected components.
+    // This is O(V² × E) worst case; in practice token count is small (< 200).
+    for src_idx in 0..n {
+        let inf = f64::INFINITY;
+        let mut dist: Vec<f64>            = vec![inf; n];
+        let mut pred_edge: Vec<Option<usize>> = vec![None; n];
+
+        dist[src_idx] = 0.0;
+
+        // n-1 relaxation rounds
+        let mut updated = true;
+        for _round in 0..(n.saturating_sub(1)) {
+            if !updated { break; }
+            updated = false;
+            for (ei, edge) in graph.edges.iter().enumerate() {
+                let u = match graph.token_index.get(&edge.token_in)  { Some(&i) => i, None => continue };
+                let v = match graph.token_index.get(&edge.token_out) { Some(&i) => i, None => continue };
+                if dist[u] == inf { continue; }
+                let new_dist = dist[u] + edge.neg_log_rate;
+                if new_dist < dist[v] {
+                    dist[v] = new_dist;
+                    pred_edge[v] = Some(ei);
+                    updated = true;
+                }
+            }
+        }
+
+        // Nth round: any node that still relaxes is on a negative cycle
+        let mut cycle_nodes: Vec<usize> = Vec::new();
+        for edge in graph.edges.iter() {
+            let u = match graph.token_index.get(&edge.token_in)  { Some(&i) => i, None => continue };
+            let v = match graph.token_index.get(&edge.token_out) { Some(&i) => i, None => continue };
+            if dist[u] == inf { continue; }
+            // FIX #4: 1e-9 epsilon for accumulated float error
+            if dist[u] + edge.neg_log_rate < dist[v] - 1e-9 {
+                if !cycle_nodes.contains(&v) {
+                    cycle_nodes.push(v);
+                }
+            }
+        }
+
+        for start_node in cycle_nodes {
+            if let Some(opp) = reconstruct_cycle(graph, config, start_node, &pred_edge) {
+                // Dedup by route fingerprint
+                let fingerprint = opp.route_description();
+                if seen_cycle_ids.insert(fingerprint) {
+                    opportunities.push(opp);
+                }
+            }
         }
     }
 
-    // Sort by NEV descending
     opportunities.sort_by(|a, b| b.net_expected_value.cmp(&a.net_expected_value));
 
     if !opportunities.is_empty() {
-        info!("Router found {} profitable cycles", opportunities.len());
+        info!("Bellman-Ford found {} profitable cycles", opportunities.len());
     }
 
     opportunities
 }
 
-/// Walk back predecessor edges to extract the cycle, then build an `ArbitrageOpportunity`.
+/// FIX #3: Verify cycle closure before returning the opportunity.
 fn reconstruct_cycle(
     graph: &LiquidityGraph,
     config: &RouterConfig,
     start: usize,
     pred_edge: &[Option<usize>],
 ) -> Option<ArbitrageOpportunity> {
-    // Walk predecessor chain to find the actual cycle node
+    // Walk predecessor chain to find the actual entry of the cycle
     let mut visited = vec![false; graph.tokens.len()];
     let mut cur = start;
 
@@ -409,7 +415,7 @@ fn reconstruct_cycle(
         cur = match pred_edge[cur] {
             Some(ei) => match graph.token_index.get(&graph.edges[ei].token_in) {
                 Some(&i) => i,
-                None => return None,
+                None     => return None,
             },
             None => return None,
         };
@@ -419,50 +425,45 @@ fn reconstruct_cycle(
     let mut cycle_edges: Vec<&LiquidityEdge> = Vec::new();
     let mut node = cycle_entry;
 
-    // Extract the cycle edges (max_hops)
     for _ in 0..config.max_hops {
-        let ei = pred_edge[node]?;
+        let ei   = pred_edge[node]?;
         let edge = &graph.edges[ei];
         cycle_edges.push(edge);
         node = graph.token_index.get(&edge.token_in).copied()?;
-        if node == cycle_entry && !cycle_edges.is_empty() {
-            break;
-        }
+        if node == cycle_entry { break; }
     }
 
-    if cycle_edges.len() < 2 {
-        return None; // need at least 2 hops to form a cycle
+    if cycle_edges.len() < 2 { return None; }
+
+    cycle_edges.reverse(); // now in execution order
+
+    // ── FIX #3: Verify the path truly closes back to cycle_entry ─────────────
+    let start_token = cycle_edges.first()?.token_in.clone();
+    let end_token   = cycle_edges.last()?.token_out.clone();
+    if start_token != end_token {
+        debug!(
+            "Cycle not closed: {} → {} — skipping (pred-chain artefact)",
+            start_token, end_token
+        );
+        return None;
     }
 
-    // Reverse so edges are in execution order
-    cycle_edges.reverse();
-
-    // Simulate actual amounts through the cycle
-    let start_token = cycle_edges[0].token_in.clone();
     let chain = cycle_edges[0].pool.chain;
     let mut current_amount = config.reference_amount;
     let mut steps: Vec<SwapStep> = Vec::new();
-    let mut total_fees = U256::zero();
+    let mut max_impact: u32 = 0;
 
     for edge in &cycle_edges {
-        let pool = &edge.pool;
-        let zero_for_one = edge.token_in == pool.token_a.address;
+        let pool       = &edge.pool;
+        let zfo        = edge.token_in == pool.token_a.address;
+        let out        = sim_out(pool, current_amount, zfo)?;
+        let impact_bps = sim_impact(pool, current_amount, zfo);
 
-        let out = match pool.pool_type {
-            PoolType::ConstantProduct => v2::get_amount_out(pool, current_amount, zero_for_one).ok()?,
-            PoolType::ConcentratedLiquidity => v3::get_amount_out_v3(pool, current_amount, zero_for_one).ok()?,
-            PoolType::StableSwap => v2::get_amount_out(pool, current_amount, zero_for_one).ok()?,
-        };
-
-        let impact_bps = match pool.pool_type {
-            PoolType::ConstantProduct => v2::price_impact_bps(pool, current_amount, zero_for_one),
-            PoolType::ConcentratedLiquidity => v3::price_impact_bps_v3(pool, current_amount, zero_for_one),
-            PoolType::StableSwap => v2::price_impact_bps(pool, current_amount, zero_for_one),
-        };
-
-        // Fee cost for this hop (fee_bps / 10000 * amount_in)
-        let fee = current_amount * U256::from(pool.fee_bps) / U256::from(10_000u32);
-        total_fees = total_fees + fee;
+        // FIX #7: reject paths with extreme impact inside the BF result too
+        if impact_bps > config.max_price_impact_bps {
+            return None;
+        }
+        max_impact = max_impact.max(impact_bps);
 
         steps.push(SwapStep {
             pool_id:               pool.id.clone(),
@@ -480,14 +481,16 @@ fn reconstruct_cycle(
     }
 
     let gross_output = current_amount;
-    let gas_units    = config.gas_per_hop * cycle_edges.len() as u64;
-    let max_impact   = steps.iter().map(|s| s.step_price_impact_bps).max().unwrap_or(0);
 
-    // Only proceed if there is a positive gross spread
+    // Only proceed if gross spread is positive (fees already deducted by sim)
     if gross_output <= config.reference_amount {
         return None;
     }
 
+    let gas_units = config.gas_per_hop * cycle_edges.len() as u64;
+
+    // FIX #2: pass U256::zero() for total_swap_fees_wei — fees are inside the
+    // simulated outputs; passing fee_bps-derived amounts would double-count.
     let mut opp = ArbitrageOpportunity::new(
         steps,
         start_token,
@@ -496,14 +499,35 @@ fn reconstruct_cycle(
         gross_output,
         gas_units,
         config.gas_price_gwei,
-        total_fees,
+        U256::zero(),
         max_impact,
-        0, // block number filled in by caller
+        0,
     );
 
     opp.calculate_nev(config.eth_price_usd);
-
     Some(opp)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Pool simulation helpers (DRY wrappers)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[inline]
+fn sim_out(pool: &Pool, amount_in: U256, zero_for_one: bool) -> Option<U256> {
+    match pool.pool_type {
+        PoolType::ConstantProduct       => v2::get_amount_out(pool, amount_in, zero_for_one).ok(),
+        PoolType::ConcentratedLiquidity => v3::get_amount_out_v3(pool, amount_in, zero_for_one).ok(),
+        PoolType::StableSwap            => v2::get_amount_out(pool, amount_in, zero_for_one).ok(),
+    }
+}
+
+#[inline]
+fn sim_impact(pool: &Pool, amount_in: U256, zero_for_one: bool) -> u32 {
+    match pool.pool_type {
+        PoolType::ConstantProduct       => v2::price_impact_bps(pool, amount_in, zero_for_one),
+        PoolType::ConcentratedLiquidity => v3::price_impact_bps_v3(pool, amount_in, zero_for_one),
+        PoolType::StableSwap            => v2::price_impact_bps(pool, amount_in, zero_for_one),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -524,15 +548,15 @@ mod tests {
             pool_type: PoolType::ConstantProduct,
             fee_bps: fee,
             state: PoolState {
-                reserve_a: U256::from(ra),
-                reserve_b: U256::from(rb),
+                reserve_a:      U256::from(ra),
+                reserve_b:      U256::from(rb),
                 sqrt_price_x96: None,
-                tick: None,
-                liquidity: None,
-                amp_coeff: None,
+                tick:           None,
+                liquidity:      None,
+                amp_coeff:      None,
             },
             last_updated_block: 1,
-            last_updated_ts: 0,
+            last_updated_ts:    0,
         }
     }
 
@@ -540,33 +564,79 @@ mod tests {
     fn test_graph_upsert() {
         let mut graph = LiquidityGraph::new();
         graph.upsert_pool(make_v2_pool(
-            "pool1", 1_000_000e18 as u128, 2_000_000e18 as u128,
-            "0xWETH", "0xUSDC", 30
+            "pool1", 1_000_000_000_000_000_000_000, 2_000_000_000_000_000_000_000,
+            "0xWETH", "0xUSDC", 30,
         ));
         assert_eq!(graph.pool_count(), 1);
         assert_eq!(graph.token_count(), 2);
-        assert_eq!(graph.edges.len(), 2); // both directions
+        assert_eq!(graph.edges.len(), 2);
     }
 
     #[test]
-    fn test_no_cycle_balanced_pools() {
-        // Two pools with IDENTICAL rates: no arb opportunity should exist
-        // Both pools: WETH→USDC at 1:2 ratio
+    fn test_balanced_pools_no_opportunity() {
+        // Two pools with identical rates: fees ensure no arb after BF.
         let mut graph = LiquidityGraph::new();
+        // WETH → USDC at 1:2 on pool1
         graph.upsert_pool(make_v2_pool(
-            "pool1", 1_000_000_000_000_000_000_000u128, 2_000_000_000_000_000_000_000u128,
-            "WETH", "USDC", 30
+            "p1", 1_000_000_000_000_000_000_000, 2_000_000_000_000_000_000_000,
+            "WETH", "USDC", 30,
         ));
-        // pool2: same pair, same direction, same ratio — no discrepancy
+        // USDC → WETH at 2:1 on pool2 (perfectly symmetric — should break even)
         graph.upsert_pool(make_v2_pool(
-            "pool2", 1_000_000_000_000_000_000_000u128, 2_000_000_000_000_000_000_000u128,
-            "WETH", "USDC", 30
+            "p2", 2_000_000_000_000_000_000_000, 1_000_000_000_000_000_000_000,
+            "USDC", "WETH", 30,
         ));
         let config = RouterConfig::default();
         let opps = find_arbitrage_cycles(&graph, &config);
-        // Balanced pools should yield no profitable cycles after fees
         for opp in &opps {
-            assert!(!opp.is_executable, "Balanced pools should not be executable");
+            assert!(
+                !opp.is_executable,
+                "Balanced pools should not be executable (NEV = {}, fee eats all profit)",
+                opp.net_expected_value
+            );
         }
+    }
+
+    #[test]
+    fn test_imbalanced_pools_finds_opportunity() {
+        let mut graph = LiquidityGraph::new();
+        // Pool A: WETH → USDC at 1:2100 (slightly above market)
+        graph.upsert_pool(make_v2_pool(
+            "p1", 1_000_000_000_000_000_000_000, 2_100_000_000_000_000_000_000_000,
+            "WETH", "USDC", 30,
+        ));
+        // Pool B: USDC → WETH at 2000:1 (below market — WETH is cheap here)
+        graph.upsert_pool(make_v2_pool(
+            "p2", 2_000_000_000_000_000_000_000_000, 1_000_000_000_000_000_000_000,
+            "USDC", "WETH", 30,
+        ));
+        let config = RouterConfig::default();
+        let opps = find_arbitrage_cycles(&graph, &config);
+        // At least one cycle should show positive gross spread
+        let any_profitable = opps.iter().any(|o| o.gross_output > o.input_amount);
+        assert!(any_profitable, "Imbalanced pools should yield at least one profitable cycle");
+    }
+
+    #[test]
+    fn test_cycle_closure_required() {
+        // Single pool — cannot form a closed cycle by itself
+        let mut graph = LiquidityGraph::new();
+        graph.upsert_pool(make_v2_pool(
+            "p1", 1_000_000_000_000_000_000_000, 2_000_000_000_000_000_000_000,
+            "WETH", "USDC", 30,
+        ));
+        let config = RouterConfig::default();
+        let opps = find_arbitrage_cycles(&graph, &config);
+        assert!(opps.is_empty(), "Single pool cannot form a cycle");
+    }
+
+    #[test]
+    fn test_get_pool_accessor() {
+        let mut graph = LiquidityGraph::new();
+        graph.upsert_pool(make_v2_pool(
+            "pool99", 1_000, 2_000, "A", "B", 30,
+        ));
+        assert!(graph.get_pool("pool99").is_some());
+        assert!(graph.get_pool("pool00").is_none());
     }
 }

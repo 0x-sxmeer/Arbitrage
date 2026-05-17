@@ -47,6 +47,8 @@ pub struct EngineMetrics {
     pub redis_errors:          AtomicU64,
     /// Postgres errors
     pub pg_errors:             AtomicU64,
+    /// Transactions dropped due to channel capacity
+    pub txs_dropped:           AtomicU64,
 
     // ── Live Data for API ─────────────────────────────────────────────────────
     pub recent_mempool_txs:    tokio::sync::RwLock<std::collections::VecDeque<serde_json::Value>>,
@@ -69,6 +71,7 @@ impl EngineMetrics {
             ws_reconnections:      AtomicU64::new(0),
             redis_errors:          AtomicU64::new(0),
             pg_errors:             AtomicU64::new(0),
+            txs_dropped:           AtomicU64::new(0),
             recent_mempool_txs:    tokio::sync::RwLock::new(std::collections::VecDeque::new()),
         }
     }
@@ -87,6 +90,7 @@ impl EngineMetrics {
     pub fn inc_ws_reconnections(&self)      { self.ws_reconnections.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_redis_errors(&self)          { self.redis_errors.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_pg_errors(&self)             { self.pg_errors.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_txs_dropped(&self)           { self.txs_dropped.fetch_add(1, Ordering::Relaxed); }
 
     pub fn set_graph_pools(&self, n: u64)  { self.graph_pools.store(n, Ordering::Relaxed); }
     pub fn set_graph_tokens(&self, n: u64) { self.graph_tokens.store(n, Ordering::Relaxed); }
@@ -108,6 +112,7 @@ impl EngineMetrics {
             ws_reconnections:      self.ws_reconnections.load(Ordering::Relaxed),
             redis_errors:          self.redis_errors.load(Ordering::Relaxed),
             pg_errors:             self.pg_errors.load(Ordering::Relaxed),
+            txs_dropped:           self.txs_dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -125,6 +130,7 @@ impl EngineMetrics {
             graph_pools  = s.graph_pools,
             graph_tokens = s.graph_tokens,
             ws_reconn    = s.ws_reconnections,
+            txs_dropped  = s.txs_dropped,
             "📊 Engine metrics"
         );
     }
@@ -151,6 +157,7 @@ pub struct MetricsSnapshot {
     pub ws_reconnections:      u64,
     pub redis_errors:          u64,
     pub pg_errors:             u64,
+    pub txs_dropped:           u64,
 }
 
 impl MetricsSnapshot {
