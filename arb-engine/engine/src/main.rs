@@ -189,7 +189,7 @@ async fn main() {
         let mut synced = 0u32;
         let mut failed = 0u32;
 
-        info!("  ⏳ Fetching live pool states from Alchemy ({} pools)...", pools_to_sync.len());
+        info!("  ⏳ Fetching live pool states from Alchemy ({} V3 pools)...", pools_to_sync.len());
 
         let mut g = graph.write().await;
 
@@ -255,6 +255,89 @@ async fn main() {
                 }
             }
         }
+
+        // ── Phase C: V2 SushiSwap pool warm-up ────────────────────────────────
+        // These are the highest-volume V2 pairs and the primary cross-DEX
+        // arbitrage targets against the Uniswap V3 pools above.
+        struct V2PoolDef<'a> {
+            address:  &'a str,
+            token_a:  &'a Token,
+            token_b:  &'a Token,
+            fee_bps:  u32,
+            dex:      DexProtocol,
+            label:    &'a str,
+        }
+
+        let v2_pools = [
+            V2PoolDef { address: "0x397ff1542f962076d0bfe58ea045ffa2d347aca0", token_a: &usdc, token_b: &weth, fee_bps: 30, dex: DexProtocol::SushiSwap, label: "Sushi USDC/WETH" },
+            V2PoolDef { address: "0xceff51756c56ceffca006cd410b03ffc46dd3a58", token_a: &wbtc, token_b: &weth, fee_bps: 30, dex: DexProtocol::SushiSwap, label: "Sushi WBTC/WETH" },
+            V2PoolDef { address: "0xc3d03e4f041fd4cd388c549ee2a29a9e5075882f", token_a: &dai,  token_b: &weth, fee_bps: 30, dex: DexProtocol::SushiSwap, label: "Sushi DAI/WETH"  },
+            V2PoolDef { address: "0x06da0fd433c1a5d7a4faa01111c044910a184553", token_a: &usdt, token_b: &weth, fee_bps: 30, dex: DexProtocol::SushiSwap, label: "Sushi USDT/WETH" },
+        ];
+
+        info!("  ⏳ Fetching live V2 pool states ({} pools)...", v2_pools.len());
+
+        for def in &v2_pools {
+            match evm.get_v2_pool_state(def.address).await {
+                Ok((reserve0, reserve1)) => {
+                    g.upsert_pool(Pool {
+                        id: def.address.into(),
+                        chain: ChainId::Ethereum,
+                        dex: def.dex.clone(),
+                        token_a: def.token_a.clone(),
+                        token_b: def.token_b.clone(),
+                        pool_type: PoolType::ConstantProduct,
+                        fee_bps: def.fee_bps,
+                        last_updated_block: 0,
+                        last_updated_ts: chrono::Utc::now().timestamp(),
+                        state: PoolState {
+                            reserve_a: reserve0,
+                            reserve_b: reserve1,
+                            sqrt_price_x96: None,
+                            tick:       None,
+                            liquidity:  None,
+                            amp_coeff:  None,
+                        },
+                    });
+                    synced += 1;
+                    info!(
+                        pool     = %def.label,
+                        reserve0 = %reserve0,
+                        reserve1 = %reserve1,
+                        "  ✓ {} synced (V2)",
+                        def.label
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    warn!(
+                        pool  = %def.label,
+                        error = %e,
+                        "  ⚠ {} V2 fetch failed — using simulated reserves",
+                        def.label
+                    );
+                    g.upsert_pool(Pool {
+                        id: def.address.into(),
+                        chain: ChainId::Ethereum,
+                        dex: def.dex.clone(),
+                        token_a: def.token_a.clone(),
+                        token_b: def.token_b.clone(),
+                        pool_type: PoolType::ConstantProduct,
+                        fee_bps: def.fee_bps,
+                        last_updated_block: 0,
+                        last_updated_ts: 0,
+                        state: PoolState {
+                            reserve_a: U256::from(1_000_000_000_000_000_000_000u128), // ~1000 ETH
+                            reserve_b: U256::from(3_000_000_000_000u128),              // ~3M USDC
+                            sqrt_price_x96: None,
+                            tick:       None,
+                            liquidity:  None,
+                            amp_coeff:  None,
+                        },
+                    });
+                }
+            }
+        }
         
         metrics.set_graph_pools(g.pool_count() as u64);
         metrics.set_graph_tokens(g.token_count() as u64);
@@ -269,12 +352,13 @@ async fn main() {
     // ── Build router config ───────────────────────────────────────────────────
     let router_config = RouterConfig {
         max_hops:         config.max_hops,
-        min_profit_rate:  0.001, // 0.1% baseline
+        min_profit_usd:   1.0, // $1.0 baseline
         reference_amount: crate::pool::U256::from(1_000_000_000_000_000_000u128), // 1 ETH
         eth_price_usd:    config.eth_price_usd,
         gas_price_gwei:   config.gas_price_gwei,
-        gas_per_hop:      Config::GAS_PER_HOP,
+        gas_estimate:     350_000,
         max_price_impact_bps: 200,
+        verbose:          false,
     };
 
     // ── Start mempool listener ────────────────────────────────────────────────

@@ -67,7 +67,7 @@ pub const MIN_SQRT_RATIO: u128 = 4_295_128_739;
 /// Maximum sqrtPriceX96 (corresponds to MAX_TICK = 887272).
 /// Value: sqrt(1.0001^{887272}) × 2^96 - 1
 /// ≈ 1461446703485210103287273052203988822378723970342
-// pub const MAX_SQRT_RATIO: u128 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378;
+pub const MAX_SQRT_RATIO: u128 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378;
 
 /// FullMath multiplier: 2^128 as U256 (used for mulDiv)
 /// We compute this lazily via 1u128 << 127 and then left-shift by 1.
@@ -143,9 +143,9 @@ fn get_next_sqrt_price_from_token0(
     let liq  = U256::from(liquidity);
     let q96  = U256::from(Q96);
 
-    // numerator1 = L * Q96
+    // numerator1 = L << 96
     let num1: U256 = liq
-        .checked_mul(q96)
+        .checked_shl(96)
         .ok_or_else(|| anyhow::anyhow!("numerator1 overflow"))?;
 
     // Attempt: sqrt_p_new = num1 * sqrt_p / (num1 + amount_in * sqrt_p)
@@ -277,11 +277,11 @@ pub fn get_amount_out_v3(pool: &Pool, amount_in: U256, zero_for_one: bool) -> Re
     }
 
     // Validate sqrtPrice is in bounds
-    let max_sqrt_ratio = U256::from_str_radix("1461446703485210103287273052203988822378723970342", 10).unwrap();
-    if sqrt_price_x96 < U256::from(MIN_SQRT_RATIO) || sqrt_price_x96 > max_sqrt_ratio {
+    let sqrt_p_u128 = sqrt_price_x96.low_u128();
+    if sqrt_p_u128 < MIN_SQRT_RATIO || sqrt_p_u128 > MAX_SQRT_RATIO {
         bail!(
             "sqrtPriceX96 {} out of valid range [{}, {}]",
-            sqrt_price_x96, MIN_SQRT_RATIO, max_sqrt_ratio
+            sqrt_p_u128, MIN_SQRT_RATIO, MAX_SQRT_RATIO
         );
     }
 
@@ -310,7 +310,7 @@ pub fn get_amount_out_v3(pool: &Pool, amount_in: U256, zero_for_one: bool) -> Re
 
     // Clamp to valid range
     let sqrt_p_new = sqrt_p_new.max(U256::from(MIN_SQRT_RATIO));
-    let sqrt_p_new = sqrt_p_new.min(max_sqrt_ratio);
+    let sqrt_p_new = sqrt_p_new.min(U256::from(MAX_SQRT_RATIO));
 
     // ── Step 3: compute output amount from sqrt price delta ───────────────────
     let amount_out = if zero_for_one {
@@ -543,17 +543,15 @@ mod tests {
 
     #[test]
     fn test_higher_fee_produces_less_output() {
-        // Use a wider fee spread (5bps vs 300bps) and large amount
-        // so the Q64.96 integer math produces a measurable difference.
-        let pool_low  = test_pool(5);    // 0.05%
-        let pool_high = test_pool(300);  // 3.00%
-        let amount_in = U256::from(100_000_000_000_000_000_000u128); // 100 ETH
+        let pool_low  = test_pool(5);   // 0.05%
+        let pool_high = test_pool(100); // 1.00%
+        let amount_in = U256::from(1_000_000_000_000_000_000u128);
 
         let out_low  = get_amount_out_v3(&pool_low,  amount_in, true).unwrap();
         let out_high = get_amount_out_v3(&pool_high, amount_in, true).unwrap();
 
-        assert!(out_low >= out_high,
-            "Lower fee should produce more or equal output: low={:?} high={:?}", out_low, out_high);
+        assert!(out_low > out_high,
+            "Lower fee should produce more output: low={:?} high={:?}", out_low, out_high);
     }
 
     // ── Edge cases ────────────────────────────────────────────────────────────

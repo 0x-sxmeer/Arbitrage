@@ -56,13 +56,20 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::arb::opportunity::ArbitrageOpportunity;
-use crate::arb::router::{find_arbitrage_cycles, LiquidityGraph, RouterConfig};
+use crate::arb::router::{
+    find_arbitrage_cycles, reset_changed_tokens,
+    cross_chain_fetch_specs,
+    LiquidityGraph, RouterConfig,
+};
 use crate::chains::evm::EvmAdapter;
 use crate::db::postgres::PostgresStore;
 use crate::db::redis::RedisCache;
-use crate::mempool::calldata_decoder::{is_uniswap_router, decode_uniswap_v3_swap};
+use crate::mempool::calldata_decoder::{
+    classify_router, decode_swap,
+    is_known_dex_router, DexVersion,
+};
 use crate::metrics::EngineMetrics;
-use crate::pool::{fee_tier_to_bps, ChainId, DexProtocol, Pool, PoolState, PoolType, Token, U256};
+use crate::pool::{ChainId, DexProtocol, Pool, PoolState, PoolType, Token, U256};
 
 // ── Reconnect policy ──────────────────────────────────────────────────────────
 const INITIAL_RECONNECT_MS: u64 = 500;
@@ -314,15 +321,17 @@ impl MempoolListener {
         gas_price_gwei: f64,
         tx_count: u64,
     ) {
-        let is_swap = is_uniswap_router(to_addr);
+        let dex = classify_router(to_addr);
+        let is_swap = dex != DexVersion::Unknown;
         // FIX #5: try_write — if the dashboard is currently reading we skip
         if let Ok(mut txs) = self.metrics.recent_mempool_txs.try_write() {
             let short_hash = &tx_hash[..tx_hash.len().min(12)];
+            let dex_label = if is_swap { format!("{:?}", dex) } else { "Mempool".to_string() };
             let entry = serde_json::json!({
                 "id":       tx_count,
                 "hash":     short_hash,
                 "type":     if is_swap { "SWAP" } else { "PENDING" },
-                "dex":      if is_swap { "Uniswap V3" } else { "Mempool" },
+                "dex":      dex_label,
                 "token":    if is_swap { "WETH/USDC" } else { "UNK" },
                 "size":     format!("${:.0}k", (tx.value.to::<u128>() as f64 / 1e18) * 3000.0 / 1000.0),
                 "color":    if is_swap { "#00FFD1" } else { "#64748B" },
@@ -368,39 +377,51 @@ struct WorkerCtx {
 
 impl WorkerCtx {
     async fn process_payload(&self, payload: RawTxPayload) {
-        if !is_uniswap_router(&payload.to_addr) { return; }
+        // Broadened: detect ALL known DEX routers, not just Uniswap V3
+        if !is_known_dex_router(&payload.to_addr) { return; }
         self.metrics.inc_txs_filtered();
         if payload.input.len() < 4 { return; }
 
-        if let Some(decoded) = decode_uniswap_v3_swap(&payload.input) {
-            self.metrics.inc_txs_decoded();
+        // Use full multi-DEX decoder (V2 + V3 + Universal Router)
+        let decoded = match decode_swap(&payload.input, &payload.to_addr) {
+            Some(d) => d,
+            None => {
+                debug!("Calldata decode failed for {}", payload.tx_hash);
+                return;
+            }
+        };
+        self.metrics.inc_txs_decoded();
 
-            let token_in  = decoded.token_in.to_string().to_lowercase();
-            let token_out = decoded.token_out.to_string().to_lowercase();
-            let fee_bps   = fee_tier_to_bps(decoded.fee);
-            let amount_in = U256::from_dec_str(&decoded.amount_in.to_string()).unwrap_or_default();
+        let token_in  = decoded.token_in.to_string().to_lowercase();
+        let token_out = decoded.token_out.to_string().to_lowercase();
+        let fee_bps   = decoded.fee_bps;
+        let amount_in = {
+            // Use primitive_types::U256 (engine type) from alloy's U256
+            let s = decoded.amount_in.to_string();
+            crate::pool::U256::from_str_radix(&s, 10).unwrap_or_default()
+        };
+        let dex_label = format!("{:?}", decoded.dex_version);
 
-            info!(
-                tx_hash   = %payload.tx_hash,
-                token_in  = %token_in,
-                token_out = %token_out,
-                fee_tier  = decoded.fee,
-                amount_in = %decoded.amount_in,
-                gas_gwei  = payload.gas_price_gwei,
-                "🔍 Decoded swap — running pathfinder"
-            );
+        info!(
+            tx_hash   = %payload.tx_hash,
+            dex       = %dex_label,
+            token_in  = %token_in,
+            token_out = %token_out,
+            fee_bps   = fee_bps,
+            amount_in = %amount_in,
+            gas_gwei  = payload.gas_price_gwei,
+            "🔍 Decoded swap — running pathfinder"
+        );
 
-            self.evaluate_arb_opportunity(
-                &token_in,
-                &token_out,
-                fee_bps,
-                payload.gas_price_gwei,
-                amount_in,
-            )
-            .await;
-        } else {
-            debug!("Calldata decode failed for {}", payload.tx_hash);
-        }
+        self.evaluate_arb_opportunity(
+            &token_in,
+            &token_out,
+            fee_bps,
+            payload.gas_price_gwei,
+            amount_in,
+            &decoded.dex_version,
+        )
+        .await;
     }
 
     // ── Core pipeline ─────────────────────────────────────────────────────────
@@ -412,6 +433,7 @@ impl WorkerCtx {
         fee_bps: u32,
         gas_gwei: f64,
         amount_in: U256,
+        dex_version: &DexVersion,
     ) {
         let pool_cache_key = format!("pool:ethereum:{}:{}:{}", token_in, token_out, fee_bps);
 
@@ -470,6 +492,14 @@ impl WorkerCtx {
         // Simulate post-swap state
         pool.simulate_swap(token_in.to_string(), amount_in);
 
+        // Resolve DEX protocol and pool type from decoder output
+        let (_dex_protocol, _pool_type) = match dex_version {
+            DexVersion::UniswapV2 | DexVersion::SushiSwapV2 | DexVersion::PancakeSwapV2 => {
+                (DexProtocol::UniswapV2, PoolType::ConstantProduct)
+            }
+            _ => (DexProtocol::UniswapV3, PoolType::ConcentratedLiquidity),
+        };
+
         // ── Step 3: Graph upsert — FIX #1: opportunistic read first ──────────
         //
         // Only take the write lock if this pool is genuinely new OR the price
@@ -505,17 +535,64 @@ impl WorkerCtx {
             graph.upsert_pool(pool);
         }
 
-        // ── Step 4: Path-finding — read lock only ─────────────────────────────
+        // ── Step 3b: Cross-chain fetch preflight ─────────────────────────────
+        //
+        // Check if the detected swap tokens overlap with any non-EVM pools.
+        // If so, log them for concurrent state fetch (Phase 2 will execute
+        // the actual Solana/Osmosis RPC calls via tokio::join!).
+        {
+            let graph = self.graph.read().await;
+            let specs = cross_chain_fetch_specs(token_in, token_out, &graph);
+            if !specs.is_empty() {
+                info!(
+                    specs_count = specs.len(),
+                    token_in    = %token_in,
+                    token_out   = %token_out,
+                    "🌐 Cross-chain pools identified for concurrent fetch"
+                );
+                for spec in &specs {
+                    debug!(
+                        chain   = ?spec.chain,
+                        pool_id = %spec.pool_id,
+                        "  ↳ pending non-EVM state fetch"
+                    );
+                }
+                // TODO Phase 2: Execute concurrent RPC fetches here:
+                // let fetch_futures = specs.iter().map(|s| fetch_non_evm_state(s));
+                // let results = futures::future::join_all(fetch_futures).await;
+                // for (spec, result) in specs.iter().zip(results) {
+                //     if let Ok(state) = result {
+                //         graph.upsert_pool(build_cross_chain_pool(spec, state));
+                //     }
+                // }
+            }
+        }
+
+        // ── Step 4: Path-finding with multi-start-token scanning ──────────────
+        //
+        // Scan from WETH, USDC, and WBTC as start tokens.  This captures arb
+        // cycles that start from stablecoins (e.g., USDC→WETH→WBTC→USDC) which
+        // a WETH-only scan would miss entirely.
         let mut config = self.router_config.clone();
         config.gas_price_gwei = gas_gwei;
 
         self.metrics.inc_router_scans();
 
+        const START_TOKENS: [&str; 3] = [
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", // WETH
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC
+            "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", // WBTC
+        ];
+
         let opportunities: Vec<ArbitrageOpportunity> = {
-            let graph = self.graph.read().await;
-            let start_token = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
-            let mut opps = graph.find_opportunities(start_token, &config);
+            let mut graph = self.graph.write().await;
+            let mut opps = Vec::new();
+            for start_token in START_TOKENS {
+                opps.extend(graph.find_opportunities(start_token, &config));
+            }
             opps.extend(find_arbitrage_cycles(&graph, &config));
+            // Reset changed_tokens after BF scan to prevent unbounded growth
+            reset_changed_tokens(&mut graph);
             opps
         };
 

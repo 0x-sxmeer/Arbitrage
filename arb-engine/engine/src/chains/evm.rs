@@ -206,8 +206,50 @@ impl EvmAdapter {
         Ok((sqrt_price, tick, liquidity._0))
     }
 
+    /// Fetches the live reserves from a Uniswap V2 / SushiSwap pair contract.
+    ///
+    /// Returns `(reserve_a, reserve_b)` as `primitive_types::U256`.
+    pub async fn get_v2_pool_state(&self, pool_address: &str) -> Result<(U256, U256)> {
+        let start = Instant::now();
 
-    // ── Flash Loan Execution ─────────────────────────────────────────────────
+        let provider = ProviderBuilder::new()
+            .on_builtin(&self.config.http_url)
+            .await
+            .with_context(|| format!("HTTP provider connection failed for {}", self.config.http_url))?;
+
+        let addr = Address::from_str(pool_address)
+            .with_context(|| format!("Invalid pool address: {}", pool_address))?;
+
+        let call_data = Bytes::from(V2_GET_RESERVES_SELECTOR.to_vec());
+
+        let tx = TransactionRequest::default()
+            .to(addr)
+            .input(call_data.into());
+
+        let result = provider.call(&tx)
+            .await
+            .with_context(|| format!("getReserves() call failed for pool {}", pool_address))?;
+
+        let result_bytes: &[u8] = result.as_ref();
+
+        if result_bytes.len() < 64 {
+            bail!("getReserves() response too short: {} bytes", result_bytes.len());
+        }
+
+        let reserve0 = U256::from_big_endian(&result_bytes[0..32]);
+        let reserve1 = U256::from_big_endian(&result_bytes[32..64]);
+
+        let elapsed = start.elapsed();
+        debug!(
+            pool     = %pool_address,
+            reserve0 = %reserve0,
+            reserve1 = %reserve1,
+            latency  = ?elapsed,
+            "V2 pool reserves fetched"
+        );
+
+        Ok((reserve0, reserve1))
+    }
 
     /// Builds and executes the flash loan arbitrage transaction on the local node.
     ///

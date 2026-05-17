@@ -27,7 +27,7 @@
 use alloy::sol;
 use alloy::primitives::{Address, U256};
 use alloy::sol_types::SolCall;
-use tracing::debug;
+use tracing::{debug, warn};
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ABI type definitions

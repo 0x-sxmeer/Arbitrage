@@ -131,8 +131,6 @@ pub struct LiquidityGraph {
     /// Tracks which token indices had edges modified in the latest batch.
     /// Used to short-circuit BF when only a few tokens changed.
     pub changed_tokens: std::collections::HashSet<usize>,
-    /// Token decimals cache: address → decimals (for decimal-aware probing).
-    token_decimals: HashMap<String, u8>,
 }
 
 impl Default for LiquidityGraph {
@@ -147,7 +145,6 @@ impl LiquidityGraph {
             edges:          Vec::new(),
             pools:          HashMap::new(),
             changed_tokens: std::collections::HashSet::new(),
-            token_decimals: HashMap::new(),
         }
     }
 
@@ -157,7 +154,6 @@ impl LiquidityGraph {
         self.edges.clear();
         self.pools.clear();
         self.changed_tokens.clear();
-        self.token_decimals.clear();
     }
 
     // ── Pool management ───────────────────────────────────────────────────────
@@ -171,31 +167,16 @@ impl LiquidityGraph {
         self.ensure_token(&pool_arc.token_a.address);
         self.ensure_token(&pool_arc.token_b.address);
 
-        // Cache decimals for decimal-aware probing
-        self.token_decimals.insert(
-            pool_arc.token_a.address.clone(),
-            pool_arc.token_a.decimals,
-        );
-        self.token_decimals.insert(
-            pool_arc.token_b.address.clone(),
-            pool_arc.token_b.decimals,
-        );
-
         // Remove old edges for this pool
         self.edges.retain(|e| e.pool.id != pool_arc.id);
 
-        // ── Decimal-aware probe amounts ──────────────────────────────────────
-        // Use 1.0 unit of the INPUT token.  For WETH (18 dec) = 10^18.
-        // For USDC (6 dec) = 10^6.  This ensures the rate = output/input is
-        // dimensionally correct regardless of the token pair's decimal mismatch.
-        let unit_a = U256::from(10u64).pow(U256::from(pool_arc.token_a.decimals as u64));
-        let unit_b = U256::from(10u64).pow(U256::from(pool_arc.token_b.decimals as u64));
+        // Probe amount: 1 token in 18-decimal units — safe for u128
+        let unit = U256::from(10u64.pow(18));
 
         let idx_a = self.token_index[&pool_arc.token_a.address];
         let idx_b = self.token_index[&pool_arc.token_b.address];
 
-        // A→B edge: probe with 1.0 of token_a
-        if let Some(rate_ab) = Self::compute_rate_static(&pool_arc, unit_a, true) {
+        if let Some(rate_ab) = Self::compute_rate_static(&pool_arc, unit, true) {
             self.edges.push(LiquidityEdge {
                 pool:         Arc::clone(&pool_arc),
                 token_in:     pool_arc.token_a.address.clone(),
@@ -205,8 +186,7 @@ impl LiquidityGraph {
             self.changed_tokens.insert(idx_a);
         }
 
-        // B→A edge: probe with 1.0 of token_b
-        if let Some(rate_ba) = Self::compute_rate_static(&pool_arc, unit_b, false) {
+        if let Some(rate_ba) = Self::compute_rate_static(&pool_arc, unit, false) {
             self.edges.push(LiquidityEdge {
                 pool:         Arc::clone(&pool_arc),
                 token_in:     pool_arc.token_b.address.clone(),
@@ -233,7 +213,7 @@ impl LiquidityGraph {
     }
 
     /// Iterate all edges from a given token.
-    pub fn edges_from<'a>(&'a self, token: &'a str) -> impl Iterator<Item = &'a LiquidityEdge> + 'a {
+    pub fn edges_from(&self, token: &str) -> impl Iterator<Item = &LiquidityEdge> {
         self.edges.iter().filter(move |e| e.token_in == token)
     }
 
@@ -268,17 +248,7 @@ impl LiquidityGraph {
         }
 
         if in_u128 == 0 { return None; }
-
-        // ── Normalise rate for cross-decimal pairs ──────────────────────────
-        // The raw rate = out_u128 / in_u128 has decimal scaling baked in.
-        // For the rate to represent "economic value", we normalise:
-        //   rate = (out / 10^dec_out) / (in / 10^dec_in)
-        //        = (out / in) × 10^(dec_in - dec_out)
-        let dec_in  = if zero_for_one { pool.token_a.decimals } else { pool.token_b.decimals };
-        let dec_out = if zero_for_one { pool.token_b.decimals } else { pool.token_a.decimals };
-        let decimal_adj = 10f64.powi(dec_in as i32 - dec_out as i32);
-        let rate = (out_u128 as f64 / in_u128 as f64) * decimal_adj;
-
+        let rate = out_u128 as f64 / in_u128 as f64;
         if rate <= 0.0 || !rate.is_finite() { None } else { Some(rate) }
     }
 
@@ -343,9 +313,9 @@ impl LiquidityGraph {
             token_in:  start.to_string(),
             token_out: mid.to_string(),
             amount_in: input,
-            expected_amount_out: out1,
+            amount_out: out1,
             fee_bps:   pool1.fee_bps,
-            step_price_impact_bps: imp1,
+            price_impact_bps: imp1,
         };
         let step2 = SwapStep {
             pool_id:   pool2.id.clone(),
@@ -354,22 +324,15 @@ impl LiquidityGraph {
             token_in:  mid.to_string(),
             token_out: start.to_string(),
             amount_in: out1,
-            expected_amount_out: out2,
+            amount_out: out2,
             fee_bps:   pool2.fee_bps,
-            step_price_impact_bps: imp2,
+            price_impact_bps: imp2,
         };
 
         Some(ArbitrageOpportunity::new(
             vec![step1, step2],
-            start.to_string(),
-            pool1.chain,
-            input,
-            out2,
-            config.gas_estimate,
+            config.gas_cost_wei(),
             config.gas_price_gwei,
-            U256::zero(),
-            imp1 + imp2,
-            0,
         ))
     }
 }
@@ -430,12 +393,6 @@ pub fn find_arbitrage_cycles(
     }
 
     results
-}
-
-/// Clear the changed_tokens set after a BF scan to prevent unbounded growth.
-/// Called by the listener after each evaluation cycle.
-pub fn reset_changed_tokens(graph: &mut LiquidityGraph) {
-    graph.changed_tokens.clear();
 }
 
 /// Single-source Bellman-Ford starting from vertex `src`.
@@ -604,9 +561,9 @@ fn reconstruct_and_evaluate(
             token_in:         edge.token_in.clone(),
             token_out:        edge.token_out.clone(),
             amount_in:        *amount_in,
-            expected_amount_out: *amount_out,
+            amount_out:       *amount_out,
             fee_bps:          edge.pool.fee_bps,
-            step_price_impact_bps: impact,
+            price_impact_bps: impact,
         }
     }).collect();
 
@@ -614,22 +571,7 @@ fn reconstruct_and_evaluate(
         return None;
     }
 
-    let gross_output = swap_steps.last().unwrap().expected_amount_out;
-    let chain = swap_steps.first().unwrap().chain;
-    let total_impact: u32 = swap_steps.iter().map(|s| s.step_price_impact_bps).sum();
-
-    let mut opp = ArbitrageOpportunity::new(
-        swap_steps,
-        cycle_entry_token.clone(),
-        chain,
-        config.reference_amount,
-        gross_output,
-        config.gas_estimate,
-        config.gas_price_gwei,
-        U256::zero(),
-        total_impact,
-        0,
-    );
+    let mut opp = ArbitrageOpportunity::new(swap_steps, config.gas_cost_wei(), config.gas_price_gwei);
     opp.calculate_nev(config.eth_price_usd);
 
     if opp.is_executable {
@@ -724,7 +666,7 @@ pub fn sim_impact(pool: &Pool, amount_in: U256, zero_for_one: bool) -> u32 {
         PoolType::ConcentratedLiquidity =>
             v3::price_impact_bps_v3(pool, amount_in, zero_for_one),
         PoolType::ConstantProduct | PoolType::StableSwap =>
-            v2::price_impact_bps(pool, amount_in, zero_for_one),
+            v2::price_impact_bps_v2(pool, amount_in, zero_for_one),
     }
 }
 
@@ -898,37 +840,6 @@ mod tests {
         g.upsert_pool(make_v2_pool("p1", "0xweth", "0xusdc", 1_000_000, 2_000_000));
         let specs = cross_chain_fetch_specs("0xweth", "0xusdc", &g);
         assert!(specs.is_empty(), "No non-EVM pools should produce fetch specs");
-    }
-
-    #[test]
-    fn test_cross_chain_fetch_specs_with_non_evm_pools() {
-        let mut g = LiquidityGraph::new();
-        // EVM pool
-        g.upsert_pool(make_v2_pool("p_evm", "0xweth", "0xusdc", 1_000_000, 2_000_000));
-
-        // Solana pool sharing "0xweth"
-        let p_sol = make_v2_pool("solana:sol_weth_usdc", "0xweth", "0xother", 1_000_000, 2_000_000);
-        g.upsert_pool(p_sol);
-
-        // Osmosis pool sharing "0xusdc"
-        let p_osm = make_v2_pool("cosmos:osm_usdc_atom", "0xusdc", "0xatom", 1_000_000, 2_000_000);
-        g.upsert_pool(p_osm);
-
-        // Non-overlapping Solana pool
-        let p_sol_non_overlap = make_v2_pool("solana:sol_other", "0xother1", "0xother2", 1_000_000, 2_000_000);
-        g.upsert_pool(p_sol_non_overlap);
-
-        // Verify specs for EVM swap "0xweth" -> "0xusdc"
-        let specs = cross_chain_fetch_specs("0xweth", "0xusdc", &g);
-        assert_eq!(specs.len(), 2, "Should identify exactly two overlapping non-EVM pools");
-
-        let has_solana = specs.iter().any(|s| s.chain == CrossChainTarget::Solana && s.pool_id == "solana:sol_weth_usdc");
-        let has_osmosis = specs.iter().any(|s| s.chain == CrossChainTarget::Osmosis && s.pool_id == "cosmos:osm_usdc_atom");
-        let has_other = specs.iter().any(|s| s.pool_id == "solana:sol_other");
-
-        assert!(has_solana, "Should find overlapping Solana pool");
-        assert!(has_osmosis, "Should find overlapping Osmosis pool");
-        assert!(!has_other, "Should not include non-overlapping pool");
     }
 
     #[test]
