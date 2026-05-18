@@ -94,6 +94,8 @@ const SWAP_ROUTER_02_ETHEREUM: &str = "0x68b3465833fb72A70eCDF485E0e4C7bD8665Fc4
 const SWAP_ROUTER_02_BASE:     &str = "0x2626664c2603336E57B271c5C0b26F421741e481";
 const SWAP_ROUTER_02_ARBITRUM: &str = "0x68b3465833fb72A70eCDF485E0e4C7bD8665Fc45";
 
+// Aerodrome V2 Router on Base (Solidly-compatible, UniV2 interface)
+const AERODROME_V2_ROUTER:      &str = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43";
 // Aerodrome router on Base (for Aerodrome V3 / Universal Router swaps)
 const AERODROME_UNIVERSAL_ROUTER: &str = "0x6Cb442acF35158D5eDa88fe602221b67B400Be3E";
 
@@ -162,10 +164,31 @@ impl EvmAdapter {
     /// (e.g., Aerodrome buy → Uniswap sell) use the correct router per leg.
     fn resolve_router_for_dex(&self, dex: &str) -> &'static str {
         let lower = dex.to_lowercase();
-        if lower.contains("aerodrome") {
-            AERODROME_UNIVERSAL_ROUTER
-        } else {
-            self.default_v3_router()
+        match self.config.chain {
+            ChainId::Base => {
+                if lower.contains("uniswap v2") || lower.contains("aerodrome v2") || lower.contains("v2") {
+                    AERODROME_V2_ROUTER
+                } else if lower.contains("aerodrome") || lower.contains("universal") {
+                    AERODROME_UNIVERSAL_ROUTER
+                } else {
+                    SWAP_ROUTER_02_BASE
+                }
+            }
+            ChainId::Arbitrum => {
+                if lower.contains("v2") || lower.contains("sushiswap") {
+                    // Sushiswap V2 or Uni V2 on Arbitrum
+                    "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506" // SushiSwap Router
+                } else {
+                    SWAP_ROUTER_02_ARBITRUM
+                }
+            }
+            _ => { // Ethereum / Default
+                if lower.contains("v2") || lower.contains("sushiswap") {
+                    "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D" // Uniswap V2 Router
+                } else {
+                    SWAP_ROUTER_02_ETHEREUM
+                }
+            }
         }
     }
 
@@ -308,24 +331,69 @@ impl EvmAdapter {
         let buy_router  = Address::from_str(buy_router_str).context("Invalid buy router address")?;
         let sell_router = Address::from_str(sell_router_str).context("Invalid sell router address")?;
 
-        // FIX-1: multiply by 100 to convert bps → V3 per-million fee units
-        let buy_fee_units  = arb.route[0].fee_bps * 100;
-        let sell_fee_units = arb.route[1].fee_bps * 100;
+        // Determine if each leg is V3 or V2
+        let buy_is_v3 = {
+            let lower = arb.route[0].dex.to_lowercase();
+            lower.contains("v3") || lower.contains("concentrated") || lower.contains("universal")
+        };
+        let sell_is_v3 = {
+            let lower = arb.route[1].dex.to_lowercase();
+            lower.contains("v3") || lower.contains("concentrated") || lower.contains("universal")
+        };
+
+        // Normalize fee units: handle both mempool basis points (e.g. 5, 30)
+        // and main.rs initialized Uniswap V3 units (e.g. 500, 3000)
+        let normalize_fee = |fee: u32, is_v3: bool| -> u32 {
+            if !is_v3 {
+                return 0;
+            }
+            match fee {
+                1 => 100,
+                5 => 500,
+                30 => 3000,
+                100 => 100,   // 0.01% V3 tier
+                500 => 500,   // 0.05% V3 tier
+                3000 => 3000, // 0.30% V3 tier
+                10000 => 10000, // 1.00% V3 tier
+                _ => {
+                    if fee < 100 {
+                        fee * 100
+                    } else {
+                        fee
+                    }
+                }
+            }
+        };
+
+        let buy_fee_units  = normalize_fee(arb.route[0].fee_bps, buy_is_v3);
+        let sell_fee_units = normalize_fee(arb.route[1].fee_bps, sell_is_v3);
         let buy_fee  = alloy::primitives::Uint::<24, 1>::from(buy_fee_units);
         let sell_fee = alloy::primitives::Uint::<24, 1>::from(sell_fee_units);
+
+        let buy_path = if !buy_is_v3 {
+            vec![token_borrow, token_intermediate]
+        } else {
+            vec![]
+        };
+
+        let sell_path = if !sell_is_v3 {
+            vec![token_intermediate, token_borrow]
+        } else {
+            vec![]
+        };
 
         let min_profit = alloy::primitives::U256::from_str(&arb.net_expected_value.to_string())
             .unwrap_or_default();
 
         Ok(ArbParams {
             buyRouter:         buy_router,
-            buyIsV3:           true,
+            buyIsV3:           buy_is_v3,
             buyFee:            buy_fee,
-            buyPath:           vec![],
+            buyPath:           buy_path,
             sellRouter:        sell_router,
-            sellIsV3:          true,
+            sellIsV3:          sell_is_v3,
             sellFee:           sell_fee,
-            sellPath:          vec![],
+            sellPath:          sell_path,
             tokenBorrow:       token_borrow,
             tokenIntermediate: token_intermediate,
             minProfitWei:      min_profit,

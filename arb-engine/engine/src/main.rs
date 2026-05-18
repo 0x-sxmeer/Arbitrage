@@ -206,10 +206,10 @@ async fn main() {
 
         let pools_to_sync = [
             // Uniswap V3 on Base — top-volume CLMM pools
-            PoolDef { address: "0xd0b53D9277642d899DF5C87A3966A349A798F224", token_a: &weth, token_b: &usdc, fee_bps: 500,  label: "UniV3 USDC/WETH 0.05% (Base)" },
-            PoolDef { address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B5", token_a: &wbtc, token_b: &weth, fee_bps: 3000, label: "UniV3 WBTC/WETH 0.3% (Base)"  },
-            PoolDef { address: "0x6c561B446416E1A00E8E93E221854d6eA4171372", token_a: &dai,  token_b: &usdc, fee_bps: 100,  label: "UniV3 DAI/USDC 0.01% (Base)"  },
-            PoolDef { address: "0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef", token_a: &weth, token_b: &usdt, fee_bps: 500,  label: "UniV3 USDT/WETH 0.05% (Base)" },
+            PoolDef { address: "0xd0b53D9277642d899DF5C87A3966A349A798F224", token_a: &weth, token_b: &usdc, fee_bps: 5,    label: "UniV3 USDC/WETH 0.05% (Base)" },
+            PoolDef { address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B5", token_a: &wbtc, token_b: &weth, fee_bps: 30,   label: "UniV3 WBTC/WETH 0.3% (Base)"  },
+            PoolDef { address: "0x6c561B446416E1A00E8E93E221854d6eA4171372", token_a: &dai,  token_b: &usdc, fee_bps: 1,    label: "UniV3 DAI/USDC 0.01% (Base)"  },
+            PoolDef { address: "0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef", token_a: &weth, token_b: &usdt, fee_bps: 5,    label: "UniV3 USDT/WETH 0.05% (Base)" },
         ];
 
         let evm = evm_adapter.as_ref().unwrap();
