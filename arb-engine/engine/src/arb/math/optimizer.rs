@@ -16,6 +16,7 @@
 #![allow(dead_code)]
 
 use crate::pool::U256;
+use primitive_types::U512;
 
 /// Golden ratio conjugate: φ = (√5 - 1) / 2 ≈ 0.6180339887
 /// Represented as 618034 / 1_000_000 for integer arithmetic.
@@ -74,7 +75,6 @@ pub fn find_optimal_input<F: Fn(U256) -> U256>(
     let mut b = upper;
     let min_interval = U256::from(MIN_INTERVAL_WEI);
 
-    // Interior probe points using golden ratio
     let mut x1 = golden_subtract(a, b);
     let mut x2 = golden_add(a, b);
 
@@ -103,15 +103,18 @@ pub fn find_optimal_input<F: Fn(U256) -> U256>(
         }
     }
 
-    // Best point is the midpoint of the final interval
-    let optimal = (a + b) / U256::from(2u64);
+    // Best point is the midpoint of the final interval (overflow-safe)
+    let optimal = a + (b - a) / U256::from(2u64);
     let gross_output = simulate(optimal);
 
-    if gross_output <= optimal + gas_cost_wei {
+    if gross_output <= optimal {
         return None; // Not profitable after gas
     }
-
-    let net_profit = gross_output - optimal - gas_cost_wei;
+    let gross_profit = gross_output - optimal;
+    if gross_profit <= gas_cost_wei {
+        return None; // Not profitable after gas
+    }
+    let net_profit = gross_profit - gas_cost_wei;
 
     Some(OptimalInput {
         amount: optimal,
@@ -127,27 +130,58 @@ pub fn find_optimal_input<F: Fn(U256) -> U256>(
 #[inline]
 fn profit<F: Fn(U256) -> U256>(simulate: &F, input: U256, gas_cost_wei: U256) -> U256 {
     let output = simulate(input);
-    let total_cost = input + gas_cost_wei;
-    if output > total_cost {
-        output - total_cost
-    } else {
+    if output <= input {
+        return U256::zero();
+    }
+    let gross_profit = output - input;
+    if gross_profit <= gas_cost_wei {
         U256::zero()
+    } else {
+        gross_profit - gas_cost_wei
     }
 }
 
 /// Compute the left interior point: a + (1 - φ)(b - a)
 #[inline]
 fn golden_subtract(a: U256, b: U256) -> U256 {
+    if b < a {
+        return a;
+    }
     let diff = b - a;
-    let complement = U256::from(PHI_DEN - PHI_NUM);
-    a + (diff * complement) / U256::from(PHI_DEN)
+    let complement = PHI_DEN - PHI_NUM;
+    
+    let diff_512 = U512::from(diff);
+    let complement_512 = U512::from(complement);
+    let phi_den_512 = U512::from(PHI_DEN);
+    
+    let quotient = (diff_512 * complement_512) / phi_den_512;
+    
+    let mut quotient_bytes = [0u8; 64];
+    quotient.to_big_endian(&mut quotient_bytes);
+    let quotient_256 = U256::from_big_endian(&quotient_bytes[32..64]);
+    
+    a + quotient_256
 }
 
 /// Compute the right interior point: a + φ(b - a)
 #[inline]
 fn golden_add(a: U256, b: U256) -> U256 {
+    if b < a {
+        return a;
+    }
     let diff = b - a;
-    a + (diff * U256::from(PHI_NUM)) / U256::from(PHI_DEN)
+    
+    let diff_512 = U512::from(diff);
+    let phi_num_512 = U512::from(PHI_NUM);
+    let phi_den_512 = U512::from(PHI_DEN);
+    
+    let quotient = (diff_512 * phi_num_512) / phi_den_512;
+    
+    let mut quotient_bytes = [0u8; 64];
+    quotient.to_big_endian(&mut quotient_bytes);
+    let quotient_256 = U256::from_big_endian(&quotient_bytes[32..64]);
+    
+    a + quotient_256
 }
 
 /// Quick helper: estimate the upper bound for a swap path based on
@@ -234,5 +268,96 @@ mod tests {
         let reserve = U256::from(1_000_000_000u64);
         let bound = estimate_upper_bound(reserve, 0.02); // 2%
         assert_eq!(bound, U256::from(20_000_000u64));
+    }
+
+    #[test]
+    fn test_fuzz_optimizer() {
+        let sim = |x: U256| -> U256 {
+            if x > U256::from(500_000u64) && x < U256::from(600_000u64) {
+                x + U256::from(50_000u64)
+            } else {
+                U256::zero()
+            }
+        };
+
+        let _ = find_optimal_input(
+            &sim,
+            U256::from(1_000u64),
+            U256::from(1_000_000u64),
+            U256::from(10_000u64),
+        );
+    }
+
+    #[test]
+    fn test_golden_add_less_than_x2() {
+        // Try to find if golden_add(x1, b) < x2 is ever true due to integer rounding
+        for diff in 1..100_000u64 {
+            let a = U256::from(0u64);
+            let b = U256::from(diff);
+            let x1 = golden_subtract(a, b);
+            let x2 = golden_add(a, b);
+            let next_x2 = golden_add(x1, b);
+            if next_x2 < x2 {
+                panic!("Found violation! diff={}, x1={}, x2={}, next_x2={}", diff, x1, x2, next_x2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_fuzz_gss_invariants() {
+        // We will simulate the GSS loop directly with random/extreme step functions
+        // to see if we can trigger b < a or other invariant violations.
+        use std::cell::Cell;
+
+        for seed in 0..10_000 {
+            let peak = U256::from(seed * 100);
+            let sim = |x: U256| -> U256 {
+                // A highly chaotic, non-monotonic function
+                let val = x.low_u64();
+                let hash = val.wrapping_mul(1103515245).wrapping_add(12345);
+                U256::from(hash % 100_000)
+            };
+
+            let gas_cost = U256::from(seed);
+            let lower = U256::from(100);
+            let upper = U256::from(1_000_000);
+
+            // Let's trace GSS step by step
+            let mut a = lower;
+            let mut b = upper;
+            let min_interval = U256::from(MIN_INTERVAL_WEI);
+
+            if a >= b { continue; }
+
+            let mut x1 = golden_subtract(a, b);
+            let mut x2 = golden_add(a, b);
+
+            let mut f1 = profit(&sim, x1, gas_cost);
+            let mut f2 = profit(&sim, x2, gas_cost);
+
+            let mut iters = 0;
+            while iters < MAX_ITERS && (b - a) > min_interval {
+                iters += 1;
+
+                assert!(b >= a, "Violation: b < a! a={}, b={}", a, b);
+                assert!(x1 >= a, "Violation: x1 < a! a={}, x1={}", a, x1);
+                assert!(x2 <= b, "Violation: x2 > b! b={}, x2={}", b, x2);
+                assert!(x1 <= x2, "Violation: x1 > x2! x1={}, x2={}", x1, x2);
+
+                if f1 > f2 {
+                    b = x2;
+                    x2 = x1;
+                    f2 = f1;
+                    x1 = golden_subtract(a, b);
+                    f1 = profit(&sim, x1, gas_cost);
+                } else {
+                    a = x1;
+                    x1 = x2;
+                    f1 = f2;
+                    x2 = golden_add(a, b);
+                    f2 = profit(&sim, x2, gas_cost);
+                }
+            }
+        }
     }
 }
