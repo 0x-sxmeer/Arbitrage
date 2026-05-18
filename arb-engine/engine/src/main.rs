@@ -52,7 +52,7 @@ async fn main() {
     // ── Initialize tracing (structured logging) ──────────────────────────────
     let use_json_log = std::env::var("LOG_FORMAT").unwrap_or_default() == "json";
     let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("arb_engine=info".parse().unwrap());
+        .add_directive("arb_engine=debug".parse().unwrap());
 
     if use_json_log {
         tracing_subscriber::fmt()
@@ -186,11 +186,11 @@ async fn main() {
         // ── Token definitions (checksummed addresses) ─────────────────────────
         // ── Base L2 token addresses (checksummed) ─────────────────────────────
         // Base canonical bridged tokens — identical ERC-20 interfaces, L2 addresses
-        let weth = Token { address: "0x4200000000000000000000000000000000000006".into(), symbol: "WETH".into(), decimals: 18 };
-        let usdc = Token { address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into(), symbol: "USDC".into(), decimals: 6 };
-        let wbtc = Token { address: "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c".into(), symbol: "WBTC".into(), decimals: 8 };
-        let dai  = Token { address: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb".into(), symbol: "DAI".into(),  decimals: 18 };
-        let usdt = Token { address: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2".into(), symbol: "USDT".into(), decimals: 6 };
+        let weth = Token { address: "0x4200000000000000000000000000000000000006".to_lowercase(), symbol: "WETH".into(), decimals: 18 };
+        let usdc = Token { address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_lowercase(), symbol: "USDC".into(), decimals: 6 };
+        let wbtc = Token { address: "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c".to_lowercase(), symbol: "WBTC".into(), decimals: 8 };
+        let dai  = Token { address: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb".to_lowercase(), symbol: "DAI".into(),  decimals: 18 };
+        let usdt = Token { address: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2".to_lowercase(), symbol: "USDT".into(), decimals: 6 };
 
         // ── Base L2 Pool Addresses ─────────────────────────────────────────────
         // Highest TVL pools on Base — primary arbitrage battleground.
@@ -224,7 +224,7 @@ async fn main() {
             match evm.get_v3_pool_state(def.address).await {
                 Ok((sqrt_price, tick, liq)) => {
                     g.upsert_pool(Pool {
-                        id: def.address.into(),
+                        id: def.address.to_lowercase(),
                         chain: active_chain,
                         dex: DexProtocol::UniswapV3,
                         token_a: def.token_a.clone(),
@@ -261,7 +261,7 @@ async fn main() {
                     );
                     // Insert with simulated defaults so the graph still has connectivity
                     g.upsert_pool(Pool {
-                        id: def.address.into(),
+                        id: def.address.to_lowercase(),
                         chain: active_chain,
                         dex: DexProtocol::UniswapV3,
                         token_a: def.token_a.clone(),
@@ -311,7 +311,7 @@ async fn main() {
             match evm.get_v2_pool_state(def.address).await {
                 Ok((reserve0, reserve1)) => {
                     g.upsert_pool(Pool {
-                        id: def.address.into(),
+                        id: def.address.to_lowercase(),
                         chain: active_chain,
                         dex: def.dex.clone(),
                         token_a: def.token_a.clone(),
@@ -347,7 +347,7 @@ async fn main() {
                         def.label
                     );
                     g.upsert_pool(Pool {
-                        id: def.address.into(),
+                        id: def.address.to_lowercase(),
                         chain: active_chain,
                         dex: def.dex.clone(),
                         token_a: def.token_a.clone(),
@@ -357,8 +357,20 @@ async fn main() {
                         last_updated_block: 0,
                         last_updated_ts: 0,
                         state: PoolState {
-                            reserve_a: U256::from(1_000_000_000_000_000_000_000u128), // ~1000 ETH
-                            reserve_b: U256::from(3_000_000_000_000u128),              // ~3M USDC
+                            reserve_a: if def.token_a.symbol == "WETH" {
+                                U256::from(1_000_000_000_000_000_000_000u128) // ~1000 WETH (18 dec)
+                            } else if def.token_a.symbol == "WBTC" {
+                                U256::from(10_000_000_000u128) // ~100 WBTC (8 dec)
+                            } else if def.token_a.symbol == "DAI" {
+                                U256::from(3_000_000_000_000_000_000_000_000u128) // ~3M DAI (18 dec)
+                            } else {
+                                U256::from(3_000_000_000_000u128) // ~3M stables (USDC/USDT, 6 dec)
+                            },
+                            reserve_b: if def.token_b.symbol == "WETH" {
+                                U256::from(1_000_000_000_000_000_000_000u128) // ~1000 WETH (18 dec)
+                            } else {
+                                U256::from(3_000_000_000_000u128) // ~3M stables (6 dec)
+                            },
                             sqrt_price_x96: None,
                             tick:       None,
                             liquidity:  None,

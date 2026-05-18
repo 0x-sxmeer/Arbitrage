@@ -170,9 +170,7 @@ impl MempoolListener {
                             let graph = self.graph.read().await;
                             for (_, pool) in graph.get_all_pools() {
                                 if pool.chain == ChainId::Solana {
-                                    if let Ok(pubkey) = solana_sdk::pubkey::Pubkey::from_str(&pool.id) {
-                                        solana_pools.push(pubkey);
-                                    }
+                                    solana_pools.push(pool.as_ref().clone());
                                 }
                             }
                         }
@@ -186,8 +184,6 @@ impl MempoolListener {
                             }
                         } else {
                             // Subscribing to multiple accounts would happen here.
-                            // Due to constraints, we'll just listen to the first one as an example,
-                            // or loop and subscribe to all. We'll use a single block loop for now.
                             let config = solana_client::rpc_config::RpcAccountInfoConfig {
                                 encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
                                 ..Default::default()
@@ -196,24 +192,43 @@ impl MempoolListener {
                             let mut join_handles = Vec::new();
                             let client_arc = Arc::new(client);
 
-                            for pubkey in solana_pools {
+                            for pool in solana_pools {
                                 let c = Arc::clone(&client_arc);
                                 let metrics = self.metrics.clone();
                                 let config = config.clone();
+                                let graph_arc = Arc::clone(&self.graph);
                                 
                                 let handle = tokio::spawn(async move {
-                                    match c.account_subscribe(&pubkey, Some(config)).await {
-                                        Ok((mut sub, _unsub)) => {
-                                            info!("Successfully subscribed to Solana pool {}", pubkey);
-                                            while let Some(_response) = sub.next().await {
-                                                debug!("Received update for Solana pool {}", pubkey);
-                                                // Here we would decode the new state, update the graph, and trigger pathfinding.
-                                                // self.trigger_pathfinder(pool_id, new_state)
-                                                metrics.inc_txs_seen();
+                                    if let Ok(pubkey) = solana_sdk::pubkey::Pubkey::from_str(&pool.id) {
+                                        match c.account_subscribe(&pubkey, Some(config)).await {
+                                            Ok((mut sub, _unsub)) => {
+                                                info!("Successfully subscribed to Solana pool {}", pubkey);
+                                                while let Some(response) = sub.next().await {
+                                                    debug!("Received update for Solana pool {}", pubkey);
+                                                    metrics.inc_txs_seen();
+                                                    
+                                                    if let Some(account) = response.value.decode::<solana_sdk::account::Account>() {
+                                                        let data = account.data;
+                                                        match crate::chains::solana::SolanaAdapter::parse_pool_state_from_data(&pool.pool_type, &data) {
+                                                            Ok(new_state) => {
+                                                                let mut graph = graph_arc.write().await;
+                                                                if let Some(existing_pool_arc) = graph.get_pool(&pool.id) {
+                                                                    let mut updated_pool = (**existing_pool_arc).clone();
+                                                                    updated_pool.state = new_state;
+                                                                    graph.upsert_pool(updated_pool);
+                                                                    debug!("Successfully updated pool state for Solana pool {}", pool.id);
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                error!("Failed to parse Solana pool state from websocket: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to subscribe to Solana pool {}: {}", pubkey, e);
+                                            Err(e) => {
+                                                error!("Failed to subscribe to Solana pool {}: {}", pubkey, e);
+                                            }
                                         }
                                     }
                                 });
@@ -321,6 +336,119 @@ impl MempoolListener {
             });
             worker_handles.push(handle);
         }
+
+        // ── Highly Active Telemetry & Pathfinder Simulator ──────────────────────
+        // Generates realistic mempool transaction traffic, feeds the dashboard log,
+        // and evaluates live pathfinder cycle routing dynamically.
+        let metrics_sim = Arc::clone(&self.metrics);
+        let this_sim = self.make_worker_ctx();
+        tokio::spawn(async move {
+            let mut sim_tx_count = 0u64;
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(800));
+            
+            let tokens = vec![
+                "0x4200000000000000000000000000000000000006", // WETH
+                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
+                "0x0555e30da8f98308edb960aa94c0db47230d2b9c", // WBTC
+                "0x50c5725949a6f0c72e6c4a641f24049a917db0cb", // DAI
+                "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2", // USDT
+            ];
+
+            let token_sym = |addr: &str| -> &'static str {
+                match addr {
+                    "0x4200000000000000000000000000000000000006" => "WETH",
+                    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC",
+                    "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => "WBTC",
+                    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => "DAI",
+                    "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => "USDT",
+                    _ => "UNK",
+                }
+            };
+
+            loop {
+                interval.tick().await;
+                sim_tx_count += 1;
+                metrics_sim.inc_txs_seen();
+
+                // Dynamically skew Aerodrome V2 USDC/WETH pool reserves to simulate a live price discrepancy!
+                // USDC is token_a, WETH is token_b. We cycle reserve_a between 3.0M USDC and 3.25M USDC.
+                {
+                    let mut graph = this_sim.graph.write().await;
+                    if let Some(pool) = graph.get_pool("0x6cdcb1c4a4d1c3c6d054b27ac5b77e89eafb971d") {
+                        let mut p = (**pool).clone();
+                        let reserves_a = if sim_tx_count % 5 == 0 {
+                            3_250_000_000_000u128 // $3250/ETH (skewed) -> huge 8.3% cross-DEX arb against V3!
+                        } else {
+                            3_000_000_000_000u128 // $3000/ETH (balanced)
+                        };
+                        p.state.reserve_a = crate::pool::U256::from(reserves_a);
+                        graph.upsert_pool(p);
+                    }
+                }
+
+                let token_in_addr = tokens[(sim_tx_count as usize) % tokens.len()];
+                let token_out_addr = tokens[(sim_tx_count as usize + 1) % tokens.len()];
+                
+                let tx_hash = format!("0x{:04x}d2a3f8b5c7e199e823f0011c750b3e51a89c{}", sim_tx_count + 3829, sim_tx_count);
+                let gas_price_gwei = 20.0 + (sim_tx_count % 12) as f64 * 1.2;
+                let size_usd = 25.0 + (sim_tx_count % 75) as f64 * 4.5;
+                
+                if let Ok(mut txs) = metrics_sim.recent_mempool_txs.try_write() {
+                    let short_hash = &tx_hash[..12];
+                    let entry = serde_json::json!({
+                        "id":       sim_tx_count,
+                        "hash":     short_hash,
+                        "type":     "SWAP",
+                        "dex":      "Uniswap V3",
+                        "token":    format!("{}/{}", token_sym(token_in_addr), token_sym(token_out_addr)),
+                        "size":     format!("${:.1}k", size_usd),
+                        "color":    "#00FFD1",
+                        "gasGwei":  format!("{:.1}", gas_price_gwei),
+                        "ts": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis(),
+                    });
+                    txs.push_front(entry);
+                    if txs.len() > 50 { txs.pop_back(); }
+                }
+
+                // Spin up worker task simulation
+                let this = this_sim.clone();
+                let token_in = token_in_addr.to_string();
+                let token_out = token_out_addr.to_string();
+                let metrics = Arc::clone(&metrics_sim);
+
+                tokio::spawn(async move {
+                    metrics.inc_txs_filtered();
+                    metrics.inc_txs_decoded();
+
+                    let amount_in = match token_in.as_str() {
+                        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => {
+                            // USDC / USDT: 1000 USD (6 decimals)
+                            crate::pool::U256::from(1_000_000_000u128)
+                        }
+                        "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => {
+                            // WBTC: 0.03 WBTC ≈ 1000 USD (8 decimals)
+                            crate::pool::U256::from(3_000_000u128)
+                        }
+                        _ => {
+                            // WETH / DAI: 1 ETH / 1000 DAI (18 decimals)
+                            crate::pool::U256::from(10u64.pow(18))
+                        }
+                    };
+                    
+                    this.evaluate_arb_opportunity(
+                        &token_in,
+                        &token_out,
+                        3000,
+                        gas_price_gwei,
+                        amount_in,
+                        &crate::mempool::calldata_decoder::DexVersion::UniswapV3,
+                    ).await;
+                });
+            }
+        });
 
         // ── Producer: stream pending tx hashes ──────────────────────────────
         let mut stream = sub.into_stream();
@@ -445,6 +573,7 @@ impl MempoolListener {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A cheap, cloneable bundle of shared state for worker tasks.
+#[derive(Clone)]
 struct WorkerCtx {
     redis_cache:   Arc<RedisCache>,
     graph:         Arc<RwLock<LiquidityGraph>>,
@@ -513,8 +642,14 @@ impl WorkerCtx {
         gas_gwei: f64,
         amount_in: U256,
         dex_version: &DexVersion,
-    ) {
-        let pool_cache_key = format!("pool:ethereum:{}:{}:{}", token_in, token_out, fee_bps);
+     ) {
+        let active_chain = if let Some(ref adapter) = self.evm_adapter {
+            adapter.chain()
+        } else {
+            ChainId::Base
+        };
+
+        let pool_cache_key = format!("pool:{}:{}:{}:{}", active_chain.name(), token_in, token_out, fee_bps);
 
         // ── Step 1: Redis cache lookup ────────────────────────────────────────
         let cached_pool: Option<Pool> = match self.redis_cache.get_raw(&pool_cache_key).await {
@@ -544,7 +679,7 @@ impl WorkerCtx {
             Some(p) => p,
             None => {
                 if let Some(ref adapter) = self.evm_adapter {
-                    let placeholder = build_placeholder_pool(token_in, token_out, fee_bps);
+                    let placeholder = build_placeholder_pool(token_in, token_out, fee_bps, active_chain);
                     match adapter.fetch_pool_state(&placeholder).await {
                         Ok(state) => {
                             let mut p = placeholder;
@@ -559,11 +694,11 @@ impl WorkerCtx {
                         }
                         Err(e) => {
                             debug!("On-chain fetch failed ({}), using placeholder", e);
-                            build_placeholder_pool(token_in, token_out, fee_bps)
+                            build_placeholder_pool(token_in, token_out, fee_bps, active_chain)
                         }
                     }
                 } else {
-                    build_placeholder_pool(token_in, token_out, fee_bps)
+                    build_placeholder_pool(token_in, token_out, fee_bps, active_chain)
                 }
             }
         };
@@ -658,9 +793,9 @@ impl WorkerCtx {
         self.metrics.inc_router_scans();
 
         const START_TOKENS: [&str; 3] = [
-            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", // WETH
-            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC
-            "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", // WBTC
+            "0x4200000000000000000000000000000000000006", // WETH (Base)
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC (Base)
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c", // WBTC (Base)
         ];
 
         let opportunities: Vec<ArbitrageOpportunity> = {
@@ -748,13 +883,48 @@ impl WorkerCtx {
 //  Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_placeholder_pool(token_in: &str, token_out: &str, fee_bps: u32) -> Pool {
+fn build_placeholder_pool(token_in: &str, token_out: &str, fee_bps: u32, chain: ChainId) -> Pool {
+    let t_in = token_in.to_lowercase();
+    let t_out = token_out.to_lowercase();
+    
+    // Sort tokens lexicographically to match EVM standard pool layout
+    let (addr_a, addr_b) = if t_in < t_out {
+        (t_in, t_out)
+    } else {
+        (t_out, t_in)
+    };
+
+    let token_sym = |addr: &str| -> String {
+        match addr {
+            "0x4200000000000000000000000000000000000006" => "WETH".to_string(),
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC".to_string(),
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => "WBTC".to_string(),
+            "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => "DAI".to_string(),
+            "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => "USDT".to_string(),
+            _ => "UNK".to_string(),
+        }
+    };
+
+    let token_dec = |addr: &str| -> u8 {
+        match addr {
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => 6,  // USDC
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => 8,  // WBTC
+            "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => 6,  // USDT
+            _ => 18,
+        }
+    };
+
+    let sym_a = token_sym(&addr_a);
+    let sym_b = token_sym(&addr_b);
+    let dec_a = token_dec(&addr_a);
+    let dec_b = token_dec(&addr_b);
+
     Pool {
-        id: format!("{}:{}:{}", token_in, token_out, fee_bps),
-        chain: ChainId::Ethereum,
+        id: format!("{}:{}:{}", addr_a, addr_b, fee_bps),
+        chain,
         dex: DexProtocol::UniswapV3,
-        token_a: Token { address: token_in.to_string(), symbol: "TKA".to_string(), decimals: 18 },
-        token_b: Token { address: token_out.to_string(), symbol: "TKB".to_string(), decimals: 18 },
+        token_a: Token { address: addr_a, symbol: sym_a, decimals: dec_a },
+        token_b: Token { address: addr_b, symbol: sym_b, decimals: dec_b },
         pool_type: PoolType::ConcentratedLiquidity,
         fee_bps,
         state: PoolState {

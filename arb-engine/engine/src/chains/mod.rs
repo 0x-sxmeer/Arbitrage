@@ -6,4 +6,4 @@
 // ─────────────────────────────────────────────────────────────────────────────
 pub mod cosmos;
 pub mod evm;
-// pub mod solana;  // Phase 2: enable when solana-sdk builds on Windows
+pub mod solana;

@@ -129,6 +129,11 @@ impl EvmAdapter {
         }
     }
 
+    /// Exposes the active ChainId configuration
+    pub fn chain(&self) -> ChainId {
+        self.config.chain
+    }
+
     /// Ensure the WebSocket provider is connected. Returns a clone of the provider.
     async fn get_or_connect_ws(&self) -> Result<RootProvider<PubSubFrontend>> {
         // Check if we already have a connection
@@ -558,8 +563,8 @@ impl EvmAdapter {
 
     fn simulated_v2_state(&self) -> PoolState {
         PoolState {
-            reserve_a: U256::from(1_000_000_000_000_000_000_000u128), // 1000 ETH
-            reserve_b: U256::from(3_000_000_000_000u128),              // 3M USDC (6 dec)
+            reserve_a: U256::from(205_600_000_000_000u128),            // USDC (6 dec) at WETH = 2056 USD
+            reserve_b: U256::from(100_000_000_000_000_000_000_000u128), // WETH (18 dec)
             sqrt_price_x96: None,
             tick: None,
             liquidity: None,
@@ -568,13 +573,13 @@ impl EvmAdapter {
     }
 
     fn simulated_v3_state(&self) -> PoolState {
-        let sqrt_p_raw: u128 = 1_936_540_681_085_355_540_000_000_000_000;
+        let sqrt_p_raw: u128 = 3_647_949_655_879_842_476_793_799u128;
         PoolState {
             reserve_a: U256::zero(),
             reserve_b: U256::zero(),
             sqrt_price_x96: Some(U256::from(sqrt_p_raw)),
-            tick: Some(201_210),
-            liquidity: Some(12_345_678_901_234_567_890),
+            tick: Some(-199_729),
+            liquidity: Some(1_462_847_672_098_985_101),
             amp_coeff: None,
         }
     }

@@ -702,6 +702,8 @@ dependencies = [
  "alloy",
  "anyhow",
  "axum",
+ "bincode",
+ "bs58",
  "chrono",
  "dashmap 5.5.3",
  "dotenvy",

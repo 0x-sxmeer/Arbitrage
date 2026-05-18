@@ -345,13 +345,43 @@ impl LiquidityGraph {
             }
         };
 
+        let get_pool_reserve = |pool: &Pool, zfo: bool| -> U256 {
+            match pool.pool_type {
+                PoolType::ConcentratedLiquidity => {
+                    let sqrt_price_x96 = pool.state.sqrt_price_x96.unwrap_or(U256::zero());
+                    let liquidity = pool.state.liquidity.unwrap_or(0);
+                    if sqrt_price_x96.is_zero() || liquidity == 0 {
+                        return U256::zero();
+                    }
+                    if zfo {
+                        let num = U256::from(liquidity) << 96;
+                        num / sqrt_price_x96
+                    } else {
+                        let prod = U256::from(liquidity) * sqrt_price_x96;
+                        prod >> 96
+                    }
+                }
+                _ => {
+                    if zfo { pool.state.reserve_a } else { pool.state.reserve_b }
+                }
+            }
+        };
+
         let min_reserve = {
-            let res1 = if zfo1 { pool1.state.reserve_a } else { pool1.state.reserve_b };
-            let res2 = if zfo2 { pool2.state.reserve_a } else { pool2.state.reserve_b };
-            if res1 < res2 { res1 } else { res2 }
+            let res1 = get_pool_reserve(pool1, zfo1);
+            let res2 = get_pool_reserve(pool2, zfo2);
+            if res1.is_zero() {
+                res2
+            } else if res2.is_zero() {
+                res1
+            } else if res1 < res2 {
+                res1
+            } else {
+                res2
+            }
         };
         let upper_bound = if min_reserve.is_zero() {
-            U256::from(u64::MAX)
+            U256::from(10_000_000_000u64) // Safe fallback bound instead of u64::MAX to prevent search window blowout
         } else {
             estimate_upper_bound(min_reserve, 0.05)
         };
@@ -569,55 +599,43 @@ fn reconstruct_and_evaluate(
     // at least max_hops times in the predecessor chain).
     let cycle_entry_token = graph.tokens[v].clone();
 
-    // Collect cycle edges starting from cycle_entry_token
-    let mut steps: Vec<(&LiquidityEdge, U256, U256)> = Vec::new();
+    // Collect cycle edges walking backwards from v until we hit v again
+    let mut temp_edges: Vec<&LiquidityEdge> = Vec::new();
     let mut current_vertex = v;
-    let mut amount         = config.reference_amount;
-
     for _ in 0..max_hops {
         let eidx = pred[current_vertex]?;
         let edge  = &graph.edges[eidx];
-
+        temp_edges.push(edge);
         let in_vertex = *graph.token_index.get(&edge.token_in)?;
-
-        let zero_for_one = edge.token_in == edge.pool.token_a.address;
-        let amount_out   = sim_out(&edge.pool, amount, zero_for_one)?;
-
-        let impact = sim_impact(&edge.pool, amount, zero_for_one);
-        if impact > config.max_price_impact_bps {
-            debug!("BF cycle rejected: price impact {} bps > limit", impact);
-            return None;
-        }
-
-        steps.push((edge, amount, amount_out));
-        amount = amount_out;
         current_vertex = in_vertex;
-
-        // Cycle closed when we return to the cycle entry token
         if graph.tokens[current_vertex] == cycle_entry_token {
             break;
         }
     }
 
-    if steps.is_empty() {
+    if graph.tokens[current_vertex] != cycle_entry_token {
+        debug!("BF cycle rejected: could not trace closed cycle");
         return None;
     }
 
-    // ── Verify cycle closure ─────────────────────────────────────────────────
-    // The cycle is valid only if the last edge's token_out = cycle_entry_token.
-    let last_out = &steps.last()?.0.token_out;
-    if *last_out != cycle_entry_token {
+    // Reverse to get correct forward order
+    let mut cycle_edges = temp_edges;
+    cycle_edges.reverse();
+
+    if cycle_edges.is_empty() {
+        return None;
+    }
+
+    // Verify cycle closure: first edge token_in and last edge token_out must equal cycle_entry_token
+    let first_in = &cycle_edges.first()?.token_in;
+    let last_out = &cycle_edges.last()?.token_out;
+    if first_in != &cycle_entry_token || last_out != &cycle_entry_token {
         debug!(
-            "BF cycle rejected: not closed ({} → {})",
-            last_out, cycle_entry_token
+            "BF cycle rejected: not closed ({} → ... → {})",
+            first_in, last_out
         );
         return None;
     }
-
-    // Reverse (predecessor traces backwards)
-    steps.reverse();
-
-    let cycle_edges: Vec<&LiquidityEdge> = steps.iter().map(|(e, _, _)| *e).collect();
 
     // ── Deduplicate ───────────────────────────────────────────────────────────
     let cycle_key: String = cycle_edges
@@ -633,6 +651,13 @@ fn reconstruct_and_evaluate(
     // ── Optimize Input Size ───────────────────────────────────────────────────
     use crate::arb::math::optimizer::{find_optimal_input, estimate_upper_bound};
 
+    let entry_decimals = if cycle_edges.first()?.token_in == cycle_edges.first()?.pool.token_a.address {
+        cycle_edges.first()?.pool.token_a.decimals
+    } else {
+        cycle_edges.first()?.pool.token_b.decimals
+    };
+    let scaling_factor = U256::from(10u64).pow(U256::from((18 - entry_decimals) as u64));
+
     let min_reserve = cycle_edges.iter().map(|e| {
         if e.token_in == e.pool.token_a.address {
             e.pool.state.reserve_a
@@ -640,16 +665,18 @@ fn reconstruct_and_evaluate(
             e.pool.state.reserve_b
         }
     }).filter(|r| !r.is_zero()).min().unwrap_or(U256::MAX);
-    let upper_bound = if min_reserve == U256::MAX {
+    let upper_bound_token = if min_reserve == U256::MAX {
         U256::from(u64::MAX)
     } else {
         estimate_upper_bound(min_reserve, 0.05)
     };
-    // Lower bound: try to avoid trivial dust amounts
-    let lower_bound = U256::from(1_000_000u64); 
+    let upper_bound = upper_bound_token * scaling_factor;
+    // Lower bound: try to avoid trivial dust amounts (1.0 token scaled to WEI)
+    let lower_bound = U256::from(1_000_000u64) * scaling_factor; 
     let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
 
-    let sim_cycle = |mut amount: U256| -> U256 {
+    let sim_cycle = |mut amount_wei: U256| -> U256 {
+        let mut amount = amount_wei / scaling_factor;
         for edge in &cycle_edges {
             let zfo = edge.token_in == edge.pool.token_a.address;
             match sim_out(&edge.pool, amount, zfo) {
@@ -657,10 +684,10 @@ fn reconstruct_and_evaluate(
                 None => return U256::zero(),
             }
         }
-        amount
+        amount * scaling_factor
     };
 
-    let optimal_amount = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_wei) {
+    let optimal_amount_wei = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_wei) {
         Some(opt) => opt.amount,
         None => {
             debug!("BF cycle rejected: no profitable input size found after gas");
@@ -668,10 +695,12 @@ fn reconstruct_and_evaluate(
         }
     };
 
+    let optimal_amount = optimal_amount_wei / scaling_factor;
+
     // ── Build SwapSteps ───────────────────────────────────────────────────────
     let mut swap_steps: Vec<SwapStep> = Vec::with_capacity(cycle_edges.len());
     let mut current_amount = optimal_amount;
-    for edge in cycle_edges {
+    for edge in &cycle_edges {
         let zfo = edge.token_in == edge.pool.token_a.address;
         let out = sim_out(&edge.pool, current_amount, zfo)?;
         let impact = sim_impact(&edge.pool, current_amount, zfo);

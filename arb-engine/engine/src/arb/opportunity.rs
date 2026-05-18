@@ -121,9 +121,17 @@ impl ArbitrageOpportunity {
     /// All costs must be denominated in the same unit as `input_amount` (wei).
     /// Pass `eth_price_usd` for USD-denominated logging only.
     pub fn calculate_nev(&mut self, eth_price_usd: f64) {
+        let decimals = match self.start_token.to_lowercase().as_str() {
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => 6, // USDC / USDT
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => 8, // WBTC
+            _ => 18, // WETH / DAI / etc.
+        };
+        let scaling_factor = 10i128.pow(18 - decimals);
+
         // 1. Gross spread: how much more we get back vs what we put in
         let gross_profit = self.gross_output.low_u128() as i128
             - self.input_amount.low_u128() as i128;
+        let gross_profit_scaled = gross_profit * scaling_factor;
 
         // 2. Gas cost: gas_units × effective_gas_price_gwei × 10^9 (gwei → wei)
         let gas_cost_wei = (self.estimated_gas_units as f64
@@ -132,20 +140,22 @@ impl ArbitrageOpportunity {
 
         // 3. Protocol swap fees (aggregated across all hops)
         let swap_fees = self.total_swap_fees_wei.low_u128() as i128;
+        let swap_fees_scaled = swap_fees * scaling_factor;
 
         // 4. Price impact loss: our trade moves the price against us
         //    Approximation: impact_bps/10000 × input_amount
         let impact_loss = (self.input_amount.low_u128() as f64
             * self.price_impact_bps as f64
             / 10_000.0) as i128;
+        let impact_loss_scaled = impact_loss * scaling_factor;
 
         // 5. Net Expected Value
-        self.net_expected_value = gross_profit - gas_cost_wei - swap_fees - impact_loss;
+        self.net_expected_value = gross_profit_scaled - gas_cost_wei - swap_fees_scaled - impact_loss_scaled;
         self.is_executable = self.net_expected_value > Self::MIN_PROFIT_WEI;
 
         // Logging
         let nev_usd  = self.net_expected_value as f64 / 1e18 * eth_price_usd;
-        let gross_usd = gross_profit as f64 / 1e18 * eth_price_usd;
+        let gross_usd = gross_profit_scaled as f64 / 1e18 * eth_price_usd;
         let gas_usd   = gas_cost_wei as f64 / 1e18 * eth_price_usd;
 
         if self.is_executable {
@@ -164,8 +174,8 @@ impl ArbitrageOpportunity {
                 id = %self.id,
                 nev_usd = format!("${:.4}", nev_usd),
                 gross_usd = format!("${:.4}", gross_usd),
-                reason = if gross_profit <= 0 { "no spread" }
-                         else if gas_cost_wei > gross_profit { "gas > spread" }
+                reason = if gross_profit_scaled <= 0 { "no spread" }
+                         else if gas_cost_wei > gross_profit_scaled { "gas > spread" }
                          else { "below threshold" },
                 "❌ Non-profitable opportunity"
             );
