@@ -129,7 +129,7 @@ async fn main() {
     let (active_chain, active_ws_url, active_http_url) =
         if let Some(ref base_ws) = config.base_ws_url {
             info!("  ✓ Base L2 WS configured — targeting Base Mainnet (chain 8453)");
-            (ChainId::Base, base_ws.clone(), "https://mainnet.base.org".to_string())
+            (ChainId::Base, base_ws.clone(), base_ws.replace("wss://", "https://"))
         } else {
             warn!("  ⚠ BASE_WS_URL not set — falling back to Ethereum mainnet");
             (ChainId::Ethereum, config.eth_ws_url.clone(), config.eth_http_url.clone())
@@ -206,10 +206,10 @@ async fn main() {
 
         let pools_to_sync = [
             // Uniswap V3 on Base — top-volume CLMM pools
-            PoolDef { address: "0xd0b53D9277642d899DF5C87A3966A349A798F224", token_a: &usdc, token_b: &weth, fee_bps: 500,  label: "UniV3 USDC/WETH 0.05% (Base)" },
+            PoolDef { address: "0xd0b53D9277642d899DF5C87A3966A349A798F224", token_a: &weth, token_b: &usdc, fee_bps: 500,  label: "UniV3 USDC/WETH 0.05% (Base)" },
             PoolDef { address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B5", token_a: &wbtc, token_b: &weth, fee_bps: 3000, label: "UniV3 WBTC/WETH 0.3% (Base)"  },
             PoolDef { address: "0x6c561B446416E1A00E8E93E221854d6eA4171372", token_a: &dai,  token_b: &usdc, fee_bps: 100,  label: "UniV3 DAI/USDC 0.01% (Base)"  },
-            PoolDef { address: "0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef", token_a: &usdt, token_b: &weth, fee_bps: 500,  label: "UniV3 USDT/WETH 0.05% (Base)" },
+            PoolDef { address: "0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef", token_a: &weth, token_b: &usdt, fee_bps: 500,  label: "UniV3 USDT/WETH 0.05% (Base)" },
         ];
 
         let evm = evm_adapter.as_ref().unwrap();
@@ -299,10 +299,10 @@ async fn main() {
         // These are the primary cross-DEX arb targets against Uniswap V3 above.
         // Aerodrome uses a 0.3% fee (30 bps) identical to Uniswap V2 math.
         let v2_pools = [
-            V2PoolDef { address: "0x6cDcb1C4A4D1C3C6d054b27AC5B77e89eAFb971d", token_a: &usdc, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDC/WETH (Base)" },
-            V2PoolDef { address: "0x2578365B3604fA26E87e14d6C9E1386E87A57A63", token_a: &wbtc, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero WBTC/WETH (Base)" },
-            V2PoolDef { address: "0x1B05a702e9d30D86a8B6eEeF3B0A0d5a8E5e3e5", token_a: &dai,  token_b: &usdc, fee_bps: 5,  dex: DexProtocol::UniswapV2, label: "Aero DAI/USDC (Base)"  },
-            V2PoolDef { address: "0xA5E7C4A5bB5d4Fe0e822B1fB00fAe44E800e1a1a", token_a: &usdt, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDT/WETH (Base)" },
+            V2PoolDef { address: "0xcDAC0d6c6C59727a65F871236188350531885C43", token_a: &weth, token_b: &usdc, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDC/WETH (Base)" },
+            V2PoolDef { address: "0xe1c1939db5b40a9fab0640cebeb1af1cc56cd9a0", token_a: &wbtc, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero WBTC/WETH (Base)" },
+            V2PoolDef { address: "0x315043e79Cc1c2a71199769087CeF61f8a4297a0", token_a: &dai,  token_b: &usdc, fee_bps: 5,  dex: DexProtocol::UniswapV2, label: "Aero DAI/USDC (Base)"  },
+            V2PoolDef { address: "0xA5E7C4A5bB5d4Fe0e822B1fB00fAe44E800e1a1a", token_a: &weth, token_b: &usdt, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDT/WETH (Base)" },
         ];
 
         info!("  ⏳ Fetching live V2 pool states ({} pools)...", v2_pools.len());
@@ -310,6 +310,11 @@ async fn main() {
         for def in &v2_pools {
             match evm.get_v2_pool_state(def.address).await {
                 Ok((reserve0, reserve1)) => {
+                    let (reserve_a, reserve_b) = if def.token_a.address.to_lowercase() < def.token_b.address.to_lowercase() {
+                        (reserve0, reserve1)
+                    } else {
+                        (reserve1, reserve0)
+                    };
                     g.upsert_pool(Pool {
                         id: def.address.to_lowercase(),
                         chain: active_chain,
@@ -321,8 +326,8 @@ async fn main() {
                         last_updated_block: 0,
                         last_updated_ts: chrono::Utc::now().timestamp(),
                         state: PoolState {
-                            reserve_a: reserve0,
-                            reserve_b: reserve1,
+                            reserve_a,
+                            reserve_b,
                             sqrt_price_x96: None,
                             tick:       None,
                             liquidity:  None,

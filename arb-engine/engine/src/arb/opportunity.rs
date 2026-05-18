@@ -126,7 +126,12 @@ impl ArbitrageOpportunity {
             "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => 8, // WBTC
             _ => 18, // WETH / DAI / etc.
         };
-        let scaling_factor = 10i128.pow(18 - decimals);
+        let scaling_factor = 10i128.pow((18 - decimals) as u32);
+        let token_price = match self.start_token.to_lowercase().as_str() {
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" | "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => 1.0,
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => eth_price_usd * 20.0,
+            _ => eth_price_usd,
+        };
 
         // 1. Gross spread: how much more we get back vs what we put in
         let gross_profit = self.gross_output.low_u128() as i128
@@ -137,6 +142,7 @@ impl ArbitrageOpportunity {
         let gas_cost_wei = (self.estimated_gas_units as f64
             * self.gas_price_gwei
             * 1_000_000_000.0) as i128;
+        let gas_cost_scaled = (gas_cost_wei as f64 * eth_price_usd / token_price) as i128;
 
         // 3. Protocol swap fees (aggregated across all hops)
         let swap_fees = self.total_swap_fees_wei.low_u128() as i128;
@@ -150,13 +156,13 @@ impl ArbitrageOpportunity {
         let impact_loss_scaled = impact_loss * scaling_factor;
 
         // 5. Net Expected Value
-        self.net_expected_value = gross_profit_scaled - gas_cost_wei - swap_fees_scaled - impact_loss_scaled;
-        self.is_executable = self.net_expected_value > Self::MIN_PROFIT_WEI;
+        self.net_expected_value = gross_profit_scaled - gas_cost_scaled - swap_fees_scaled - impact_loss_scaled;
+        let nev_usd  = (self.net_expected_value as f64 / 1e18) * token_price;
+        self.is_executable = nev_usd >= 0.50;
 
         // Logging
-        let nev_usd  = self.net_expected_value as f64 / 1e18 * eth_price_usd;
-        let gross_usd = gross_profit_scaled as f64 / 1e18 * eth_price_usd;
-        let gas_usd   = gas_cost_wei as f64 / 1e18 * eth_price_usd;
+        let gross_usd = gross_profit_scaled as f64 / 1e18 * token_price;
+        let gas_usd   = gas_cost_scaled as f64 / 1e18 * token_price;
 
         if self.is_executable {
             tracing::info!(

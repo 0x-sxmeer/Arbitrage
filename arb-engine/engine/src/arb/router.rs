@@ -334,15 +334,22 @@ impl LiquidityGraph {
         let zfo1 = start == pool1.token_a.address;
         let zfo2 = mid == pool2.token_a.address;
 
-        let sim_cycle = |amount: U256| -> U256 {
+        let dec_start = if zfo1 { pool1.token_a.decimals } else { pool1.token_b.decimals };
+        let dec_mid = if zfo1 { pool1.token_b.decimals } else { pool1.token_a.decimals };
+        let scaling_factor = U256::from(10u64).pow(U256::from((18 - dec_start) as u64));
+        let scaling_mid = U256::from(10u64).pow(U256::from((18 - dec_mid) as u64));
+
+        let sim_cycle_18 = |amount_18: U256| -> U256 {
+            let amount = amount_18 / scaling_factor;
             let out1 = match sim_out(pool1, amount, zfo1) {
                 Some(o) => o,
                 None => return U256::zero(),
             };
-            match sim_out(pool2, out1, zfo2) {
+            let out2 = match sim_out(pool2, out1, zfo2) {
                 Some(o) => o,
-                None => U256::zero(),
-            }
+                None => return U256::zero(),
+            };
+            out2 * scaling_factor
         };
 
         let get_pool_reserve = |pool: &Pool, zfo: bool| -> U256 {
@@ -367,31 +374,42 @@ impl LiquidityGraph {
             }
         };
 
-        let min_reserve = {
+        let min_reserve_18 = {
             let res1 = get_pool_reserve(pool1, zfo1);
             let res2 = get_pool_reserve(pool2, zfo2);
-            if res1.is_zero() {
-                res2
-            } else if res2.is_zero() {
-                res1
-            } else if res1 < res2 {
-                res1
+            let res1_18 = res1 * scaling_factor;
+            let res2_18 = res2 * scaling_mid;
+            if res1_18.is_zero() {
+                res2_18
+            } else if res2_18.is_zero() {
+                res1_18
+            } else if res1_18 < res2_18 {
+                res1_18
             } else {
-                res2
+                res2_18
             }
         };
-        let upper_bound = if min_reserve.is_zero() {
-            U256::from(10_000_000_000u64) // Safe fallback bound instead of u64::MAX to prevent search window blowout
-        } else {
-            estimate_upper_bound(min_reserve, 0.05)
-        };
-        let lower_bound = U256::from(1_000_000u64);
-        let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
 
-        let optimal_amount = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_wei) {
+        let upper_bound = if min_reserve_18.is_zero() {
+            U256::from(10_000_000_000u64) * scaling_factor
+        } else {
+            estimate_upper_bound(min_reserve_18, 0.05)
+        };
+        let lower_bound = U256::from(1_000_000u64) * scaling_factor;
+        let start_price = match start.to_lowercase().as_str() {
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" | "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => 1.0,
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => config.eth_price_usd * 20.0,
+            _ => config.eth_price_usd,
+        };
+        let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
+        let gas_cost_scaled = U256::from((gas_cost_wei.low_u128() as f64 * config.eth_price_usd / start_price) as u128);
+
+        let optimal_amount_18 = match find_optimal_input(&sim_cycle_18, lower_bound, upper_bound, gas_cost_scaled) {
             Some(opt) => opt.amount,
             None => return None,
         };
+
+        let optimal_amount = optimal_amount_18 / scaling_factor;
 
         let out1  = sim_out(pool1, optimal_amount, zfo1)?;
         let imp1  = sim_impact(pool1, optimal_amount, zfo1);
@@ -658,22 +676,51 @@ fn reconstruct_and_evaluate(
     };
     let scaling_factor = U256::from(10u64).pow(U256::from((18 - entry_decimals) as u64));
 
+    let get_edge_reserve = |e: &LiquidityEdge| -> (U256, u8) {
+        let zfo = e.token_in == e.pool.token_a.address;
+        let decimals = if zfo { e.pool.token_a.decimals } else { e.pool.token_b.decimals };
+        let reserve = match e.pool.pool_type {
+            PoolType::ConcentratedLiquidity => {
+                let sqrt_price_x96 = e.pool.state.sqrt_price_x96.unwrap_or(U256::zero());
+                let liquidity = e.pool.state.liquidity.unwrap_or(0);
+                if sqrt_price_x96.is_zero() || liquidity == 0 {
+                    U256::zero()
+                } else if zfo {
+                    let num = U256::from(liquidity) << 96;
+                    num / sqrt_price_x96
+                } else {
+                    let prod = U256::from(liquidity) * sqrt_price_x96;
+                    prod >> 96
+                }
+            }
+            _ => {
+                if zfo { e.pool.state.reserve_a } else { e.pool.state.reserve_b }
+            }
+        };
+        (reserve, decimals)
+    };
+
     let min_reserve = cycle_edges.iter().map(|e| {
-        if e.token_in == e.pool.token_a.address {
-            e.pool.state.reserve_a
-        } else {
-            e.pool.state.reserve_b
-        }
+        let (reserve, decimals) = get_edge_reserve(e);
+        let scaling = U256::from(10u64).pow(U256::from((18 - decimals) as u64));
+        reserve * scaling
     }).filter(|r| !r.is_zero()).min().unwrap_or(U256::MAX);
-    let upper_bound_token = if min_reserve == U256::MAX {
+
+    let upper_bound = if min_reserve == U256::MAX {
         U256::from(u64::MAX)
     } else {
         estimate_upper_bound(min_reserve, 0.05)
     };
-    let upper_bound = upper_bound_token * scaling_factor;
     // Lower bound: try to avoid trivial dust amounts (1.0 token scaled to WEI)
     let lower_bound = U256::from(1_000_000u64) * scaling_factor; 
+    let start_token = &cycle_edges[0].token_in;
+    let start_price = match start_token.to_lowercase().as_str() {
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" | "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => 1.0,
+        "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => config.eth_price_usd * 20.0,
+        _ => config.eth_price_usd,
+    };
     let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
+    let gas_cost_scaled = U256::from((gas_cost_wei.low_u128() as f64 * config.eth_price_usd / start_price) as u128);
 
     let sim_cycle = |mut amount_wei: U256| -> U256 {
         let mut amount = amount_wei / scaling_factor;
@@ -687,7 +734,7 @@ fn reconstruct_and_evaluate(
         amount * scaling_factor
     };
 
-    let optimal_amount_wei = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_wei) {
+    let optimal_amount_wei = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_scaled) {
         Some(opt) => opt.amount,
         None => {
             debug!("BF cycle rejected: no profitable input size found after gas");

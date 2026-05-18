@@ -370,21 +370,21 @@ impl MempoolListener {
                 sim_tx_count += 1;
                 metrics_sim.inc_txs_seen();
 
-                // Dynamically skew Aerodrome V2 USDC/WETH pool reserves to simulate a live price discrepancy!
-                // USDC is token_a, WETH is token_b. We cycle reserve_a between 3.0M USDC and 3.25M USDC.
-                {
-                    let mut graph = this_sim.graph.write().await;
-                    if let Some(pool) = graph.get_pool("0x6cdcb1c4a4d1c3c6d054b27ac5b77e89eafb971d") {
-                        let mut p = (**pool).clone();
-                        let reserves_a = if sim_tx_count % 5 == 0 {
-                            3_250_000_000_000u128 // $3250/ETH (skewed) -> huge 8.3% cross-DEX arb against V3!
-                        } else {
-                            3_000_000_000_000u128 // $3000/ETH (balanced)
-                        };
-                        p.state.reserve_a = crate::pool::U256::from(reserves_a);
-                        graph.upsert_pool(p);
-                    }
-                }
+                 // Dynamically skew Aerodrome V2 USDC/WETH pool reserves to simulate a live price discrepancy!
+                 // WETH is token_a, USDC is token_b. We cycle reserve_b between 3.0M USDC and 3.25M USDC.
+                 {
+                     let mut graph = this_sim.graph.write().await;
+                     if let Some(pool) = graph.get_pool("0x6cdcb1c4a4d1c3c6d054b27ac5b77e89eafb971d") {
+                         let mut p = (**pool).clone();
+                         let reserves_b = if sim_tx_count % 5 == 0 {
+                             3_250_000_000_000u128 // $3250/ETH (skewed) -> huge 8.3% cross-DEX arb against V3!
+                         } else {
+                             3_000_000_000_000u128 // $3000/ETH (balanced)
+                         };
+                         p.state.reserve_b = crate::pool::U256::from(reserves_b);
+                         graph.upsert_pool(p);
+                     }
+                 }
 
                 let token_in_addr = tokens[(sim_tx_count as usize) % tokens.len()];
                 let token_out_addr = tokens[(sim_tx_count as usize + 1) % tokens.len()];
@@ -678,11 +678,25 @@ impl WorkerCtx {
         let mut pool = match cached_pool {
             Some(p) => p,
             None => {
+                // Try to resolve the real pool from the LiquidityGraph first
+                let graph_pool = {
+                    let graph = self.graph.read().await;
+                    graph.get_all_pools()
+                        .find(|(_, p)| {
+                            ((p.token_a.address.to_lowercase() == token_in.to_lowercase() && p.token_b.address.to_lowercase() == token_out.to_lowercase())
+                                || (p.token_a.address.to_lowercase() == token_out.to_lowercase() && p.token_b.address.to_lowercase() == token_in.to_lowercase()))
+                                && p.fee_bps == fee_bps
+                        })
+                        .map(|(_, p)| (**p).clone())
+                };
+
                 if let Some(ref adapter) = self.evm_adapter {
-                    let placeholder = build_placeholder_pool(token_in, token_out, fee_bps, active_chain);
-                    match adapter.fetch_pool_state(&placeholder).await {
+                    let base_pool = graph_pool.unwrap_or_else(|| {
+                        build_placeholder_pool(token_in, token_out, fee_bps, active_chain)
+                    });
+                    match adapter.fetch_pool_state(&base_pool).await {
                         Ok(state) => {
-                            let mut p = placeholder;
+                            let mut p = base_pool;
                             p.state = state;
                             if let Ok(json) = serde_json::to_string(&p) {
                                 // 24-block TTL (≈5 min on mainnet)
@@ -698,7 +712,9 @@ impl WorkerCtx {
                         }
                     }
                 } else {
-                    build_placeholder_pool(token_in, token_out, fee_bps, active_chain)
+                    graph_pool.unwrap_or_else(|| {
+                        build_placeholder_pool(token_in, token_out, fee_bps, active_chain)
+                    })
                 }
             }
         };

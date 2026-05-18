@@ -252,12 +252,12 @@ impl PoolRegistryRow {
             token_a: Token {
                 address:  self.token_a_addr.clone(),
                 symbol:   self.token_a_sym.clone(),
-                decimals: 18,
+                decimals: get_token_decimals(&self.token_a_addr),
             },
             token_b: Token {
                 address:  self.token_b_addr.clone(),
                 symbol:   self.token_b_sym.clone(),
-                decimals: 18,
+                decimals: get_token_decimals(&self.token_b_addr),
             },
             pool_type,
             fee_bps: self.fee_bps as u32,

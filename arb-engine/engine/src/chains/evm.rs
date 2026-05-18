@@ -407,6 +407,16 @@ impl EvmAdapter {
             "Fetching pool state from chain"
         );
 
+        // If the pool ID contains colons (placeholder pool), skip live fetch and use simulated fallback
+        if pool.id.contains(':') {
+            debug!(pool_id = %pool.id, "Pool ID is a placeholder — returning simulated state directly");
+            return match pool.pool_type {
+                PoolType::ConstantProduct => Ok(self.simulated_v2_state()),
+                PoolType::ConcentratedLiquidity => Ok(self.simulated_v3_state()),
+                PoolType::StableSwap => Ok(self.simulated_v2_state()),
+            };
+        }
+
         // Try real on-chain fetch first
         match self.get_or_connect_ws().await {
             Ok(provider) => {

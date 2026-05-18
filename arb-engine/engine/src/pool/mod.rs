@@ -169,6 +169,20 @@ impl PoolState {
     }
 }
 
+/// Helper to resolve canonical token decimals by address (case-insensitive).
+pub fn get_token_decimals(address: &str) -> u8 {
+    match address.to_lowercase().as_str() {
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => 6,  // USDC on Base
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => 6,  // USDC on Ethereum
+        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" => 6,  // USDbC on Base
+        "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => 6,  // USDT on Base
+        "0xdac17f958d2ee523a2206206994597c13d831ec7" => 6,  // USDT on Ethereum
+        "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => 8,  // WBTC on Base
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" => 8,  // WBTC on Ethereum
+        _ => 18,
+    }
+}
+
 /// ERC-20 / SPL token descriptor
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Token {
