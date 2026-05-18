@@ -311,6 +311,9 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
             "AtomicArb: insufficient profit - transaction reverted"
         );
 
+        // NOTE (BUG-10 Resolution): minProfitWei is a gating threshold/slippage guard,
+        // not a cost or fee. Therefore, the actual balance increase (netProfit) is
+        // exactly finalAmount - repayAmount, which is correctly recorded and emitted.
         uint256 netProfit = finalAmount - repayAmount;
 
         // ── Step 4: Repay Aave flash loan ─────────────────────────────────────

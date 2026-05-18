@@ -160,6 +160,15 @@ impl LiquidityGraph {
         self.token_decimals.clear();
     }
 
+    /// Mark all edges as stale (set neg_log_rate to f64::INFINITY) and reset changed tokens.
+    /// Called on WebSocket reconnect to preserve topology but invalidate prices.
+    pub fn mark_all_edges_stale(&mut self) {
+        for edge in &mut self.edges {
+            edge.neg_log_rate = f64::INFINITY;
+        }
+        self.changed_tokens.clear();
+    }
+
     // ── Pool management ───────────────────────────────────────────────────────
 
     /// Insert or update a pool.  Replaces existing edges for this pool_id.

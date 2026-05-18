@@ -117,7 +117,7 @@ pub struct EvmAdapter {
     ws_provider:      tokio::sync::RwLock<Option<RootProvider<PubSubFrontend>>>,
     // FIX-6: cached HTTP provider — avoids creating a new connection on every call
     http_provider:    tokio::sync::RwLock<Option<alloy::providers::RootProvider<
-                          alloy::transports::BoxTransport
+                          alloy::transports::http::Http<reqwest::Client>
                       >>>,
     last_block:       std::sync::atomic::AtomicU64,
     execution_count:  std::sync::atomic::AtomicU64,
@@ -201,7 +201,7 @@ impl EvmAdapter {
     /// on all subsequent calls so we don't open a new TCP connection per fetch.
     async fn get_or_connect_http(&self)
         -> Result<alloy::providers::RootProvider<
-                alloy::transports::BoxTransport
+                alloy::transports::http::Http<reqwest::Client>
            >>
     {
         {

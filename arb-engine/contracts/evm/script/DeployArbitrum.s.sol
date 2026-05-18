@@ -13,7 +13,7 @@ contract DeployArbitrum is Script {
         address aavePoolArbitrum = 0x794a61358D6845594F94dc1DB02A252b5b4814aD;
         
         // Wormhole Relayer on Arbitrum Mainnet
-        address wormholeRelayerArbitrum = 0x27428DD2d3ABB50bAC90940428B7bb9662758ebA;
+        address wormholeRelayerArbitrum = 0x27428Dd2D3Abb50BaC90940428B7bB9662758ebA;
         
         // 5% max drawdown per hour circuit breaker
         uint256 maxDrawdownPerHour = 0.05 ether; // Adjust depending on quote token (e.g., USDC vs WETH)

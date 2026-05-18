@@ -300,9 +300,9 @@ async fn main() {
         // Aerodrome uses a 0.3% fee (30 bps) identical to Uniswap V2 math.
         let v2_pools = [
             V2PoolDef { address: "0xcDAC0d6c6C59727a65F871236188350531885C43", token_a: &weth, token_b: &usdc, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDC/WETH (Base)" },
-            V2PoolDef { address: "0xe1c1939db5b40a9fab0640cebeb1af1cc56cd9a0", token_a: &wbtc, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero WBTC/WETH (Base)" },
-            V2PoolDef { address: "0x315043e79Cc1c2a71199769087CeF61f8a4297a0", token_a: &dai,  token_b: &usdc, fee_bps: 5,  dex: DexProtocol::UniswapV2, label: "Aero DAI/USDC (Base)"  },
-            V2PoolDef { address: "0xA5E7C4A5bB5d4Fe0e822B1fB00fAe44E800e1a1a", token_a: &weth, token_b: &usdt, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDT/WETH (Base)" },
+            V2PoolDef { address: "0x27Be19afF47d30d3CEDC098E36844a657a8953AE", token_a: &wbtc, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero WBTC/WETH (Base)" },
+            V2PoolDef { address: "0x67b00B46FA4f4F24c03855c5C8013C0B938B3eEc", token_a: &dai,  token_b: &usdc, fee_bps: 5,  dex: DexProtocol::UniswapV2, label: "Aero DAI/USDC (Base)"  },
+            V2PoolDef { address: "0xFFD4Ec4BD2211cBFD58C209FdEcC65F63f2b9e4c", token_a: &weth, token_b: &usdt, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDT/WETH (Base)" },
         ];
 
         info!("  ⏳ Fetching live V2 pool states ({} pools)...", v2_pools.len());

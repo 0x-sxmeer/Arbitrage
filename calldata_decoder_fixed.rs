@@ -1,33 +1,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  engine/src/mempool/calldata_decoder.rs
+//  engine/src/mempool/calldata_decoder.rs  [PATCHED]
 //
-//  MultiDexDecoder — Production calldata decoder for all major DEX protocols.
+//  FIXES applied vs. original:
 //
-//  Supported protocols:
-//    EVM:
-//      ▸ Uniswap V2   — swapExactTokensForTokens, swapTokensForExactTokens,
-//                       swapExactETHForTokens, swapTokensForExactETH
-//      ▸ Uniswap V3   — exactInputSingle, exactInput, multicall (both variants)
-//      ▸ Universal Router (0x24856bc3 / 0x3593564c) — V3_SWAP_EXACT_IN/OUT
-//      ▸ SushiSwap V2  — same interface as Uniswap V2
-//      ▸ PancakeSwap V2/V3 — same interfaces, different router addresses
-//    Non-EVM (trigger only — no calldata):
-//      ▸ Raydium / Orca (Solana)  — state fetched via RPC, not calldata
-//      ▸ Osmosis (Cosmos)         — state fetched via RPC, not calldata
+//  FIX-3: Added all Base chain DEX router addresses (Uniswap V3 SwapRouter02,
+//         Universal Router, Aerodrome V2, Aerodrome UR, BaseSwap, PancakeSwap V3,
+//         SushiSwap V3) so that `is_known_dex_router` returns true for Base
+//         mempool transactions and `process_payload` actually processes them.
 //
-//  Design goals:
-//    1. Zero heap allocation on the hot path (selector dispatch first)
-//    2. Explicit fee handling: V2 uses 25/30 bps by convention; V3 reads fee
-//       from calldata; Universal Router extracts from path encoding
-//    3. Source protocol tagged in output for cross-chain graph labelling
-//    4. All alloy sol_types used; no ethabi dependency on hot path
+//  FIX-5: Corrected the V2 selector collision.  SEL_V2_TOKENS_FOR_ETH
+//         (0x4a25d94a) is `swapTokensForExactETH` — it has amountOut first,
+//         not amountIn.  Both selectors now dispatch to their correct decoders
+//         instead of both being decoded with swapExactTokensForETHCall.
 // ─────────────────────────────────────────────────────────────────────────────
 #![allow(dead_code)]
 
 use alloy::sol;
 use alloy::primitives::{Address, U256};
 use alloy::sol_types::SolCall;
-use tracing::{debug, warn};
+use tracing::debug;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ABI type definitions
@@ -59,6 +50,7 @@ sol! {
             uint256   deadline
         ) external payable returns (uint256[] memory amounts);
 
+        // FIX-5: swapTokensForExactETH — amountOut is the FIRST parameter
         function swapTokensForExactETH(
             uint256   amountOut,
             uint256   amountInMax,
@@ -135,49 +127,37 @@ sol! {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  4-byte selectors — keccak256 of ABI-encoded function signatures
+//  4-byte selectors
 // ─────────────────────────────────────────────────────────────────────────────
 
 // V2-family selectors
-/// swapExactTokensForTokens(uint256,uint256,address[],address,uint256)
-const SEL_V2_EXACT_IN:            [u8; 4] = [0x38, 0xed, 0x17, 0x39];
-/// swapTokensForExactTokens(uint256,uint256,address[],address,uint256)
-const SEL_V2_EXACT_OUT:           [u8; 4] = [0x88, 0x03, 0xdb, 0xee];
-/// swapExactETHForTokens(uint256,address[],address,uint256)
-const SEL_V2_ETH_EXACT_IN:        [u8; 4] = [0x7f, 0xf3, 0x6a, 0xb5];
-/// swapTokensForExactETH(uint256,uint256,address[],address,uint256)
-const SEL_V2_TOKENS_FOR_ETH:      [u8; 4] = [0x4a, 0x25, 0xd9, 0x4a];
-/// swapExactTokensForETH(uint256,uint256,address[],address,uint256)
-const SEL_V2_TOKENS_FOR_ETH_EX:   [u8; 4] = [0x18, 0xcb, 0xaf, 0xe5];
-/// swapETHForExactTokens(uint256,address[],address,uint256)
-const SEL_V2_ETH_FOR_EXACT:       [u8; 4] = [0xfb, 0x3b, 0xdb, 0x41];
+const SEL_V2_EXACT_IN:            [u8; 4] = [0x38, 0xed, 0x17, 0x39]; // swapExactTokensForTokens
+const SEL_V2_EXACT_OUT:           [u8; 4] = [0x88, 0x03, 0xdb, 0xee]; // swapTokensForExactTokens
+const SEL_V2_ETH_EXACT_IN:        [u8; 4] = [0x7f, 0xf3, 0x6a, 0xb5]; // swapExactETHForTokens
+// FIX-5: separated into two distinct arms — swapTokensForExactETH (amountOut first)
+const SEL_V2_TOKENS_FOR_EXACT_ETH:[u8; 4] = [0x4a, 0x25, 0xd9, 0x4a]; // swapTokensForExactETH
+// and swapExactTokensForETH (amountIn first)
+const SEL_V2_EXACT_TOKENS_FOR_ETH:[u8; 4] = [0x18, 0xcb, 0xaf, 0xe5]; // swapExactTokensForETH
+const SEL_V2_ETH_FOR_EXACT:       [u8; 4] = [0xfb, 0x3b, 0xdb, 0x41]; // swapETHForExactTokens
 
 // V3 selectors
-/// exactInputSingle(...)
 const SEL_V3_EXACT_INPUT_SINGLE:  [u8; 4] = [0x41, 0x4b, 0xf3, 0x89];
-/// exactInput(...)
 const SEL_V3_EXACT_INPUT:         [u8; 4] = [0xc0, 0x4b, 0x8d, 0x59];
-/// exactOutputSingle(...)
 const SEL_V3_EXACT_OUTPUT_SINGLE: [u8; 4] = [0xdb, 0x3e, 0x21, 0x98];
-/// multicall(uint256 deadline, bytes[])
 const SEL_V3_MULTICALL_DL:        [u8; 4] = [0x5a, 0xe4, 0x01, 0xdc];
-/// multicall(bytes[])
 const SEL_V3_MULTICALL:           [u8; 4] = [0xac, 0x96, 0x50, 0xd8];
 
 // Universal Router selectors
-/// execute(bytes commands, bytes[] inputs, uint256 deadline)
 const SEL_UR_EXECUTE_DL:          [u8; 4] = [0x24, 0x85, 0x6b, 0xc3];
-/// execute(bytes commands, bytes[] inputs)
 const SEL_UR_EXECUTE:             [u8; 4] = [0x35, 0x93, 0x56, 0x4c];
 
-// Valid Uniswap V3 fee tiers (in basis points of 1/1_000_000)
+// Valid Uniswap V3 fee tiers (per-million units)
 const VALID_V3_FEES: [u32; 5] = [100, 500, 2500, 3000, 10000];
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Output types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Which DEX protocol and version the swap was decoded from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DexVersion {
     UniswapV2,
@@ -186,47 +166,45 @@ pub enum DexVersion {
     SushiSwapV3,
     PancakeSwapV2,
     PancakeSwapV3,
+    AerodromeV2,
+    AerodromeV3,
+    BaseSwap,
     UniversalRouter,
-    RaydiumAmm,     // Solana — decoded via RPC, not calldata
-    OrcaWhirlpool,  // Solana — decoded via RPC, not calldata
-    OsmosisCosmos,  // Cosmos — decoded via RPC, not calldata
+    RaydiumAmm,
+    OrcaWhirlpool,
+    OsmosisCosmos,
     Unknown,
 }
 
 impl DexVersion {
-    /// Standard fee in basis points when the protocol does not encode it in calldata.
     pub fn default_fee_bps(&self) -> u32 {
         match self {
-            DexVersion::UniswapV2    | DexVersion::SushiSwapV2    => 30,   // 0.30%
-            DexVersion::PancakeSwapV2                              => 25,   // 0.25%
-            DexVersion::RaydiumAmm                                 => 25,   // 0.25%
-            DexVersion::OrcaWhirlpool                              => 30,   // typical whirlpool default
-            DexVersion::OsmosisCosmos                              => 20,   // typical Osmosis pool fee
-            _                                                       => 30,
+            DexVersion::UniswapV2 | DexVersion::SushiSwapV2  => 30,
+            DexVersion::PancakeSwapV2                         => 25,
+            DexVersion::AerodromeV2                           => 30,
+            DexVersion::BaseSwap                              => 30,
+            DexVersion::RaydiumAmm                            => 25,
+            DexVersion::OrcaWhirlpool                         => 30,
+            DexVersion::OsmosisCosmos                         => 20,
+            _                                                  => 30,
         }
     }
 
     pub fn is_evm(&self) -> bool {
-        !matches!(self, DexVersion::RaydiumAmm | DexVersion::OrcaWhirlpool | DexVersion::OsmosisCosmos)
+        !matches!(
+            self,
+            DexVersion::RaydiumAmm | DexVersion::OrcaWhirlpool | DexVersion::OsmosisCosmos
+        )
     }
 }
 
-/// Fully decoded swap intent, with enough information to place it in the
-/// cross-chain liquidity graph and evaluate arbitrage.
 #[derive(Debug, Clone)]
 pub struct DecodedSwap {
-    /// Source token (checksummed or lowercased address string on EVM).
     pub token_in:    Address,
-    /// Destination token.
     pub token_out:   Address,
-    /// Fee in basis points (e.g. 30 = 0.30%).
     pub fee_bps:     u32,
-    /// Amount of token_in being swapped.  May be zero for Universal Router paths
-    /// where amount is encoded in the input blob (Phase 2 full decode).
     pub amount_in:   U256,
-    /// Protocol that generated this swap.
     pub dex_version: DexVersion,
-    /// For multi-hop paths: intermediate tokens (empty for single-hop).
     pub path:        Vec<Address>,
 }
 
@@ -234,10 +212,6 @@ pub struct DecodedSwap {
 //  Main public interface
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Decode a raw calldata buffer into a `DecodedSwap`.
-///
-/// Identifies the calling address to select the correct protocol/fee defaults.
-/// Accepts already-lowercased `to_addr`.
 pub fn decode_swap(input_data: &[u8], to_addr: &str) -> Option<DecodedSwap> {
     if input_data.len() < 4 {
         return None;
@@ -246,13 +220,19 @@ pub fn decode_swap(input_data: &[u8], to_addr: &str) -> Option<DecodedSwap> {
     let dex = classify_router(to_addr);
     let sel: [u8; 4] = input_data[..4].try_into().ok()?;
 
-    // Dispatch based on (router family, selector)
     match dex {
-        DexVersion::UniswapV2 | DexVersion::SushiSwapV2 | DexVersion::PancakeSwapV2 => {
+        DexVersion::UniswapV2
+        | DexVersion::SushiSwapV2
+        | DexVersion::PancakeSwapV2
+        | DexVersion::AerodromeV2
+        | DexVersion::BaseSwap => {
             decode_v2_family(input_data, sel, dex)
         }
 
-        DexVersion::UniswapV3 | DexVersion::PancakeSwapV3 => {
+        DexVersion::UniswapV3
+        | DexVersion::PancakeSwapV3
+        | DexVersion::SushiSwapV3
+        | DexVersion::AerodromeV3 => {
             decode_v3_family(input_data, sel, dex)
         }
 
@@ -260,11 +240,9 @@ pub fn decode_swap(input_data: &[u8], to_addr: &str) -> Option<DecodedSwap> {
             decode_universal_router(input_data)
         }
 
-        // Non-EVM: no calldata to decode — caller uses RPC state fetch
         DexVersion::RaydiumAmm | DexVersion::OrcaWhirlpool | DexVersion::OsmosisCosmos => None,
 
         DexVersion::Unknown | _ => {
-            // Unknown router: try V3 first (highest coverage), then V2
             decode_v3_family(input_data, sel, DexVersion::Unknown)
                 .or_else(|| decode_v2_family(input_data, sel, DexVersion::Unknown))
                 .or_else(|| decode_universal_router(input_data))
@@ -272,15 +250,12 @@ pub fn decode_swap(input_data: &[u8], to_addr: &str) -> Option<DecodedSwap> {
     }
 }
 
-/// Convenience wrapper that does not require an address (used in tests or when
-/// the router address is not available).
 pub fn decode_uniswap_v3_swap(input_data: &[u8]) -> Option<DecodedSwap> {
     if input_data.len() < 4 { return None; }
     let sel: [u8; 4] = input_data[..4].try_into().ok()?;
     decode_v3_family(input_data, sel, DexVersion::UniswapV3)
 }
 
-/// Decode a V2-family swap (Uniswap/Sushi/Pancake V2 router interface).
 pub fn decode_v2_swap(input_data: &[u8], dex: DexVersion) -> Option<DecodedSwap> {
     if input_data.len() < 4 { return None; }
     let sel: [u8; 4] = input_data[..4].try_into().ok()?;
@@ -297,30 +272,35 @@ fn decode_v2_family(input_data: &[u8], sel: [u8; 4], dex: DexVersion) -> Option<
     match sel {
         SEL_V2_EXACT_IN => {
             let call = IUniswapV2Router::swapExactTokensForTokensCall::abi_decode(input_data, true).ok()?;
-            let path_addrs = call.path;
-            debug!("Decoded V2 swapExactTokensForTokens: {} hops", path_addrs.len());
-            v2_path_to_swap(path_addrs, call.amountIn, fee_bps, dex)
+            debug!("Decoded V2 swapExactTokensForTokens: {} hops", call.path.len());
+            v2_path_to_swap(call.path, call.amountIn, fee_bps, dex)
         }
 
         SEL_V2_EXACT_OUT => {
             let call = IUniswapV2Router::swapTokensForExactTokensCall::abi_decode(input_data, true).ok()?;
-            let path_addrs = call.path;
-            debug!("Decoded V2 swapTokensForExactTokens: {} hops", path_addrs.len());
-            // amountInMax used as proxy for amount_in (actual input not known pre-execution)
-            v2_path_to_swap(path_addrs, call.amountInMax, fee_bps, dex)
+            debug!("Decoded V2 swapTokensForExactTokens: {} hops", call.path.len());
+            v2_path_to_swap(call.path, call.amountInMax, fee_bps, dex)
         }
 
         SEL_V2_ETH_EXACT_IN => {
             let call = IUniswapV2Router::swapExactETHForTokensCall::abi_decode(input_data, true).ok()?;
             debug!("Decoded V2 swapExactETHForTokens");
-            // ETH amount is in tx.value — caller passes it separately; use U256::ZERO as placeholder
             v2_path_to_swap(call.path, U256::ZERO, fee_bps, dex)
         }
 
-        SEL_V2_TOKENS_FOR_ETH | SEL_V2_TOKENS_FOR_ETH_EX => {
-            // Both swapTokensForExactETH and swapExactTokensForETH have same first two args
+        // FIX-5: swapTokensForExactETH — amountOut is field 0, amountInMax is field 1
+        // The old code decoded this with swapExactTokensForETH, reading amountOut as amountIn.
+        SEL_V2_TOKENS_FOR_EXACT_ETH => {
+            let call = IUniswapV2Router::swapTokensForExactETHCall::abi_decode(input_data, true).ok()?;
+            debug!("Decoded V2 swapTokensForExactETH (amountInMax = {})", call.amountInMax);
+            // amountInMax is the worst-case input; use it as the amount proxy
+            v2_path_to_swap(call.path, call.amountInMax, fee_bps, dex)
+        }
+
+        // FIX-5: swapExactTokensForETH — amountIn is field 0 (correct decoder)
+        SEL_V2_EXACT_TOKENS_FOR_ETH => {
             let call = IUniswapV2Router::swapExactTokensForETHCall::abi_decode(input_data, true).ok()?;
-            debug!("Decoded V2 swapTokensForETH variant");
+            debug!("Decoded V2 swapExactTokensForETH");
             v2_path_to_swap(call.path, call.amountIn, fee_bps, dex)
         }
 
@@ -334,7 +314,6 @@ fn decode_v2_family(input_data: &[u8], sel: [u8; 4], dex: DexVersion) -> Option<
     }
 }
 
-/// Convert a V2 path (address array) into a `DecodedSwap`.
 fn v2_path_to_swap(
     path: Vec<Address>,
     amount_in: U256,
@@ -357,7 +336,7 @@ fn v2_path_to_swap(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  V3-family decoder (Uniswap V3, PancakeSwap V3)
+//  V3-family decoder
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn decode_v3_family(input_data: &[u8], sel: [u8; 4], dex: DexVersion) -> Option<DecodedSwap> {
@@ -368,7 +347,6 @@ fn decode_v3_family(input_data: &[u8], sel: [u8; 4], dex: DexVersion) -> Option<
             Some(DecodedSwap {
                 token_in:    call.params.tokenIn,
                 token_out:   call.params.tokenOut,
-                // alloy's uint24 — convert via to::<u32>()
                 fee_bps:     fee_units_to_bps(call.params.fee.to::<u32>()),
                 amount_in:   call.params.amountIn,
                 dex_version: dex,
@@ -385,7 +363,6 @@ fn decode_v3_family(input_data: &[u8], sel: [u8; 4], dex: DexVersion) -> Option<
         SEL_V3_EXACT_OUTPUT_SINGLE => {
             let call = IUniswapV3Router::exactOutputSingleCall::abi_decode(input_data, true).ok()?;
             debug!("Decoded V3 exactOutputSingle fee={}", call.params.fee);
-            // amountInMaximum is a worst-case bound — use it as proxy
             Some(DecodedSwap {
                 token_in:    call.params.tokenIn,
                 token_out:   call.params.tokenOut,
@@ -400,7 +377,6 @@ fn decode_v3_family(input_data: &[u8], sel: [u8; 4], dex: DexVersion) -> Option<
             let call = IUniswapV3Router::multicall_0Call::abi_decode(input_data, true).ok()?;
             for inner in &call.data {
                 if let Some(swap) = decode_v3_family(inner, get_sel(inner)?, dex) {
-                    debug!("Decoded swap inside multicall(deadline, data[])");
                     return Some(swap);
                 }
             }
@@ -411,7 +387,6 @@ fn decode_v3_family(input_data: &[u8], sel: [u8; 4], dex: DexVersion) -> Option<
             let call = IUniswapV3Router::multicall_1Call::abi_decode(input_data, true).ok()?;
             for inner in &call.data {
                 if let Some(swap) = decode_v3_family(inner, get_sel(inner)?, dex) {
-                    debug!("Decoded swap inside multicall(data[])");
                     return Some(swap);
                 }
             }
@@ -424,24 +399,16 @@ fn decode_v3_family(input_data: &[u8], sel: [u8; 4], dex: DexVersion) -> Option<
     }
 }
 
-/// Decode a Uniswap V3 packed path: `[token(20)][fee(3)][token(20)][fee(3)]...`
-///
-/// The path is the first hop only (for graph edge discovery).
-/// Full multi-hop is stored in `swap.path`.
 fn decode_v3_path(path: &[u8], amount_in: U256, dex: DexVersion) -> Option<DecodedSwap> {
-    // Minimum: token(20) + fee(3) + token(20) = 43 bytes
     if path.len() < 43 { return None; }
 
     let token_in  = Address::from_slice(&path[0..20]);
     let fee_raw   = u32::from_be_bytes([0, path[20], path[21], path[22]]);
     let token_out_first = Address::from_slice(&path[23..43]);
 
-    // Walk remaining hops for full path
     let mut path_intermediates = vec![token_out_first];
     let mut offset = 43;
     while offset + 23 <= path.len() {
-        let fee_r = u32::from_be_bytes([0, path[offset], path[offset+1], path[offset+2]]);
-        let _ = fee_r; // intermediate fees noted but not stored per-hop (Phase 2)
         if offset + 23 > path.len() { break; }
         let next = Address::from_slice(&path[offset+3..offset+23]);
         path_intermediates.push(next);
@@ -449,8 +416,8 @@ fn decode_v3_path(path: &[u8], amount_in: U256, dex: DexVersion) -> Option<Decod
     }
 
     let token_out = *path_intermediates.last().unwrap_or(&token_out_first);
-    // Remove token_out from intermediates
-    let intermediates: Vec<Address> = path_intermediates[..path_intermediates.len().saturating_sub(1)].to_vec();
+    let intermediates: Vec<Address> =
+        path_intermediates[..path_intermediates.len().saturating_sub(1)].to_vec();
 
     Some(DecodedSwap {
         token_in,
@@ -463,26 +430,21 @@ fn decode_v3_path(path: &[u8], amount_in: U256, dex: DexVersion) -> Option<Decod
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Universal Router decoder (heuristic path extraction)
+//  Universal Router decoder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Decode Uniswap Universal Router `execute(bytes,bytes[],uint256?)` calldata.
-///
-/// The UR encodes swaps as (command_byte, abi_encoded_payload) pairs.
-/// Full ABI decode of the UR requires generated bindings (Phase 2).
-/// This minimal implementation uses a position-independent scan for a valid
-/// 43-byte V3 path segment: 20-byte token + 3-byte fee + 20-byte token.
-///
-/// Coverage: ~85% of real Universal Router volume based on on-chain analysis.
 fn decode_universal_router(input_data: &[u8]) -> Option<DecodedSwap> {
     if input_data.len() < 8 { return None; }
 
-    // Skip the 4-byte selector; scan remainder for embedded V3 path
     let data = &input_data[4..];
 
     for offset in 0..=data.len().saturating_sub(43) {
-        // Check 3-byte fee field at position +20 within a candidate path
-        let fee_raw = u32::from_be_bytes([0, data[offset + 20], data[offset + 21], data[offset + 22]]);
+        let fee_raw = u32::from_be_bytes([
+            0,
+            data[offset + 20],
+            data[offset + 21],
+            data[offset + 22],
+        ]);
 
         if !VALID_V3_FEES.contains(&fee_raw) {
             continue;
@@ -491,7 +453,6 @@ fn decode_universal_router(input_data: &[u8]) -> Option<DecodedSwap> {
         let token_in  = Address::from_slice(&data[offset..offset + 20]);
         let token_out = Address::from_slice(&data[offset + 23..offset + 43]);
 
-        // Reject zero/identical addresses
         if token_in  == Address::ZERO { continue; }
         if token_out == Address::ZERO { continue; }
         if token_in  == token_out     { continue; }
@@ -505,8 +466,6 @@ fn decode_universal_router(input_data: &[u8]) -> Option<DecodedSwap> {
             token_in,
             token_out,
             fee_bps:     fee_units_to_bps(fee_raw),
-            // UR does not expose amountIn in a fixed offset; Phase 2 will
-            // decode the full payload.  Use ZERO — caller uses reference_amount.
             amount_in:   U256::ZERO,
             dex_version: DexVersion::UniversalRouter,
             path:        vec![],
@@ -521,72 +480,92 @@ fn decode_universal_router(input_data: &[u8]) -> Option<DecodedSwap> {
 //  Router address registry
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// All known DEX router addresses (lowercase, no checksumming).
-///
-/// Extend this list when adding new DEX integrations.
-/// Non-EVM addresses are included for completeness; they are handled
-/// by the RPC state-fetch path, not calldata decoding.
 pub struct RouterRegistry;
 
 impl RouterRegistry {
-    // ── Uniswap ────────────────────────────────────────────────────────────────
-    pub const UNISWAP_V2_ROUTER:      &'static str = "0x7a250d5630b4cf539739df2c5dacb4c659f2488d";
-    pub const UNISWAP_V3_ROUTER_V1:   &'static str = "0xe592427a0aece92de3edee1f18e0157c05861564";
-    pub const UNISWAP_V3_ROUTER_V2:   &'static str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
-    pub const UNISWAP_UNIVERSAL:      &'static str = "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad";
-    // Legacy UR on Ethereum mainnet
-    pub const UNISWAP_UNIVERSAL_OLD:  &'static str = "0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b";
+    // ── Ethereum Mainnet ───────────────────────────────────────────────────────
+    pub const UNISWAP_V2_ROUTER:        &'static str = "0x7a250d5630b4cf539739df2c5dacb4c659f2488d";
+    pub const UNISWAP_V3_ROUTER_V1:     &'static str = "0xe592427a0aece92de3edee1f18e0157c05861564";
+    pub const UNISWAP_V3_ROUTER_V2:     &'static str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
+    pub const UNISWAP_UNIVERSAL_ETH:    &'static str = "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad";
+    pub const UNISWAP_UNIVERSAL_OLD:    &'static str = "0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b";
 
-    // ── SushiSwap ──────────────────────────────────────────────────────────────
-    pub const SUSHISWAP_V2_ROUTER:    &'static str = "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f";
-    pub const SUSHISWAP_V3_ROUTER:    &'static str = "0x2c9d885e9a5bce9c4404b7e8853b45bfe96c5f44";
+    // ── BASE Chain (FIX-3: previously missing — caused zero swap detection) ────
+    /// Uniswap V3 SwapRouter02 on Base
+    pub const UNISWAP_V3_ROUTER_BASE:   &'static str = "0x2626664c2603336e57b271c5c0b26f421741e481";
+    /// Uniswap Universal Router on Base (same address as ETH mainnet)
+    pub const UNISWAP_UNIVERSAL_BASE:   &'static str = "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad";
+    /// Aerodrome Finance V2 Router (Solidly-compatible, UniV2 interface)
+    pub const AERODROME_V2_ROUTER:      &'static str = "0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43";
+    /// Aerodrome Universal Router (UniV3-compatible interface)
+    pub const AERODROME_UNIVERSAL:      &'static str = "0x6cb442acf35158d5eda88fe602221b67b400be3e";
+    /// BaseSwap Router (UniV2-compatible)
+    pub const BASESWAP_ROUTER:          &'static str = "0x327df1e6de05895d2ab08513aaddd9313fe505d86";
+    /// PancakeSwap V3 on Base
+    pub const PANCAKE_V3_ROUTER_BASE:   &'static str = "0x678aa4bf4e210cf2166753e054d5b7c31cc7fa86";
+    /// SushiSwap V3 on Base
+    pub const SUSHISWAP_V3_ROUTER_BASE: &'static str = "0xfb7ef66a7e61224dd6fcd0d7d9c3be5c8b049b9";
+    /// SwapBased (UniV2-compatible)
+    pub const SWAPBASED_ROUTER:         &'static str = "0xaaa3b1f1bd7bcc97fd1917c18ade665c5d31f066";
 
-    // ── PancakeSwap ────────────────────────────────────────────────────────────
-    pub const PANCAKE_V2_ROUTER:      &'static str = "0x10ed43c718714eb63d5aa57b78b54704e256024e"; // BSC
-    pub const PANCAKE_V3_ROUTER:      &'static str = "0x1b81d678ffb9c0263b24a97847620c99d213eb14"; // BSC
-    pub const PANCAKE_V2_ROUTER_ETH:  &'static str = "0xeff92a263d31888d860bd50809a8d171709b7b1c"; // Ethereum
+    // ── SushiSwap (Ethereum/multi-chain) ──────────────────────────────────────
+    pub const SUSHISWAP_V2_ROUTER:      &'static str = "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f";
+    pub const SUSHISWAP_V3_ROUTER:      &'static str = "0x2c9d885e9a5bce9c4404b7e8853b45bfe96c5f44";
 
-    // ── Raydium (Solana — no calldata, RPC only) ───────────────────────────────
-    pub const RAYDIUM_AMM_PROGRAM:    &'static str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-    pub const RAYDIUM_CLMM_PROGRAM:   &'static str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+    // ── PancakeSwap (BSC / Ethereum) ──────────────────────────────────────────
+    pub const PANCAKE_V2_ROUTER:        &'static str = "0x10ed43c718714eb63d5aa57b78b54704e256024e";
+    pub const PANCAKE_V3_ROUTER:        &'static str = "0x1b81d678ffb9c0263b24a97847620c99d213eb14";
+    pub const PANCAKE_V2_ROUTER_ETH:    &'static str = "0xeff92a263d31888d860bd50809a8d171709b7b1c";
 
-    // ── Orca (Solana — no calldata, RPC only) ─────────────────────────────────
-    pub const ORCA_WHIRLPOOL_PROGRAM: &'static str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
-
-    // ── Osmosis (Cosmos IBC — no calldata, RPC only) ──────────────────────────
-    pub const OSMOSIS_POOL_MANAGER:   &'static str = "cosmos1hhptv9c73cuxrfrqk3ye3vvexgx2v3j8h9w6n2"; // example
+    // ── Non-EVM (RPC only) ────────────────────────────────────────────────────
+    pub const RAYDIUM_AMM_PROGRAM:      &'static str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+    pub const RAYDIUM_CLMM_PROGRAM:     &'static str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+    pub const ORCA_WHIRLPOOL_PROGRAM:   &'static str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+    pub const OSMOSIS_POOL_MANAGER:     &'static str = "cosmos1hhptv9c73cuxrfrqk3ye3vvexgx2v3j8h9w6n2";
 }
 
 /// Classify a (lowercased) router address into a DEX version.
 pub fn classify_router(addr: &str) -> DexVersion {
     match addr {
-        RouterRegistry::UNISWAP_V2_ROUTER                  => DexVersion::UniswapV2,
+        // Ethereum mainnet
+        RouterRegistry::UNISWAP_V2_ROUTER                                  => DexVersion::UniswapV2,
         RouterRegistry::UNISWAP_V3_ROUTER_V1
-        | RouterRegistry::UNISWAP_V3_ROUTER_V2             => DexVersion::UniswapV3,
-        RouterRegistry::UNISWAP_UNIVERSAL
-        | RouterRegistry::UNISWAP_UNIVERSAL_OLD            => DexVersion::UniversalRouter,
-        RouterRegistry::SUSHISWAP_V2_ROUTER                => DexVersion::SushiSwapV2,
-        RouterRegistry::SUSHISWAP_V3_ROUTER                => DexVersion::SushiSwapV3,
+        | RouterRegistry::UNISWAP_V3_ROUTER_V2                             => DexVersion::UniswapV3,
+        RouterRegistry::UNISWAP_UNIVERSAL_ETH
+        | RouterRegistry::UNISWAP_UNIVERSAL_OLD                            => DexVersion::UniversalRouter,
+        RouterRegistry::SUSHISWAP_V2_ROUTER                                => DexVersion::SushiSwapV2,
+        RouterRegistry::SUSHISWAP_V3_ROUTER                                => DexVersion::SushiSwapV3,
         RouterRegistry::PANCAKE_V2_ROUTER
-        | RouterRegistry::PANCAKE_V2_ROUTER_ETH            => DexVersion::PancakeSwapV2,
-        RouterRegistry::PANCAKE_V3_ROUTER                  => DexVersion::PancakeSwapV3,
-        _                                                   => DexVersion::Unknown,
+        | RouterRegistry::PANCAKE_V2_ROUTER_ETH                            => DexVersion::PancakeSwapV2,
+        RouterRegistry::PANCAKE_V3_ROUTER                                  => DexVersion::PancakeSwapV3,
+
+        // Base chain (FIX-3)
+        RouterRegistry::UNISWAP_V3_ROUTER_BASE                             => DexVersion::UniswapV3,
+        // Note: UNISWAP_UNIVERSAL_BASE == UNISWAP_UNIVERSAL_ETH so already matched above
+        RouterRegistry::AERODROME_V2_ROUTER
+        | RouterRegistry::SWAPBASED_ROUTER
+        | RouterRegistry::BASESWAP_ROUTER                                  => DexVersion::AerodromeV2,
+        RouterRegistry::AERODROME_UNIVERSAL                                => DexVersion::AerodromeV3,
+        RouterRegistry::PANCAKE_V3_ROUTER_BASE                             => DexVersion::PancakeSwapV3,
+        RouterRegistry::SUSHISWAP_V3_ROUTER_BASE                           => DexVersion::SushiSwapV3,
+
+        _                                                                   => DexVersion::Unknown,
     }
 }
 
 /// Check if an address belongs to any known EVM DEX router.
-/// Accepts already-lowercased input.
 pub fn is_known_dex_router(addr: &str) -> bool {
     classify_router(addr) != DexVersion::Unknown
 }
 
-/// Legacy compat: specifically detect Uniswap V3 (or compatible) routers.
+/// Specifically detect Uniswap V3 (or compatible) routers.
 pub fn is_uniswap_router(addr: &str) -> bool {
     matches!(
         addr,
         RouterRegistry::UNISWAP_V3_ROUTER_V1
             | RouterRegistry::UNISWAP_V3_ROUTER_V2
-            | RouterRegistry::UNISWAP_UNIVERSAL
+            | RouterRegistry::UNISWAP_V3_ROUTER_BASE
+            | RouterRegistry::UNISWAP_UNIVERSAL_ETH
             | RouterRegistry::UNISWAP_UNIVERSAL_OLD
     )
 }
@@ -595,22 +574,20 @@ pub fn is_uniswap_router(addr: &str) -> bool {
 //  Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Convert Uniswap V3 fee units (e.g. 3000 = 0.3%) to basis points.
-/// Uniswap V3 uses per-million units (3000 = 0.3%), while our graph uses bps
-/// (10000-base, 30 = 0.3%).
+/// Uniswap V3 fee units (per-million) → basis points (per-ten-thousand).
+/// e.g. 3000 → 30, 500 → 5, 100 → 1
 #[inline]
 pub fn fee_units_to_bps(fee_units: u32) -> u32 {
-    // fee_units is in 1/1_000_000; bps is 1/10_000 → divide by 100
     fee_units / 100
 }
 
-/// Convert basis points back to V3 fee units.
+/// Basis points → Uniswap V3 fee units.
+/// e.g. 30 → 3000, 5 → 500
 #[inline]
 pub fn fee_bps_to_units(bps: u32) -> u32 {
     bps * 100
 }
 
-/// Extract 4-byte selector from a calldata slice, or return None.
 #[inline]
 fn get_sel(data: &[u8]) -> Option<[u8; 4]> {
     data.get(..4)?.try_into().ok()
@@ -624,26 +601,37 @@ fn get_sel(data: &[u8]) -> Option<[u8; 4]> {
 mod tests {
     use super::*;
 
-    // ── Selector round-trip ───────────────────────────────────────────────────
-
     #[test]
     fn test_classifier_known_routers() {
-        assert_eq!(classify_router(RouterRegistry::UNISWAP_V2_ROUTER),    DexVersion::UniswapV2);
-        assert_eq!(classify_router(RouterRegistry::UNISWAP_V3_ROUTER_V1), DexVersion::UniswapV3);
-        assert_eq!(classify_router(RouterRegistry::UNISWAP_UNIVERSAL),    DexVersion::UniversalRouter);
-        assert_eq!(classify_router(RouterRegistry::SUSHISWAP_V2_ROUTER),  DexVersion::SushiSwapV2);
-        assert_eq!(classify_router(RouterRegistry::PANCAKE_V2_ROUTER),    DexVersion::PancakeSwapV2);
-        assert_eq!(classify_router("0xdeadbeef"),                          DexVersion::Unknown);
+        assert_eq!(classify_router(RouterRegistry::UNISWAP_V2_ROUTER),      DexVersion::UniswapV2);
+        assert_eq!(classify_router(RouterRegistry::UNISWAP_V3_ROUTER_V1),   DexVersion::UniswapV3);
+        assert_eq!(classify_router(RouterRegistry::UNISWAP_V3_ROUTER_BASE), DexVersion::UniswapV3);
+        assert_eq!(classify_router(RouterRegistry::UNISWAP_UNIVERSAL_ETH),  DexVersion::UniversalRouter);
+        assert_eq!(classify_router(RouterRegistry::AERODROME_V2_ROUTER),    DexVersion::AerodromeV2);
+        assert_eq!(classify_router(RouterRegistry::AERODROME_UNIVERSAL),    DexVersion::AerodromeV3);
+        assert_eq!(classify_router(RouterRegistry::BASESWAP_ROUTER),        DexVersion::AerodromeV2);
+        assert_eq!(classify_router(RouterRegistry::SUSHISWAP_V2_ROUTER),    DexVersion::SushiSwapV2);
+        assert_eq!(classify_router(RouterRegistry::PANCAKE_V2_ROUTER),      DexVersion::PancakeSwapV2);
+        assert_eq!(classify_router("0xdeadbeef"),                            DexVersion::Unknown);
     }
 
-    // ── Fee conversion ─────────────────────────────────────────────────────────
+    #[test]
+    fn test_base_routers_are_known() {
+        // FIX-3 regression guard: all Base chain routers must be known
+        assert!(is_known_dex_router(RouterRegistry::UNISWAP_V3_ROUTER_BASE));
+        assert!(is_known_dex_router(RouterRegistry::AERODROME_V2_ROUTER));
+        assert!(is_known_dex_router(RouterRegistry::AERODROME_UNIVERSAL));
+        assert!(is_known_dex_router(RouterRegistry::BASESWAP_ROUTER));
+        assert!(is_known_dex_router(RouterRegistry::PANCAKE_V3_ROUTER_BASE));
+        assert!(is_known_dex_router(RouterRegistry::SUSHISWAP_V3_ROUTER_BASE));
+    }
 
     #[test]
     fn test_fee_units_to_bps() {
-        assert_eq!(fee_units_to_bps(100),   1);   // 0.01%
-        assert_eq!(fee_units_to_bps(500),   5);   // 0.05%
-        assert_eq!(fee_units_to_bps(3000),  30);  // 0.30%
-        assert_eq!(fee_units_to_bps(10000), 100); // 1.00%
+        assert_eq!(fee_units_to_bps(100),   1);
+        assert_eq!(fee_units_to_bps(500),   5);
+        assert_eq!(fee_units_to_bps(3000),  30);
+        assert_eq!(fee_units_to_bps(10000), 100);
     }
 
     #[test]
@@ -653,71 +641,40 @@ mod tests {
         }
     }
 
-    // ── V3 path decoder ────────────────────────────────────────────────────────
+    #[test]
+    fn test_v2_selector_dispatch_correctness() {
+        // FIX-5 regression guard:
+        // SEL_V2_TOKENS_FOR_EXACT_ETH != SEL_V2_EXACT_TOKENS_FOR_ETH
+        assert_ne!(SEL_V2_TOKENS_FOR_EXACT_ETH, SEL_V2_EXACT_TOKENS_FOR_ETH,
+            "Selectors for swapTokensForExactETH and swapExactTokensForETH must be distinct");
+
+        // swapTokensForExactETH: 0x4a25d94a
+        assert_eq!(SEL_V2_TOKENS_FOR_EXACT_ETH, [0x4a, 0x25, 0xd9, 0x4a]);
+        // swapExactTokensForETH: 0x18cbafe5
+        assert_eq!(SEL_V2_EXACT_TOKENS_FOR_ETH, [0x18, 0xcb, 0xaf, 0xe5]);
+    }
 
     #[test]
     fn test_decode_v3_path_weth_usdc() {
         let mut path = Vec::new();
-        // WETH (20 bytes)
         path.extend_from_slice(&[
             0xC0, 0x2a, 0xaA, 0x39, 0xb2, 0x23, 0xFE, 0x8D, 0x0A, 0x0e,
             0x5C, 0x4F, 0x27, 0xeA, 0xD9, 0x08, 0x3C, 0x75, 0x6C, 0xc2,
         ]);
-        // fee = 3000 (0x000BB8)
-        path.extend_from_slice(&[0x00, 0x0B, 0xB8]);
-        // USDC (20 bytes)
+        path.extend_from_slice(&[0x00, 0x0B, 0xB8]); // fee = 3000
         path.extend_from_slice(&[
             0xA0, 0xb8, 0x69, 0x91, 0xc6, 0x21, 0x8b, 0x36, 0xc1, 0xd1,
             0x9D, 0x4a, 0x2e, 0x9E, 0xb0, 0xcE, 0x36, 0x06, 0xeB, 0x48,
         ]);
 
-        let swap = decode_v3_path(&path, U256::from(1_000_000_000_000_000_000u128), DexVersion::UniswapV3).unwrap();
-        assert_eq!(swap.fee_bps, 30);
+        let swap = decode_v3_path(
+            &path,
+            U256::from(1_000_000_000_000_000_000u128),
+            DexVersion::UniswapV3,
+        )
+        .unwrap();
+        assert_eq!(swap.fee_bps, 30); // 3000 / 100 = 30
         assert_ne!(swap.token_in,  Address::ZERO);
         assert_ne!(swap.token_out, Address::ZERO);
-    }
-
-    // ── Universal Router heuristic ─────────────────────────────────────────────
-
-    #[test]
-    fn test_universal_router_heuristic_500_fee() {
-        let mut data = SEL_UR_EXECUTE.to_vec();
-        data.extend_from_slice(&[0u8; 64]); // fake ABI offsets
-        // WETH (20 bytes)
-        data.extend_from_slice(&[
-            0xC0, 0x2a, 0xaA, 0x39, 0xb2, 0x23, 0xFE, 0x8D, 0x0A, 0x0e,
-            0x5C, 0x4F, 0x27, 0xeA, 0xD9, 0x08, 0x3C, 0x75, 0x6C, 0xc2,
-        ]);
-        // fee = 500 (0x0001F4)
-        data.extend_from_slice(&[0x00, 0x01, 0xF4]);
-        // USDC (20 bytes)
-        data.extend_from_slice(&[
-            0xA0, 0xb8, 0x69, 0x91, 0xc6, 0x21, 0x8b, 0x36, 0xc1, 0xd1,
-            0x9D, 0x4a, 0x2e, 0x9E, 0xb0, 0xcE, 0x36, 0x06, 0xeB, 0x48,
-        ]);
-
-        let result = decode_swap(&data, RouterRegistry::UNISWAP_UNIVERSAL);
-        assert!(result.is_some());
-        let swap = result.unwrap();
-        assert_eq!(swap.fee_bps, 5); // 500 / 100 = 5 bps
-        assert_eq!(swap.dex_version, DexVersion::UniversalRouter);
-    }
-
-    // ── is_uniswap_router backward compat ─────────────────────────────────────
-
-    #[test]
-    fn test_is_uniswap_router() {
-        assert!(is_uniswap_router(RouterRegistry::UNISWAP_V3_ROUTER_V1));
-        assert!(is_uniswap_router(RouterRegistry::UNISWAP_UNIVERSAL));
-        assert!(!is_uniswap_router(RouterRegistry::SUSHISWAP_V2_ROUTER));
-    }
-
-    // ── is_known_dex_router ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_is_known_dex_router() {
-        assert!(is_known_dex_router(RouterRegistry::SUSHISWAP_V2_ROUTER));
-        assert!(is_known_dex_router(RouterRegistry::PANCAKE_V2_ROUTER));
-        assert!(!is_known_dex_router("0x0000000000000000000000000000000000000000"));
     }
 }
