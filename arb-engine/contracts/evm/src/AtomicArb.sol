@@ -62,6 +62,40 @@ interface IUniswapV2Router {
     ) external returns (uint256[] memory amounts);
 }
 
+// ── Wormhole Cross-Chain Relayer Interfaces ───────────────────────────────────
+
+interface IWormholeRelayer {
+    function sendPayloadToEvm(
+        uint16 targetChain,
+        address targetAddress,
+        bytes memory payload,
+        uint256 receiverValue,
+        uint256 gasLimit
+    ) external payable returns (uint64 sequence);
+    
+    function send(
+        uint16 targetChain,
+        bytes32 targetAddress,
+        bytes memory payload,
+        uint256 receiverValue,
+        uint256 paymentForExtraReceiverValue,
+        uint16 refundChain,
+        address refundAddress,
+        address routingAccount,
+        uint32 routingFee
+    ) external payable returns (uint64 sequence);
+}
+
+interface IWormholeReceiver {
+    function receiveWormholeMessages(
+        bytes memory payload,
+        bytes[] memory additionalVaas,
+        bytes32 sourceAddress,
+        uint16 sourceChain,
+        bytes32 deliveryHash
+    ) external payable;
+}
+
 // ── Uniswap V3 Router ─────────────────────────────────────────────────────────
 
 interface IUniswapV3Router {
@@ -104,13 +138,16 @@ struct ArbParams {
 //  AtomicArb contract
 // ─────────────────────────────────────────────────────────────────────────────
 
-contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausable {
+contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     // ── State ──────────────────────────────────────────────────────────────────
 
     /// Aave V3 Pool (the flash loan provider)
     IPool public immutable aavePool;
+
+    /// Wormhole Relayer
+    IWormholeRelayer public immutable wormholeRelayer;
 
     /// Aave V3 flash loan fee: 0.05% = 5 bps
     uint256 public constant AAVE_FLASH_LOAN_FEE_BPS = 5;
@@ -138,13 +175,54 @@ contract AtomicArb is IFlashLoanSimpleReceiver, Ownable, ReentrancyGuard, Pausab
 
     event CircuitBreakerTriggered(uint256 drawdown, uint256 threshold);
     event ProfitWithdrawn(address token, uint256 amount);
+    event CrossChainMessageReceived(uint16 sourceChain, bytes32 sourceAddress, bytes payload);
+    event CrossChainMessageSent(uint16 targetChain, bytes32 targetAddress, bytes payload);
 
     // ── Constructor ────────────────────────────────────────────────────────────
 
-    constructor(address _aavePool, uint256 _maxDrawdownPerHour)  {
+    constructor(address _aavePool, address _wormholeRelayer, uint256 _maxDrawdownPerHour)  {
         aavePool = IPool(_aavePool);
+        wormholeRelayer = IWormholeRelayer(_wormholeRelayer);
         maxDrawdownPerHour = _maxDrawdownPerHour;
         drawdownWindowStart = block.timestamp;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Cross-Chain Relayer Functions
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function sendCrossChainMessage(
+        uint16 targetChain,
+        bytes32 targetAddress,
+        bytes memory payload
+    ) external payable onlyOwner {
+        uint256 cost = msg.value;
+        require(cost > 0, "AtomicArb: Insufficient value for relayer fee");
+
+        wormholeRelayer.send{value: cost}(
+            targetChain,
+            targetAddress,
+            payload,
+            0, // no receiver value
+            0,
+            targetChain,
+            msg.sender,
+            address(0),
+            0
+        );
+        emit CrossChainMessageSent(targetChain, targetAddress, payload);
+    }
+
+    function receiveWormholeMessages(
+        bytes memory payload,
+        bytes[] memory /* additionalVaas */,
+        bytes32 sourceAddress,
+        uint16 sourceChain,
+        bytes32 /* deliveryHash */
+    ) external payable override {
+        require(msg.sender == address(wormholeRelayer), "AtomicArb: Only relayer can call");
+        // Process the message (e.g. trigger execution or sync state)
+        emit CrossChainMessageReceived(sourceChain, sourceAddress, payload);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

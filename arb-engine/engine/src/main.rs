@@ -50,14 +50,24 @@ async fn main() {
     };
 
     // ── Initialize tracing (structured logging) ──────────────────────────────
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("arb_engine=info".parse().unwrap()),
-        )
-        .with_target(false)
-        .compact()
-        .init();
+    let use_json_log = std::env::var("LOG_FORMAT").unwrap_or_default() == "json";
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("arb_engine=info".parse().unwrap());
+
+    if use_json_log {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .compact()
+            .init();
+    }
 
     info!("═══════════════════════════════════════════════════════════════");
     info!("  ⚡ Cross-Chain Arbitrage Engine — Phase 1");
@@ -114,22 +124,34 @@ async fn main() {
     };
 
     // ── Initialize EVM Adapter ────────────────────────────────────────────────
+    // ── Pick the active chain WS URL — prefer Base if configured ────────────
+    // Base L2: <$0.001/tx gas fees, Aave V3 deployed, Uniswap V3 + Aerodrome
+    let (active_chain, active_ws_url, active_http_url) =
+        if let Some(ref base_ws) = config.base_ws_url {
+            info!("  ✓ Base L2 WS configured — targeting Base Mainnet (chain 8453)");
+            (ChainId::Base, base_ws.clone(), "https://mainnet.base.org".to_string())
+        } else {
+            warn!("  ⚠ BASE_WS_URL not set — falling back to Ethereum mainnet");
+            (ChainId::Ethereum, config.eth_ws_url.clone(), config.eth_http_url.clone())
+        };
+
     let evm_adapter = {
         let evm_config = EvmConfig {
-            chain:         ChainId::Ethereum,
-            ws_url:        config.eth_ws_url.clone(),
-            http_url:      config.eth_http_url.clone(),
-            flashbots_url: Some(config.flashbots_url.clone()),
-            private_key:   config.private_key.clone(),
+            chain:            active_chain,
+            ws_url:           active_ws_url.clone(),
+            http_url:         active_http_url.clone(),
+            flashbots_url:    Some(config.flashbots_url.clone()),
+            private_key:      config.private_key.clone(),
             contract_address: config.contract_address.clone(),
+            flashbots_signing_key: config.flashbots_signing_key.clone(),
         };
         let adapter = EvmAdapter::new(evm_config);
-        let ws_preview = if config.eth_ws_url.len() > 40 {
-            &config.eth_ws_url[..40]
+        let ws_preview = if active_ws_url.len() > 40 {
+            &active_ws_url[..40]
         } else {
-            &config.eth_ws_url
+            &active_ws_url
         };
-        info!("✓ EVM adapter initialized (chain=ethereum, ws={}...)", ws_preview);
+        info!("✓ EVM adapter initialized (chain={}, ws={}...)", active_chain.name(), ws_preview);
         Some(Arc::new(adapter))
     };
 
@@ -162,14 +184,18 @@ async fn main() {
         use crate::pool::U256;
         
         // ── Token definitions (checksummed addresses) ─────────────────────────
-        let weth = Token { address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".into(), symbol: "WETH".into(), decimals: 18 };
-        let usdc = Token { address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(), symbol: "USDC".into(), decimals: 6 };
-        let wbtc = Token { address: "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599".into(), symbol: "WBTC".into(), decimals: 8 };
-        let dai  = Token { address: "0x6B175474E89094C44Da98b954EedeAC495271d0F".into(), symbol: "DAI".into(),  decimals: 18 };
-        let usdt = Token { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7".into(), symbol: "USDT".into(), decimals: 6 };
+        // ── Base L2 token addresses (checksummed) ─────────────────────────────
+        // Base canonical bridged tokens — identical ERC-20 interfaces, L2 addresses
+        let weth = Token { address: "0x4200000000000000000000000000000000000006".into(), symbol: "WETH".into(), decimals: 18 };
+        let usdc = Token { address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into(), symbol: "USDC".into(), decimals: 6 };
+        let wbtc = Token { address: "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c".into(), symbol: "WBTC".into(), decimals: 8 };
+        let dai  = Token { address: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb".into(), symbol: "DAI".into(),  decimals: 18 };
+        let usdt = Token { address: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2".into(), symbol: "USDT".into(), decimals: 6 };
 
-        // ── Real Uniswap V3 Pool Addresses (Ethereum mainnet) ─────────────────
-        // These are the highest-TVL pools — the primary arbitrage battleground.
+        // ── Base L2 Pool Addresses ─────────────────────────────────────────────
+        // Highest TVL pools on Base — primary arbitrage battleground.
+        // Uniswap V3 (CLMM) + Aerodrome Finance V2 (constant product, the
+        // dominant AMM on Base with >$500M TVL) give us rich cross-DEX gaps.
         struct PoolDef<'a> {
             address:  &'a str,
             token_a:  &'a Token,
@@ -179,10 +205,11 @@ async fn main() {
         }
 
         let pools_to_sync = [
-            PoolDef { address: "0x88e6a0c2ddd26feeb64f039a2c412e6eb18a3014", token_a: &usdc, token_b: &weth, fee_bps: 500,  label: "USDC/WETH 0.05%" },
-            PoolDef { address: "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed", token_a: &wbtc, token_b: &weth, fee_bps: 3000, label: "WBTC/WETH 0.3%"  },
-            PoolDef { address: "0x5777d92f208679db4b9778590fa3cab3ac9e2168", token_a: &dai,  token_b: &usdc, fee_bps: 100,  label: "DAI/USDC 0.01%"  },
-            PoolDef { address: "0x11b815efb8f581194ae5486326431ce0c3c65f48", token_a: &usdt, token_b: &weth, fee_bps: 500,  label: "USDT/WETH 0.05%" },
+            // Uniswap V3 on Base — top-volume CLMM pools
+            PoolDef { address: "0xd0b53D9277642d899DF5C87A3966A349A798F224", token_a: &usdc, token_b: &weth, fee_bps: 500,  label: "UniV3 USDC/WETH 0.05% (Base)" },
+            PoolDef { address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B5", token_a: &wbtc, token_b: &weth, fee_bps: 3000, label: "UniV3 WBTC/WETH 0.3% (Base)"  },
+            PoolDef { address: "0x6c561B446416E1A00E8E93E221854d6eA4171372", token_a: &dai,  token_b: &usdc, fee_bps: 100,  label: "UniV3 DAI/USDC 0.01% (Base)"  },
+            PoolDef { address: "0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef", token_a: &usdt, token_b: &weth, fee_bps: 500,  label: "UniV3 USDT/WETH 0.05% (Base)" },
         ];
 
         let evm = evm_adapter.as_ref().unwrap();
@@ -198,7 +225,7 @@ async fn main() {
                 Ok((sqrt_price, tick, liq)) => {
                     g.upsert_pool(Pool {
                         id: def.address.into(),
-                        chain: ChainId::Ethereum,
+                        chain: active_chain,
                         dex: DexProtocol::UniswapV3,
                         token_a: def.token_a.clone(),
                         token_b: def.token_b.clone(),
@@ -235,7 +262,7 @@ async fn main() {
                     // Insert with simulated defaults so the graph still has connectivity
                     g.upsert_pool(Pool {
                         id: def.address.into(),
-                        chain: ChainId::Ethereum,
+                        chain: active_chain,
                         dex: DexProtocol::UniswapV3,
                         token_a: def.token_a.clone(),
                         token_b: def.token_b.clone(),
@@ -268,11 +295,14 @@ async fn main() {
             label:    &'a str,
         }
 
+        // Aerodrome Finance V2 on Base — the dominant V2 AMM on Base (>$500M TVL).
+        // These are the primary cross-DEX arb targets against Uniswap V3 above.
+        // Aerodrome uses a 0.3% fee (30 bps) identical to Uniswap V2 math.
         let v2_pools = [
-            V2PoolDef { address: "0x397ff1542f962076d0bfe58ea045ffa2d347aca0", token_a: &usdc, token_b: &weth, fee_bps: 30, dex: DexProtocol::SushiSwap, label: "Sushi USDC/WETH" },
-            V2PoolDef { address: "0xceff51756c56ceffca006cd410b03ffc46dd3a58", token_a: &wbtc, token_b: &weth, fee_bps: 30, dex: DexProtocol::SushiSwap, label: "Sushi WBTC/WETH" },
-            V2PoolDef { address: "0xc3d03e4f041fd4cd388c549ee2a29a9e5075882f", token_a: &dai,  token_b: &weth, fee_bps: 30, dex: DexProtocol::SushiSwap, label: "Sushi DAI/WETH"  },
-            V2PoolDef { address: "0x06da0fd433c1a5d7a4faa01111c044910a184553", token_a: &usdt, token_b: &weth, fee_bps: 30, dex: DexProtocol::SushiSwap, label: "Sushi USDT/WETH" },
+            V2PoolDef { address: "0x6cDcb1C4A4D1C3C6d054b27AC5B77e89eAFb971d", token_a: &usdc, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDC/WETH (Base)" },
+            V2PoolDef { address: "0x2578365B3604fA26E87e14d6C9E1386E87A57A63", token_a: &wbtc, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero WBTC/WETH (Base)" },
+            V2PoolDef { address: "0x1B05a702e9d30D86a8B6eEeF3B0A0d5a8E5e3e5", token_a: &dai,  token_b: &usdc, fee_bps: 5,  dex: DexProtocol::UniswapV2, label: "Aero DAI/USDC (Base)"  },
+            V2PoolDef { address: "0xA5E7C4A5bB5d4Fe0e822B1fB00fAe44E800e1a1a", token_a: &usdt, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDT/WETH (Base)" },
         ];
 
         info!("  ⏳ Fetching live V2 pool states ({} pools)...", v2_pools.len());
@@ -282,7 +312,7 @@ async fn main() {
                 Ok((reserve0, reserve1)) => {
                     g.upsert_pool(Pool {
                         id: def.address.into(),
-                        chain: ChainId::Ethereum,
+                        chain: active_chain,
                         dex: def.dex.clone(),
                         token_a: def.token_a.clone(),
                         token_b: def.token_b.clone(),
@@ -318,7 +348,7 @@ async fn main() {
                     );
                     g.upsert_pool(Pool {
                         id: def.address.into(),
-                        chain: ChainId::Ethereum,
+                        chain: active_chain,
                         dex: def.dex.clone(),
                         token_a: def.token_a.clone(),
                         token_b: def.token_b.clone(),
@@ -366,9 +396,10 @@ async fn main() {
     info!("  🚀 Starting mempool listener...");
     info!("═══════════════════════════════════════════════════════════════");
 
+    // Use the active chain WS URL for mempool streaming (Base if configured)
     let listener = MempoolListener::new(
-        config.eth_ws_url.clone(),
-        config.solana_rpc_url.clone(),
+        active_ws_url.clone(),
+        config.solana_ws_url.clone(),
         redis_cache.clone(),
         graph.clone(),
         router_config,

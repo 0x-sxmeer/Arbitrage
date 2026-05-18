@@ -27,6 +27,8 @@ pub struct Config {
     pub arb_ws_url: Option<String>,
     /// Solana RPC HTTP URL (optional)
     pub solana_rpc_url: Option<String>,
+    /// Solana WebSocket URL (optional)
+    pub solana_ws_url: Option<String>,
 
     // ── Database ──────────────────────────────────────────────────────────────
     /// Redis connection URL
@@ -79,6 +81,7 @@ impl Config {
             base_ws_url: std::env::var("BASE_WS_URL").ok(),
             arb_ws_url: std::env::var("ARB_WS_URL").ok(),
             solana_rpc_url: std::env::var("SOLANA_RPC_URL").ok(),
+            solana_ws_url: std::env::var("SOLANA_WS_URL").ok(),
 
             // ── Database ──────────────────────────────────────────────────
             redis_url: std::env::var("REDIS_URL")

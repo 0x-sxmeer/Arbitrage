@@ -264,6 +264,8 @@ fn get_amount0_delta(
 /// `pool.fee_bps` is in basis points of 10_000 (30 = 0.30%).
 /// The fee is deducted from `amount_in` before sqrt price calculation.
 pub fn get_amount_out_v3(pool: &Pool, amount_in: U256, zero_for_one: bool) -> Result<U256> {
+    use crate::arb::math::v3_math::simulate_swap_single_range;
+
     let sqrt_price_x96 = pool.state.sqrt_price_x96
         .ok_or_else(|| anyhow::anyhow!("V3 pool {} missing sqrtPriceX96", pool.id))?;
     let liquidity = pool.state.liquidity
@@ -276,59 +278,13 @@ pub fn get_amount_out_v3(pool: &Pool, amount_in: U256, zero_for_one: bool) -> Re
         bail!("amount_in must be > 0");
     }
 
-    // Validate sqrtPrice is in bounds
-    let max_sqrt_ratio = U256::from_str_radix("1461446703485210103287273052203988822378723970342", 10).unwrap();
-    if sqrt_price_x96 < U256::from(MIN_SQRT_RATIO) || sqrt_price_x96 > max_sqrt_ratio {
-        bail!(
-            "sqrtPriceX96 {} out of valid range [{}, {}]",
-            sqrt_price_x96, MIN_SQRT_RATIO, max_sqrt_ratio
-        );
-    }
-
-    // ── Step 1: deduct fee from amount_in ────────────────────────────────────
-    // amount_in_after_fee = amount_in * (FEE_DENOMINATOR - fee_bps) / FEE_DENOMINATOR
-    let fee_denom = U256::from(FEE_DENOMINATOR);
-    let fee_bps   = U256::from(pool.fee_bps);
-    let net_factor = fee_denom.saturating_sub(fee_bps);
-
-    let amount_in_after_fee = full_mul_div(amount_in, net_factor, fee_denom)
-        .ok_or_else(|| anyhow::anyhow!("fee deduction overflow"))?;
-
-    if amount_in_after_fee.is_zero() {
-        // Amount so small that fee consumes everything
-        return Ok(U256::zero());
-    }
-
-    // ── Step 2: compute new sqrt price after swap ─────────────────────────────
-    let sqrt_p_new = if zero_for_one {
-        // Selling token0 → price decreases
-        get_next_sqrt_price_from_token0(sqrt_price_x96, liquidity, amount_in_after_fee)?
-    } else {
-        // Selling token1 → price increases
-        get_next_sqrt_price_from_token1(sqrt_price_x96, liquidity, amount_in_after_fee)?
-    };
-
-    // Clamp to valid range
-    let sqrt_p_new = sqrt_p_new.max(U256::from(MIN_SQRT_RATIO));
-    let sqrt_p_new = sqrt_p_new.min(max_sqrt_ratio);
-
-    // ── Step 3: compute output amount from sqrt price delta ───────────────────
-    let amount_out = if zero_for_one {
-        // Selling token0 → receiving token1 (y)
-        // sqrt_price decreased: old > new
-        if sqrt_price_x96 <= sqrt_p_new {
-            // No price movement — degenerate case
-            return Ok(U256::zero());
-        }
-        get_amount1_delta(sqrt_p_new, sqrt_price_x96, liquidity)?
-    } else {
-        // Selling token1 → receiving token0 (x)
-        // sqrt_price increased: new > old
-        if sqrt_p_new <= sqrt_price_x96 {
-            return Ok(U256::zero());
-        }
-        get_amount0_delta(sqrt_price_x96, sqrt_p_new, liquidity)?
-    };
+    let amount_out = simulate_swap_single_range(
+        sqrt_price_x96,
+        liquidity,
+        amount_in,
+        pool.fee_bps,
+        zero_for_one,
+    );
 
     Ok(amount_out)
 }

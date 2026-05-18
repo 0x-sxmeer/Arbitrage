@@ -41,7 +41,7 @@ services:
         -c shared_buffers=256MB
         -c work_mem=16MB
         -c max_connections=100
-        -c wal_level=minimal
+        -c wal_level=replica
         -c synchronous_commit=off
         -c checkpoint_completion_target=0.9
         -c log_min_duration_statement=500

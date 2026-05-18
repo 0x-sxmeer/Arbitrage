@@ -47,6 +47,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::str::FromStr;
 
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use futures_util::StreamExt;
@@ -141,22 +142,100 @@ impl MempoolListener {
     /// Run forever — subscribes to pending txs, reconnects on failure.
     pub async fn run(&self) -> Result<()> {
         let evm_task = self.run_evm_stream();
+        let solana_task = self.run_solana_stream();
 
-        let solana_task = async {
+        tokio::select! {
+            res = evm_task => res,
+            res = solana_task => res,
+        }
+    }
+
+    // ── Solana reconnect loop ──────────────────────────────────────────────────
+
+    async fn run_solana_stream(&self) -> Result<()> {
+        let mut reconnect_delay = INITIAL_RECONNECT_MS;
+
+        loop {
             if let Some(ref url) = self.solana_ws_url {
-                info!(url = %url, "Starting Solana stream placeholder");
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    debug!("Solana stream placeholder heartbeat");
+                info!(url = %url, "Connecting to Solana WebSocket RPC...");
+
+                match solana_client::nonblocking::pubsub_client::PubsubClient::new(url).await {
+                    Ok(client) => {
+                        info!("✓ Solana WebSocket connected. Subscribing to account changes...");
+                        
+                        // For the purpose of the engine, we subscribe to relevant pools.
+                        // We gather Solana pools from the graph.
+                        let mut solana_pools = Vec::new();
+                        {
+                            let graph = self.graph.read().await;
+                            for (_, pool) in graph.get_all_pools() {
+                                if pool.chain == ChainId::Solana {
+                                    if let Ok(pubkey) = solana_sdk::pubkey::Pubkey::from_str(&pool.id) {
+                                        solana_pools.push(pubkey);
+                                    }
+                                }
+                            }
+                        }
+
+                        if solana_pools.is_empty() {
+                            warn!("No Solana pools found in the graph. Adding a heartbeat.");
+                            let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
+                            loop {
+                                heartbeat.tick().await;
+                                debug!("Solana stream heartbeat (no pools)");
+                            }
+                        } else {
+                            // Subscribing to multiple accounts would happen here.
+                            // Due to constraints, we'll just listen to the first one as an example,
+                            // or loop and subscribe to all. We'll use a single block loop for now.
+                            let config = solana_client::rpc_config::RpcAccountInfoConfig {
+                                encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                                ..Default::default()
+                            };
+
+                            let mut join_handles = Vec::new();
+                            let client_arc = Arc::new(client);
+
+                            for pubkey in solana_pools {
+                                let c = Arc::clone(&client_arc);
+                                let metrics = self.metrics.clone();
+                                let config = config.clone();
+                                
+                                let handle = tokio::spawn(async move {
+                                    match c.account_subscribe(&pubkey, Some(config)).await {
+                                        Ok((mut sub, _unsub)) => {
+                                            info!("Successfully subscribed to Solana pool {}", pubkey);
+                                            while let Some(_response) = sub.next().await {
+                                                debug!("Received update for Solana pool {}", pubkey);
+                                                // Here we would decode the new state, update the graph, and trigger pathfinding.
+                                                // self.trigger_pathfinder(pool_id, new_state)
+                                                metrics.inc_txs_seen();
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to subscribe to Solana pool {}: {}", pubkey, e);
+                                        }
+                                    }
+                                });
+                                join_handles.push(handle);
+                            }
+
+                            // Wait for any task to fail or complete
+                            futures_util::future::join_all(join_handles).await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Solana WebSocket error: {:?} — reconnecting in {}ms", e, reconnect_delay);
+                        self.metrics.inc_ws_reconnections();
+                    }
                 }
             } else {
                 std::future::pending::<()>().await;
             }
-        };
 
-        tokio::select! {
-            res = evm_task => res,
-            _ = solana_task => Ok(()),
+            sleep(Duration::from_millis(reconnect_delay)).await;
+            reconnect_delay = ((reconnect_delay as f64 * BACKOFF_MULTIPLIER) as u64)
+                .min(MAX_RECONNECT_MS);
         }
     }
 
@@ -633,7 +712,24 @@ impl WorkerCtx {
                 }
             }
 
-            // 5c: Execute (never block the worker — spawn)
+            // 5c: Dry-run simulation (Task 5) — NEVER fire without passing eth_call
+            if let Some(ref adapter) = self.evm_adapter {
+                match adapter.simulate_arbitrage(&opp).await {
+                    Ok(()) => {
+                        info!(id = %opp.id, "✓ Simulation passed — proceeding to execution");
+                    }
+                    Err(e) => {
+                        warn!(
+                            id = %opp.id,
+                            error = %e,
+                            "⚠ Simulation failed — skipping execution (zero-loss guarantee)"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // 5d: Execute (never block the worker — spawn)
             if let Some(ref adapter) = self.evm_adapter {
                 let adapter_clone = Arc::clone(adapter);
                 let opp_clone     = opp.clone();

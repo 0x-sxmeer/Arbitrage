@@ -232,6 +232,11 @@ impl LiquidityGraph {
         self.pools.get(pool_id)
     }
 
+    /// Iterator over all pools in the graph
+    pub fn get_all_pools(&self) -> std::collections::hash_map::Iter<'_, String, Arc<Pool>> {
+        self.pools.iter()
+    }
+
     /// Iterate all edges from a given token.
     pub fn edges_from<'a>(&'a self, token: &'a str) -> impl Iterator<Item = &'a LiquidityEdge> + 'a {
         self.edges.iter().filter(move |e| e.token_in == token)
@@ -324,14 +329,44 @@ impl LiquidityGraph {
         pool2:    &Pool,
         config:   &RouterConfig,
     ) -> Option<ArbitrageOpportunity> {
-        let input = config.reference_amount;
+        use crate::arb::math::optimizer::{find_optimal_input, estimate_upper_bound};
 
-        let zfo1  = start == pool1.token_a.address;
-        let out1  = sim_out(pool1, input, zfo1)?;
-        let imp1  = sim_impact(pool1, input, zfo1);
+        let zfo1 = start == pool1.token_a.address;
+        let zfo2 = mid == pool2.token_a.address;
+
+        let sim_cycle = |amount: U256| -> U256 {
+            let out1 = match sim_out(pool1, amount, zfo1) {
+                Some(o) => o,
+                None => return U256::zero(),
+            };
+            match sim_out(pool2, out1, zfo2) {
+                Some(o) => o,
+                None => U256::zero(),
+            }
+        };
+
+        let min_reserve = {
+            let res1 = if zfo1 { pool1.state.reserve_a } else { pool1.state.reserve_b };
+            let res2 = if zfo2 { pool2.state.reserve_a } else { pool2.state.reserve_b };
+            if res1 < res2 { res1 } else { res2 }
+        };
+        let upper_bound = if min_reserve.is_zero() {
+            U256::from(u64::MAX)
+        } else {
+            estimate_upper_bound(min_reserve, 0.05)
+        };
+        let lower_bound = U256::from(1_000_000u64);
+        let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
+
+        let optimal_amount = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_wei) {
+            Some(opt) => opt.amount,
+            None => return None,
+        };
+
+        let out1  = sim_out(pool1, optimal_amount, zfo1)?;
+        let imp1  = sim_impact(pool1, optimal_amount, zfo1);
         if imp1 > config.max_price_impact_bps { return None; }
 
-        let zfo2  = mid == pool2.token_a.address;
         let out2  = sim_out(pool2, out1, zfo2)?;
         let imp2  = sim_impact(pool2, out1, zfo2);
         if imp2 > config.max_price_impact_bps { return None; }
@@ -342,7 +377,7 @@ impl LiquidityGraph {
             chain:     pool1.chain,
             token_in:  start.to_string(),
             token_out: mid.to_string(),
-            amount_in: input,
+            amount_in: optimal_amount,
             expected_amount_out: out1,
             fee_bps:   pool1.fee_bps,
             step_price_impact_bps: imp1,
@@ -363,7 +398,7 @@ impl LiquidityGraph {
             vec![step1, step2],
             start.to_string(),
             pool1.chain,
-            input,
+            optimal_amount,
             out2,
             config.gas_estimate,
             config.gas_price_gwei,
@@ -582,10 +617,12 @@ fn reconstruct_and_evaluate(
     // Reverse (predecessor traces backwards)
     steps.reverse();
 
+    let cycle_edges: Vec<&LiquidityEdge> = steps.iter().map(|(e, _, _)| *e).collect();
+
     // ── Deduplicate ───────────────────────────────────────────────────────────
-    let cycle_key: String = steps
+    let cycle_key: String = cycle_edges
         .iter()
-        .map(|(e, _, _)| e.pool.id.as_str())
+        .map(|e| e.pool.id.as_str())
         .collect::<Vec<_>>()
         .join("|");
     if !seen_cycles.insert(cycle_key.clone()) {
@@ -593,22 +630,68 @@ fn reconstruct_and_evaluate(
         return None;
     }
 
+    // ── Optimize Input Size ───────────────────────────────────────────────────
+    use crate::arb::math::optimizer::{find_optimal_input, estimate_upper_bound};
+
+    let min_reserve = cycle_edges.iter().map(|e| {
+        if e.token_in == e.pool.token_a.address {
+            e.pool.state.reserve_a
+        } else {
+            e.pool.state.reserve_b
+        }
+    }).filter(|r| !r.is_zero()).min().unwrap_or(U256::MAX);
+    let upper_bound = if min_reserve == U256::MAX {
+        U256::from(u64::MAX)
+    } else {
+        estimate_upper_bound(min_reserve, 0.05)
+    };
+    // Lower bound: try to avoid trivial dust amounts
+    let lower_bound = U256::from(1_000_000u64); 
+    let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
+
+    let sim_cycle = |mut amount: U256| -> U256 {
+        for edge in &cycle_edges {
+            let zfo = edge.token_in == edge.pool.token_a.address;
+            match sim_out(&edge.pool, amount, zfo) {
+                Some(out) => amount = out,
+                None => return U256::zero(),
+            }
+        }
+        amount
+    };
+
+    let optimal_amount = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_wei) {
+        Some(opt) => opt.amount,
+        None => {
+            debug!("BF cycle rejected: no profitable input size found after gas");
+            return None;
+        }
+    };
+
     // ── Build SwapSteps ───────────────────────────────────────────────────────
-    let swap_steps: Vec<SwapStep> = steps.iter().map(|(edge, amount_in, amount_out)| {
-        let zfo    = edge.token_in == edge.pool.token_a.address;
-        let impact = sim_impact(&edge.pool, *amount_in, zfo);
-        SwapStep {
+    let mut swap_steps: Vec<SwapStep> = Vec::with_capacity(cycle_edges.len());
+    let mut current_amount = optimal_amount;
+    for edge in cycle_edges {
+        let zfo = edge.token_in == edge.pool.token_a.address;
+        let out = sim_out(&edge.pool, current_amount, zfo)?;
+        let impact = sim_impact(&edge.pool, current_amount, zfo);
+        if impact > config.max_price_impact_bps {
+            debug!("BF cycle rejected: price impact {} bps > limit at optimal amount", impact);
+            return None;
+        }
+        swap_steps.push(SwapStep {
             pool_id:          edge.pool.id.clone(),
             dex:              edge.pool.dex.name().to_string(),
             chain:            edge.pool.chain,
             token_in:         edge.token_in.clone(),
             token_out:        edge.token_out.clone(),
-            amount_in:        *amount_in,
-            expected_amount_out: *amount_out,
+            amount_in:        current_amount,
+            expected_amount_out: out,
             fee_bps:          edge.pool.fee_bps,
             step_price_impact_bps: impact,
-        }
-    }).collect();
+        });
+        current_amount = out;
+    }
 
     if swap_steps.is_empty() {
         return None;
@@ -622,7 +705,7 @@ fn reconstruct_and_evaluate(
         swap_steps,
         cycle_entry_token.clone(),
         chain,
-        config.reference_amount,
+        optimal_amount,
         gross_output,
         config.gas_estimate,
         config.gas_price_gwei,

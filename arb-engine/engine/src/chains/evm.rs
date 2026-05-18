@@ -96,6 +96,8 @@ pub struct EvmConfig {
     pub contract_address: Option<String>,
     /// Private key for signing execution transactions (hex, 0x-prefixed)
     pub private_key: Option<String>,
+    /// Persistent Flashbots signing key for relay reputation (hex, 0x-prefixed)
+    pub flashbots_signing_key: Option<String>,
 }
 
 /// EVM adapter — manages the alloy-rs provider connection and exposes chain operations.
@@ -637,9 +639,16 @@ impl EvmAdapter {
 
         let payload_string = serde_json::to_string(&payload)?;
         
-        // Generate a random signer for the Flashbots reputation identity
-        // In production, this should be a stable key loaded from config
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        // Use persistent signing key from config for consistent relay reputation.
+        // A stable identity builds trust with block builders (Titan, Flashbots, etc.)
+        let signer: PrivateKeySigner = match self.config.flashbots_signing_key.as_deref() {
+            Some(key) => key.parse()
+                .context("Failed to parse FLASHBOTS_SIGNING_KEY")?,
+            None => {
+                warn!("FLASHBOTS_SIGNING_KEY not set — using random key (no reputation!)");
+                alloy::signers::local::PrivateKeySigner::random()
+            }
+        };
         let body_hash = alloy::primitives::keccak256(payload_string.as_bytes());
         let signature = alloy::signers::Signer::sign_message(&signer, body_hash.as_slice()).await?;
         let header_value = format!("{}:{}", signer.address(), hex::encode(signature.as_bytes()));
@@ -663,6 +672,114 @@ impl EvmAdapter {
         info!(response = %text, "✓ Bundle submitted successfully");
 
         Ok(text)
+    }
+
+    // ── Dry-Run Simulation (Task 5) ──────────────────────────────────────────
+
+    /// Simulate the arbitrage transaction via eth_call before committing gas.
+    ///
+    /// Returns `Ok(())` if the simulation succeeds (tx would not revert).
+    /// Returns `Err(...)` with the revert reason if the simulation fails.
+    ///
+    /// This is the critical safety gate: never submit a real tx without a
+    /// passing dry-run. The AtomicArb contract will revert if
+    /// `finalAmount < repayAmount + minProfitWei`, so a simulation failure
+    /// means the arb is no longer profitable at current state.
+    pub async fn simulate_arbitrage(&self, arb: &ArbitrageOpportunity) -> Result<()> {
+        let start = Instant::now();
+
+        let pk = self.config.private_key.as_deref()
+            .context("PRIVATE_KEY not set — cannot simulate")?;
+        let contract_addr_str = self.config.contract_address.as_deref()
+            .context("CONTRACT_ADDRESS not set — cannot simulate")?;
+
+        if arb.route.len() < 2 {
+            bail!("Route too short for simulation (need >= 2 hops)");
+        }
+
+        // Build the same calldata as execute_arbitrage
+        let signer: PrivateKeySigner = pk.parse()
+            .context("Failed to parse PRIVATE_KEY for simulation")?;
+        let from_addr = signer.address();
+
+        let contract_addr = Address::from_str(contract_addr_str)
+            .context("Invalid CONTRACT_ADDRESS")?;
+
+        let token_borrow = Address::from_str(&arb.route[0].token_in)
+            .context("Invalid token_in address on first hop")?;
+        let token_intermediate = Address::from_str(&arb.route[0].token_out)
+            .context("Invalid token_out address on first hop")?;
+
+        let router_addr = Address::from_str(UNISWAP_V3_ROUTER)
+            .context("Invalid V3 router address")?;
+
+        let buy_fee = alloy::primitives::Uint::<24, 1>::from(arb.route[0].fee_bps);
+        let sell_fee = alloy::primitives::Uint::<24, 1>::from(arb.route[1].fee_bps);
+        let min_profit = alloy::primitives::U256::from_str(&arb.net_expected_value.to_string())
+            .unwrap_or_default();
+
+        let params = ArbParams {
+            buyRouter:         router_addr,
+            buyIsV3:           true,
+            buyFee:            buy_fee,
+            buyPath:           vec![],
+            sellRouter:        router_addr,
+            sellIsV3:          true,
+            sellFee:           sell_fee,
+            sellPath:          vec![],
+            tokenBorrow:       token_borrow,
+            tokenIntermediate: token_intermediate,
+            minProfitWei:      min_profit,
+        };
+
+        use alloy::sol_types::SolValue;
+        let encoded_params = params.abi_encode();
+
+        let borrow_amount = alloy::primitives::U256::from_str(&arb.input_amount.to_string())
+            .unwrap_or_default();
+
+        // ABI-encode the executeArbitrage(address, uint256, bytes) call
+        use alloy::sol_types::SolCall;
+        let call = IAtomicArb::executeArbitrageCall {
+            asset: token_borrow,
+            borrowAmount: borrow_amount,
+            params: Bytes::from(encoded_params),
+        };
+        let calldata = call.abi_encode();
+
+        // Build eth_call request (no gas limit = simulates with max gas)
+        let tx = TransactionRequest::default()
+            .from(from_addr)
+            .to(contract_addr)
+            .input(Bytes::from(calldata).into());
+
+        // Use HTTP provider for simulation (more reliable than WS for one-shot calls)
+        let provider = ProviderBuilder::new()
+            .on_builtin(&self.config.http_url)
+            .await
+            .context("Failed to connect simulation provider")?;
+
+        match provider.call(&tx).await {
+            Ok(_) => {
+                let elapsed = start.elapsed();
+                info!(
+                    id      = %arb.id,
+                    latency = ?elapsed,
+                    "✅ Dry-run simulation PASSED — safe to execute"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let elapsed = start.elapsed();
+                warn!(
+                    id      = %arb.id,
+                    latency = ?elapsed,
+                    error   = %e,
+                    "❌ Dry-run simulation REVERTED — aborting execution"
+                );
+                bail!("Simulation reverted: {}", e)
+            }
+        }
     }
 }
 
