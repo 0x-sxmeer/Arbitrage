@@ -49,37 +49,25 @@ impl PostgresStore {
     /// [H-2] Creates all required tables: opportunities, pool_registry,
     ///        executions, and circuit_breaker_events.
     pub async fn run_migrations(&self) -> Result<()> {
-        sqlx::query(CREATE_OPPORTUNITIES_TABLE)
-            .execute(&self.pool)
-            .await
-            .context("Failed to create opportunities table")?;
+        let statements = [
+            CREATE_OPPORTUNITIES_TABLE,
+            CREATE_POOL_REGISTRY_TABLE,
+            CREATE_EXECUTIONS_TABLE,
+            CREATE_CIRCUIT_BREAKER_TABLE,
+            "CREATE INDEX IF NOT EXISTS idx_opportunities_discovered_at ON opportunities (discovered_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_opportunities_executable ON opportunities (is_executable, discovered_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_executions_tx_hash ON executions(tx_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status, submitted_at DESC)",
+        ];
 
-        sqlx::query(CREATE_POOL_REGISTRY_TABLE)
-            .execute(&self.pool)
-            .await
-            .context("Failed to create pool_registry table")?;
+        for stmt in &statements {
+            sqlx::query(stmt)
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("Migration failed: {:.60}...", stmt))?;
+        }
 
-        sqlx::query(CREATE_EXECUTIONS_TABLE)
-            .execute(&self.pool)
-            .await
-            .context("Failed to create executions table")?;
-
-        sqlx::query(CREATE_CIRCUIT_BREAKER_TABLE)
-            .execute(&self.pool)
-            .await
-            .context("Failed to create circuit_breaker_events table")?;
-
-        sqlx::query(CREATE_OPPORTUNITIES_INDEX)
-            .execute(&self.pool)
-            .await
-            .context("Failed to create opportunities index")?;
-
-        sqlx::query(CREATE_EXECUTIONS_INDEX)
-            .execute(&self.pool)
-            .await
-            .context("Failed to create executions index")?;
-
-        info!("✓ Database migrations applied (6 tables/indexes)");
+        info!("✓ Database migrations applied");
         Ok(())
     }
 
@@ -323,12 +311,7 @@ CREATE TABLE IF NOT EXISTS pool_registry (
 )
 "#;
 
-const CREATE_OPPORTUNITIES_INDEX: &str = r#"
-CREATE INDEX IF NOT EXISTS idx_opportunities_discovered_at
-    ON opportunities (discovered_at DESC);
-CREATE INDEX IF NOT EXISTS idx_opportunities_executable
-    ON opportunities (is_executable, discovered_at DESC);
-"#;
+
 
 const INSERT_OPPORTUNITY: &str = r#"
 INSERT INTO opportunities (
@@ -400,12 +383,7 @@ CREATE TABLE IF NOT EXISTS executions (
 )
 "#;
 
-const CREATE_EXECUTIONS_INDEX: &str = r#"
-CREATE INDEX IF NOT EXISTS idx_executions_tx_hash
-    ON executions(tx_hash);
-CREATE INDEX IF NOT EXISTS idx_executions_status
-    ON executions(status, submitted_at DESC);
-"#;
+
 
 // ── [H-2] Circuit breaker event log ──────────────────────────────────────────
 const CREATE_CIRCUIT_BREAKER_TABLE: &str = r#"

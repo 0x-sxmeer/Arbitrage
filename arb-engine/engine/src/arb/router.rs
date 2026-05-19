@@ -68,6 +68,8 @@ pub struct RouterConfig {
     pub max_hops:           usize,
     /// Whether to emit detailed path logs.
     pub verbose:            bool,
+    /// Aave flashloan premium in basis points (e.g., 5 = 0.05%).
+    pub aave_fee_bps:       u32,
 }
 
 impl Default for RouterConfig {
@@ -81,6 +83,7 @@ impl Default for RouterConfig {
             max_price_impact_bps: 200,   // 2% — reject high-impact paths
             max_hops:             4,
             verbose:              false,
+            aave_fee_bps:         5, // Default to 5 bps if unable to fetch
         }
     }
 }
@@ -320,7 +323,7 @@ impl LiquidityGraph {
                 if e1.pool.id == e2.pool.id { continue; }
 
                 if let Some(mut arb) = self.evaluate_two_hop(start_token, mid, &e1.pool, &e2.pool, config) {
-                    arb.calculate_nev(config.eth_price_usd);
+                    arb.calculate_nev(config.eth_price_usd, config.aave_fee_bps);
                     if arb.is_executable {
                         opps.push(arb);
                     }
@@ -798,7 +801,7 @@ fn reconstruct_and_evaluate(
         total_impact,
         0,
     );
-    opp.calculate_nev(config.eth_price_usd);
+    opp.calculate_nev(config.eth_price_usd, config.aave_fee_bps);
 
     if opp.is_executable {
         info!(

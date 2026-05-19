@@ -396,6 +396,20 @@ async fn main() {
         }
     }
 
+    // ── Fetch Aave Flash Loan fee dynamically ────────────────────────────────
+    let mut aave_fee_bps = 5; // Default fallback
+    if let Some(ref evm) = evm_adapter {
+        match evm.get_aave_premium().await {
+            Ok(premium) => {
+                info!("✓ Dynamically fetched Aave flash loan fee: {} bps", premium);
+                aave_fee_bps = premium;
+            }
+            Err(e) => {
+                warn!("⚠ Failed to fetch Aave flash loan fee: {} — falling back to {} bps", e, aave_fee_bps);
+            }
+        }
+    }
+
     // ── Build router config ───────────────────────────────────────────────────
     let router_config = RouterConfig {
         max_hops:         config.max_hops,
@@ -406,6 +420,7 @@ async fn main() {
         gas_estimate:     350_000,
         max_price_impact_bps: 200,
         verbose:          false,
+        aave_fee_bps,
     };
 
     // ── Start mempool listener ────────────────────────────────────────────────

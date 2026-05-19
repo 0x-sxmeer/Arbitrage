@@ -78,18 +78,6 @@ interface IWormholeRelayer {
         uint256 receiverValue,
         uint256 gasLimit
     ) external view returns (uint256 nativePriceQuote, uint256 targetChainRefundPerGasUnused);
-    
-    function send(
-        uint16 targetChain,
-        bytes32 targetAddress,
-        bytes memory payload,
-        uint256 receiverValue,
-        uint256 paymentForExtraReceiverValue,
-        uint16 refundChain,
-        address refundAddress,
-        address routingAccount,
-        uint32 routingFee
-    ) external payable returns (uint64 sequence);
 }
 
 interface IWormholeReceiver {
@@ -158,9 +146,6 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     /// Wormhole Relayer
     IWormholeRelayer public immutable wormholeRelayer;
 
-    /// Aave V3 flash loan fee: 0.05% = 5 bps
-    uint256 public constant AAVE_FLASH_LOAN_FEE_BPS = 5;
-
     /// [C-3] Slippage tolerance in basis points (default 0.5%, max 2%)
     uint256 public slippageBps = 50;
 
@@ -210,7 +195,9 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
 
     // ── Constructor ────────────────────────────────────────────────────────────
 
-    constructor(address _aavePool, address _wormholeRelayer, uint256 _maxDrawdownPerHour)  {
+    constructor(address _aavePool, address _wormholeRelayer, uint256 _maxDrawdownPerHour) Ownable() {
+        require(_aavePool != address(0), "AtomicArb: zero aave pool");
+        require(_wormholeRelayer != address(0), "AtomicArb: zero wormhole relayer");
         aavePool = IPool(_aavePool);
         wormholeRelayer = IWormholeRelayer(_wormholeRelayer);
         maxDrawdownPerHour = _maxDrawdownPerHour;
@@ -333,7 +320,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         if (arb.expectedBuyOut > 0) {
             buyMinOut = (arb.expectedBuyOut * (10000 - slippageBps)) / 10000;
         } else {
-            buyMinOut = 1; // fallback: final profit check still guards overall outcome
+            buyMinOut = (amount * (10000 - slippageBps)) / 10000;
         }
 
         uint256 intermediateAmount = _swap(
@@ -402,6 +389,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
             block.timestamp
         );
 
+        IERC20(asset).forceApprove(address(aavePool), 0);
         return true;
     }
 
@@ -419,6 +407,12 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 amountIn,
         uint256 amountOutMin
     ) internal returns (uint256 amountOut) {
+        if (!isV3) {
+            require(path.length >= 2, "AtomicArb: V2 path too short");
+            require(path[0] == tokenIn, "AtomicArb: path[0] != tokenIn");
+            require(path[path.length - 1] == tokenOut, "AtomicArb: path end != tokenOut");
+        }
+
         // FIX: Use forceApprove instead of safeApprove for OpenZeppelin v5 compatibility
         IERC20(tokenIn).forceApprove(router, amountIn);
 
@@ -473,8 +467,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     //  Admin functions
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Withdraw accumulated profit to owner wallet.
-    function withdrawProfit(address token) external onlyOwner {
+    function _withdrawProfitFor(address token) internal {
         if (token == address(0)) {
             // Native ETH withdrawal
             uint256 ethBalance = address(this).balance;
@@ -491,11 +484,21 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         }
     }
 
+    /// Withdraw accumulated profit to owner wallet.
+    function withdrawProfit(address token) external onlyOwner {
+        _withdrawProfitFor(token);
+    }
+
     /// [C-1] Batch withdraw multiple tokens in one call
     function withdrawProfits(address[] calldata tokens) external onlyOwner {
         for (uint256 i = 0; i < tokens.length; i++) {
-            this.withdrawProfit(tokens[i]);
+            _withdrawProfitFor(tokens[i]);
         }
+    }
+
+    /// Report a loss for the circuit breaker
+    function reportLoss(uint256 lossWei) external onlyOwner {
+        _checkCircuitBreaker(lossWei);
     }
 
     /// [C-3] Set slippage tolerance (owner only, max 2%)

@@ -120,7 +120,7 @@ impl ArbitrageOpportunity {
     ///
     /// All costs must be denominated in the same unit as `input_amount` (wei).
     /// Pass `eth_price_usd` for USD-denominated logging only.
-    pub fn calculate_nev(&mut self, eth_price_usd: f64) {
+    pub fn calculate_nev(&mut self, eth_price_usd: f64, aave_fee_bps: u32) {
         let decimals = match self.start_token.to_lowercase().as_str() {
             "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => 6, // USDC / USDT
             "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => 8, // WBTC
@@ -155,8 +155,14 @@ impl ArbitrageOpportunity {
             / 10_000.0) as i128;
         let impact_loss_scaled = impact_loss * scaling_factor;
 
-        // 5. Net Expected Value
-        self.net_expected_value = gross_profit_scaled - gas_cost_scaled - swap_fees_scaled - impact_loss_scaled;
+        // 5. Aave flashloan fee: borrowing cost
+        let aave_fee_loss = (self.input_amount.low_u128() as f64
+            * aave_fee_bps as f64
+            / 10_000.0) as i128;
+        let aave_fee_loss_scaled = aave_fee_loss * scaling_factor;
+
+        // 6. Net Expected Value
+        self.net_expected_value = gross_profit_scaled - gas_cost_scaled - swap_fees_scaled - impact_loss_scaled - aave_fee_loss_scaled;
         let nev_usd  = (self.net_expected_value as f64 / 1e18) * token_price;
         self.is_executable = nev_usd >= 0.50;
 
@@ -239,7 +245,7 @@ mod tests {
             200_000,
             20.0, // 20 gwei
         );
-        opp.calculate_nev(3000.0);
+        opp.calculate_nev(3000.0, 5);
         assert!(opp.is_executable, "Should be executable");
         assert!(opp.net_expected_value > 0);
     }
@@ -255,7 +261,7 @@ mod tests {
             300_000,
             50.0,
         );
-        opp.calculate_nev(3000.0);
+        opp.calculate_nev(3000.0, 5);
         assert!(!opp.is_executable, "High gas should make this non-executable");
         assert!(opp.net_expected_value < 0);
     }

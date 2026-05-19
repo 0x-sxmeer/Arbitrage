@@ -57,12 +57,19 @@ sol! {
 
     #[sol(rpc)]
     interface IAtomicArb {
+        function aavePool() external view returns (address);
+        
         function executeArbitrage(
             address asset,
             uint256 borrowAmount,
             bytes calldata params,
             uint256 deadline
         ) external;
+    }
+
+    #[sol(rpc)]
+    interface IAavePool {
+        function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
     }
 
     // [C-3] Updated to include per-leg expected outputs for slippage protection
@@ -251,6 +258,21 @@ impl EvmAdapter {
         let mut guard = self.http_provider.write().await;
         *guard = Some(provider.clone());
         Ok(provider)
+    }
+
+    /// Dynamically query the Aave FLASHLOAN_PREMIUM_TOTAL via the AtomicArb contract.
+    pub async fn get_aave_premium(&self) -> Result<u32> {
+        let contract_addr_str = self.config.contract_address.as_deref()
+            .context("CONTRACT_ADDRESS not set")?;
+        let contract_addr = Address::from_str(contract_addr_str)?;
+        let provider = self.get_or_connect_http().await?;
+        
+        let atomic_arb = IAtomicArb::new(contract_addr, provider.clone());
+        let aave_pool_addr = atomic_arb.aavePool().call().await?._0;
+        let aave_pool = IAavePool::new(aave_pool_addr, provider);
+        
+        let premium = aave_pool.FLASHLOAN_PREMIUM_TOTAL().call().await?._0;
+        Ok(premium as u32)
     }
 
     // ── Live Pool State Fetching ─────────────────────────────────────────────
