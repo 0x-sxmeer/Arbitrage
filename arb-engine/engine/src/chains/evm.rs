@@ -34,7 +34,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use std::str::FromStr;
 use std::time::Instant;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 
 use crate::arb::opportunity::ArbitrageOpportunity;
 use crate::pool::{ChainId, Pool, PoolState, PoolType, U256};
@@ -457,10 +457,10 @@ impl EvmAdapter {
         }
 
         let signer: PrivateKeySigner = pk.parse().context("Failed to parse PRIVATE_KEY")?;
-        let wallet = EthereumWallet::from(signer);
+        let wallet = EthereumWallet::from(signer.clone());
 
         let provider = ProviderBuilder::new()
-            .wallet(wallet)
+            .wallet(wallet.clone())
             .on_builtin(&self.config.http_url)
             .await
             .context("Failed to connect execution provider")?;
@@ -508,32 +508,74 @@ impl EvmAdapter {
             deadline,
         );
 
-        match tx.send().await {
-            Ok(pending_tx) => {
-                let receipt = pending_tx.get_receipt().await?;
-                let elapsed = start.elapsed();
-                let exec_num = self.execution_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let mut tx_req = tx.into_transaction_request().from(signer.address());
+        
+        // Estimate gas and populate tx parameters
+        let nonce = provider.get_transaction_count(signer.address()).await?;
+        let gas = provider.estimate_gas(&tx_req).await?;
+        let gas_price = provider.get_gas_price().await?;
+        
+        tx_req.set_nonce(nonce);
+        tx_req.set_gas_limit(gas * 12 / 10); // 20% buffer
+        tx_req.set_max_fee_per_gas(gas_price);
+        tx_req.set_max_priority_fee_per_gas(gas_price);
 
-                info!(
-                    tx_hash     = ?receipt.transaction_hash,
-                    gas_used    = ?receipt.gas_used,
-                    status      = ?receipt.status(),
-                    latency     = ?elapsed,
-                    exec_number = exec_num,
-                    "✅ Arbitrage Executed Successfully!"
-                );
+        use alloy::network::TransactionBuilder;
+        let envelope = tx_req.build(&wallet).await.map_err(|e| anyhow::anyhow!("build error: {}", e))?;
+        
+        // Get RLP encoded signed tx
+        use alloy::eips::eip2718::Encodable2718;
+        let signed_bytes = envelope.encoded_2718();
+        
+        let (receipt, receipt_str) = if self.config.chain == ChainId::Base {
+            info!("Directly broadcasting raw transaction on Base Mainnet...");
+            let tx_hash = envelope.tx_hash();
+            let _pending_tx = provider.send_raw_transaction(&signed_bytes).await
+                .context("Failed to send raw transaction on Base")?;
+            
+            let mut receipt = None;
+            for _ in 0..15 { // wait up to 15 seconds
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                if let Ok(Some(r)) = provider.get_transaction_receipt(*tx_hash).await {
+                    receipt = Some(r);
+                    break;
+                }
             }
-            Err(e) => {
-                error!(
-                    id      = %arb.id,
-                    nev_wei = arb.net_expected_value,
-                    latency = ?start.elapsed(),
-                    error   = %e,
-                    "❌ Arbitrage Reverted"
-                );
+            let rec = receipt.context("Transaction not included after 15s")?;
+            (rec, format!("{:?}", tx_hash))
+        } else {
+            let target_block = provider.get_block_number().await.unwrap_or(0) + 1;
+            let receipt_str = self.submit_flashbots_bundle(vec![signed_bytes], target_block).await?;
+            
+            let tx_hash = envelope.tx_hash();
+            let mut receipt = None;
+            for _ in 0..15 { // wait up to 15 seconds
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                if let Ok(Some(r)) = provider.get_transaction_receipt(*tx_hash).await {
+                    receipt = Some(r);
+                    break;
+                }
             }
+            let rec = receipt.context("Transaction not included after 15s")?;
+            (rec, receipt_str)
+        };
+        
+        if !receipt.status() {
+            bail!("Tx Reverted!");
         }
+        
+        let elapsed = start.elapsed();
+        let exec_num = self.execution_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+        info!(
+            bundle_receipt = %receipt_str,
+            tx_hash     = ?receipt.transaction_hash,
+            gas_used    = ?receipt.gas_used,
+            latency     = ?elapsed,
+            exec_number = exec_num,
+            "✅ Arbitrage Bundle Submitted to Flashbots!"
+        );
 
         Ok(())
     }

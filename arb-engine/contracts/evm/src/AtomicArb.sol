@@ -305,7 +305,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 premium,
         address initiator,
         bytes calldata params
-    ) external override nonReentrant returns (bool) {
+    ) external override returns (bool) {
         // Security: only Aave Pool can call this
         require(msg.sender == address(aavePool), "AtomicArb: caller is not Aave Pool");
         require(initiator == address(this), "AtomicArb: invalid initiator");
@@ -316,12 +316,8 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         // ── Step 1: Buy leg - swap tokenBorrow → tokenIntermediate ───────────
         // [C-3] Per-leg slippage protection: use expectedBuyOut if provided,
         // otherwise fall back to global slippageBps percentage
-        uint256 buyMinOut;
-        if (arb.expectedBuyOut > 0) {
-            buyMinOut = (arb.expectedBuyOut * (10000 - slippageBps)) / 10000;
-        } else {
-            buyMinOut = (amount * (10000 - slippageBps)) / 10000;
-        }
+        require(arb.expectedBuyOut > 0, "AtomicArb: expectedBuyOut must be > 0");
+        uint256 buyMinOut = (arb.expectedBuyOut * (10000 - slippageBps)) / 10000;
 
         uint256 intermediateAmount = _swap(
             arb.buyRouter,
@@ -339,14 +335,10 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         // ── Step 2: Sell leg - swap tokenIntermediate → tokenBorrow ──────────
         // [C-3] Per-leg slippage on sell side: use expectedSellOut if provided,
         // otherwise require at least the repayAmount (break-even guard)
-        uint256 sellMinOut;
-        if (arb.expectedSellOut > 0) {
-            sellMinOut = (arb.expectedSellOut * (10000 - slippageBps)) / 10000;
-            // Never go below repayAmount — that would be a guaranteed loss
-            if (sellMinOut < repayAmount) {
-                sellMinOut = repayAmount;
-            }
-        } else {
+        require(arb.expectedSellOut > 0, "AtomicArb: expectedSellOut must be > 0");
+        uint256 sellMinOut = (arb.expectedSellOut * (10000 - slippageBps)) / 10000;
+        // Never go below repayAmount — that would be a guaranteed loss
+        if (sellMinOut < repayAmount) {
             sellMinOut = repayAmount;
         }
 
@@ -377,7 +369,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
 
         // ── Step 5: Update accounting ─────────────────────────────────────────
         totalProfitAccumulated += netProfit;
-        _checkCircuitBreaker(0); // no loss this execution
+        _checkCircuitBreaker(tx.gasprice * 350_000); // record approx gas cost as loss
 
         emit ArbExecuted(
             asset,
@@ -423,7 +415,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
                     tokenOut:          tokenOut,
                     fee:               fee,
                     recipient:         address(this),
-                    deadline:          block.timestamp + 60,
+                    deadline:          block.timestamp,
                     amountIn:          amountIn,
                     amountOutMinimum:  amountOutMin,
                     sqrtPriceLimitX96: 0
@@ -435,7 +427,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
                 amountOutMin,
                 path,
                 address(this),
-                block.timestamp + 60
+                block.timestamp
             );
             amountOut = amounts[amounts.length - 1];
         }

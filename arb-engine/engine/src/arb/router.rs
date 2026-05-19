@@ -311,14 +311,14 @@ impl LiquidityGraph {
         let mut opps = Vec::new();
 
         let first_hops: Vec<&LiquidityEdge> = self.edges.iter()
-            .filter(|e| e.token_in == start_token)
+            .filter(|e| e.token_in == start_token && e.pool.last_updated_ts != 0)
             .collect();
 
         for e1 in &first_hops {
             let mid = &e1.token_out;
 
             for e2 in self.edges.iter()
-                .filter(|e| e.token_in == *mid && e.token_out == start_token)
+                .filter(|e| e.token_in == *mid && e.token_out == start_token && e.pool.last_updated_ts != 0)
             {
                 if e1.pool.id == e2.pool.id { continue; }
 
@@ -553,6 +553,8 @@ fn bellman_ford_from(
     for _pass in 0..n.saturating_sub(1) {
         let mut relaxed = false;
         for (eidx, edge) in graph.edges.iter().enumerate() {
+            if edge.pool.last_updated_ts == 0 { continue; } // Skip stale placeholder pools
+
             let u = match graph.token_index.get(&edge.token_in) {
                 Some(&i) => i,
                 None     => continue,
@@ -578,6 +580,8 @@ fn bellman_ford_from(
     // ── N-th pass: detect negative cycles ────────────────────────────────────
     let mut neg_cycle_vertices: Vec<usize> = Vec::new();
     for edge in graph.edges.iter() {
+        if edge.pool.last_updated_ts == 0 { continue; } // Skip stale placeholder pools
+
         let u = match graph.token_index.get(&edge.token_in)  { Some(&i) => i, None => continue };
         let v = match graph.token_index.get(&edge.token_out) { Some(&i) => i, None => continue };
 
@@ -686,7 +690,11 @@ fn reconstruct_and_evaluate(
     } else {
         cycle_edges.first()?.pool.token_b.decimals
     };
-    let scaling_factor = U256::from(10u64).pow(U256::from((18 - entry_decimals) as u64));
+    let scaling_factor = if entry_decimals < 18 {
+        U256::from(10u64).checked_pow(U256::from((18 - entry_decimals) as u64)).unwrap_or(U256::one())
+    } else {
+        U256::one()
+    };
 
     let get_edge_reserve = |e: &LiquidityEdge| -> (U256, u8) {
         let zfo = e.token_in == e.pool.token_a.address;
@@ -714,8 +722,12 @@ fn reconstruct_and_evaluate(
 
     let min_reserve = cycle_edges.iter().map(|e| {
         let (reserve, decimals) = get_edge_reserve(e);
-        let scaling = U256::from(10u64).pow(U256::from((18 - decimals) as u64));
-        reserve * scaling
+        let scaling = if decimals < 18 {
+            U256::from(10u64).checked_pow(U256::from((18 - decimals) as u64)).unwrap_or(U256::one())
+        } else {
+            U256::one()
+        };
+        reserve.checked_mul(scaling).unwrap_or(U256::MAX)
     }).filter(|r| !r.is_zero()).min().unwrap_or(U256::MAX);
 
     let upper_bound = if min_reserve == U256::MAX {
@@ -724,7 +736,7 @@ fn reconstruct_and_evaluate(
         estimate_upper_bound(min_reserve, 0.05)
     };
     // Lower bound: try to avoid trivial dust amounts (1.0 token scaled to WEI)
-    let lower_bound = U256::from(1_000_000u64) * scaling_factor; 
+    let lower_bound = U256::from(1_000_000u64).checked_mul(scaling_factor).unwrap_or(U256::MAX); 
     let start_token = &cycle_edges[0].token_in;
     let start_price = match start_token.to_lowercase().as_str() {
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" | "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => 1.0,
@@ -734,8 +746,8 @@ fn reconstruct_and_evaluate(
     let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
     let gas_cost_scaled = U256::from((gas_cost_wei.low_u128() as f64 * config.eth_price_usd / start_price) as u128);
 
-    let sim_cycle = |mut amount_wei: U256| -> U256 {
-        let mut amount = amount_wei / scaling_factor;
+    let sim_cycle = |amount_wei: U256| -> U256 {
+        let mut amount = amount_wei.checked_div(scaling_factor).unwrap_or(U256::zero());
         for edge in &cycle_edges {
             let zfo = edge.token_in == edge.pool.token_a.address;
             match sim_out(&edge.pool, amount, zfo) {
@@ -743,7 +755,7 @@ fn reconstruct_and_evaluate(
                 None => return U256::zero(),
             }
         }
-        amount * scaling_factor
+        amount.checked_mul(scaling_factor).unwrap_or(U256::zero())
     };
 
     let optimal_amount_wei = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_scaled) {

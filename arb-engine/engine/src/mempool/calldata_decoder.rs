@@ -242,7 +242,7 @@ pub fn decode_swap(input_data: &[u8], to_addr: &str) -> Option<DecodedSwap> {
 
         DexVersion::RaydiumAmm | DexVersion::OrcaWhirlpool | DexVersion::OsmosisCosmos => None,
 
-        DexVersion::Unknown | _ => {
+        DexVersion::Unknown => {
             decode_v3_family(input_data, sel, DexVersion::Unknown)
                 .or_else(|| decode_v2_family(input_data, sel, DexVersion::Unknown))
                 .or_else(|| decode_universal_router(input_data))

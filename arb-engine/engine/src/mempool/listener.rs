@@ -84,9 +84,11 @@ const POOL_CACHE_TTL_SECS: usize = 288;
 struct RawTxPayload {
     to_addr:        String,
     input:          Vec<u8>,
+    #[allow(dead_code)]
     value:          u128,
     gas_price_gwei: f64,
     tx_hash:        String,
+    #[allow(dead_code)]
     tx_count:       u64,
 }
 
@@ -715,7 +717,7 @@ impl WorkerCtx {
         fee_bps:     u32,
         gas_gwei:    f64,
         amount_in:   U256,
-        dex_version: &DexVersion,
+        _dex_version: &DexVersion,
     ) {
         let active_chain = if let Some(ref adapter) = self.evm_adapter {
             adapter.chain()

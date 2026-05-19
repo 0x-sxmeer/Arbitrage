@@ -1,0 +1,19 @@
+{
+  "antigravity.security.terminal": "Ask",
+  "antigravity.security.filesystem": "Ask",
+  "antigravity.security.browser": "Ask",
+  "antigravity.security.reviewPolicy": "Request Review",
+
+  "antigravity.permissions.terminal": "Ask",
+  "antigravity.permissions.filesystem": "Ask",
+  "antigravity.permissions.browser": "Ask",
+  "antigravity.reviewPolicy": "Request Review",
+
+  "antigravity.security.permissions.terminal": "Ask",
+  "antigravity.security.permissions.filesystem": "Ask",
+  "antigravity.security.permissions.browser": "Ask",
+
+  "antigravity.terminalExecutionPolicy": "Request Review",
+  "antigravity.javascriptExecutionPolicy": "Request Review",
+  "antigravity.artifactReviewPolicy": "Request Review"
+}

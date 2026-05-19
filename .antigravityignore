@@ -1,0 +1,45 @@
+# Antigravity context optimization ignore file
+# Blocks context-heavy, generated, and dependency directories to prevent context bloat
+
+# Node dependencies and build folders
+node_modules/
+dist/
+build/
+out/
+
+# Rust build target folder (extremely heavy)
+target/
+
+# Smart contract compilation / Web3 artifacts
+artifacts/
+cache/
+typechain-types/
+typechain/
+.hardhat/
+.waffle/
+.anchor/
+
+# Specific massive ABI and JSON compilation outputs
+**/abi/*.json
+**/abis/*.json
+**/*ABI.json
+**/*abi.json
+**/artifacts/**/*.json
+**/build/**/*.json
+
+# Package manager locks & metadata
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+Cargo.lock
+
+# Logs, temporary files, and system cache
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+.cache/
+.parcel-cache/
+.next/
+.nuxt/

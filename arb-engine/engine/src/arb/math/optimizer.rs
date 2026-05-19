@@ -83,7 +83,7 @@ pub fn find_optimal_input<F: Fn(U256) -> U256>(
 
     let mut iters = 0u32;
 
-    while iters < MAX_ITERS && (b - a) > min_interval {
+    while iters < MAX_ITERS && b > a && (b - a) > min_interval {
         iters += 1;
 
         if f1 > f2 {
@@ -104,7 +104,11 @@ pub fn find_optimal_input<F: Fn(U256) -> U256>(
     }
 
     // Best point is the midpoint of the final interval (overflow-safe)
-    let optimal = a + (b - a) / U256::from(2u64);
+    let optimal = if b > a {
+        a + (b - a) / U256::from(2u64)
+    } else {
+        a
+    };
     let gross_output = simulate(optimal);
 
     if gross_output <= optimal {

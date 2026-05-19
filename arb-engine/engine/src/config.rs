@@ -23,6 +23,8 @@ pub struct Config {
     pub eth_http_url: String,
     /// Base chain WebSocket (optional)
     pub base_ws_url: Option<String>,
+    /// Base chain HTTP (optional)
+    pub base_http_url: Option<String>,
     /// Arbitrum One WebSocket (optional)
     pub arb_ws_url: Option<String>,
     /// Solana RPC HTTP URL (optional)
@@ -80,6 +82,7 @@ impl Config {
                 .unwrap_or_else(|_| "https://cloudflare-eth.com".to_string()),
 
             base_ws_url: std::env::var("BASE_WS_URL").ok(),
+            base_http_url: std::env::var("BASE_HTTP_URL").ok(),
             arb_ws_url: std::env::var("ARB_WS_URL").ok(),
             solana_rpc_url: std::env::var("SOLANA_RPC_URL").ok(),
             solana_ws_url: std::env::var("SOLANA_WS_URL").ok(),
@@ -156,6 +159,13 @@ impl Config {
         if let Some(ref base_ws) = self.base_ws_url {
             if !base_ws.starts_with("ws://") && !base_ws.starts_with("wss://") {
                 anyhow::bail!("BASE_WS_URL must start with ws:// or wss:// (got: {})", base_ws);
+            }
+        }
+
+        // Validate optional Base HTTP URL
+        if let Some(ref base_http) = self.base_http_url {
+            if !base_http.starts_with("http://") && !base_http.starts_with("https://") {
+                anyhow::bail!("BASE_HTTP_URL must start with http:// or https:// (got: {})", base_http);
             }
         }
 

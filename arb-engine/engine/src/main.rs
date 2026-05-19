@@ -129,7 +129,8 @@ async fn main() {
     let (active_chain, active_ws_url, active_http_url) =
         if let Some(ref base_ws) = config.base_ws_url {
             info!("  ✓ Base L2 WS configured — targeting Base Mainnet (chain 8453)");
-            (ChainId::Base, base_ws.clone(), base_ws.replace("wss://", "https://"))
+            let base_http = config.base_http_url.clone().unwrap_or_else(|| base_ws.replace("wss://", "https://"));
+            (ChainId::Base, base_ws.clone(), base_http)
         } else {
             warn!("  ⚠ BASE_WS_URL not set — falling back to Ethereum mainnet");
             (ChainId::Ethereum, config.eth_ws_url.clone(), config.eth_http_url.clone())
