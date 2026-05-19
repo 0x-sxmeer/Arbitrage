@@ -1,0 +1,4 @@
+@openzeppelin/contracts/=arb-engine/contracts/evm/node_modules/@openzeppelin/contracts/
+ds-test/=arb-engine/contracts/evm/lib/openzeppelin-contracts/lib/forge-std/lib/ds-test/src/
+forge-std/=arb-engine/contracts/evm/lib/openzeppelin-contracts/lib/forge-std/src/
+openzeppelin-contracts/=arb-engine/contracts/evm/lib/openzeppelin-contracts/
