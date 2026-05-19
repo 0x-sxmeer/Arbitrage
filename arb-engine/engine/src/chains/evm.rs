@@ -647,23 +647,40 @@ impl EvmAdapter {
         let provider = self.get_or_connect_http().await
             .context("Failed to connect simulation provider")?;
 
-        match provider.call(&tx).await {
-            Ok(_) => {
-                info!(
-                    id = %arb.id, latency = ?start.elapsed(),
-                    buy_router  = %format!("{:?}", params.buyRouter),
-                    buy_fee     = params.buyFee.to::<u32>(),
-                    sell_fee    = params.sellFee.to::<u32>(),
-                    "✅ Dry-run simulation PASSED"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                warn!(
-                    id = %arb.id, latency = ?start.elapsed(), error = %e,
-                    "❌ Dry-run simulation REVERTED — aborting execution"
-                );
-                bail!("Simulation reverted: {}", e)
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let mut delay_ms = 100;
+
+        loop {
+            attempts += 1;
+            match provider.call(&tx).await {
+                Ok(_) => {
+                    info!(
+                        id = %arb.id, latency = ?start.elapsed(), attempts,
+                        buy_router  = %format!("{:?}", params.buyRouter),
+                        buy_fee     = params.buyFee.to::<u32>(),
+                        sell_fee    = params.sellFee.to::<u32>(),
+                        "✅ Dry-run simulation PASSED"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if (err_str.contains("429") || err_str.contains("rate") || err_str.contains("capacity") || err_str.contains("limit")) && attempts < max_attempts {
+                        warn!(
+                            id = %arb.id, attempts, delay = delay_ms, error = %err_str,
+                            "⚠️ Simulation rate-limited — retrying with backoff"
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        delay_ms *= 2;
+                        continue;
+                    }
+                    warn!(
+                        id = %arb.id, latency = ?start.elapsed(), attempts, error = %e,
+                        "❌ Dry-run simulation REVERTED — aborting execution"
+                    );
+                    bail!("Simulation reverted: {}", e)
+                }
             }
         }
     }

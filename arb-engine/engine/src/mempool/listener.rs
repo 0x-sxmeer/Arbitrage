@@ -43,6 +43,7 @@ use std::time::Duration;
 use std::str::FromStr;
 
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::consensus::Transaction;
 use futures_util::StreamExt;
 use anyhow::Result;
 use tokio::sync::{mpsc, RwLock};
@@ -323,7 +324,7 @@ impl MempoolListener {
 
             while let Some(block) = stream.next().await {
                 block_count += 1;
-                let block_number = block.header.number;
+                let block_number = block.inner.number;
 
                 info!(block = block_number, "📦 New L2 block received — refreshing pool states!");
 
@@ -478,7 +479,7 @@ impl MempoolListener {
                                 });
                             }
                             Err(e) => {
-                                debug!(id = %opp.id, error = %e, "Simulation failed");
+                                warn!(id = %opp.id, error = %e, "❌ Simulation failed");
                             }
                         }
                     }
@@ -588,24 +589,23 @@ impl MempoolListener {
             tx_count += 1;
             self.metrics.inc_txs_seen();
 
-            let tx_hash = tx.hash.to_string();
-            let to_addr = match tx.to {
+            let tx_hash = tx.inner.tx_hash().to_string();
+            let to_addr = match tx.inner.to() {
                 Some(addr) => addr.to_string().to_lowercase(),
                 None       => continue,
             };
 
-            let gas_price_gwei = tx.gas_price
+            let gas_price_gwei = tx.inner.gas_price()
                 .map(|g| g as f64 / 1e9)
-                .or_else(|| tx.max_fee_per_gas.map(|g| g as f64 / 1e9))
-                .unwrap_or(gas_ewa);
+                .unwrap_or_else(|| tx.inner.max_fee_per_gas() as f64 / 1e9);
             gas_ewa = gas_ewa * 0.95 + gas_price_gwei * 0.05;
 
             self.maybe_update_dashboard(&tx_hash, &to_addr, &tx, gas_price_gwei, tx_count);
 
             let payload = RawTxPayload {
                 to_addr,
-                input: tx.input.to_vec(),
-                value: tx.value.to::<u128>(),
+                input: tx.inner.input().to_vec(),
+                value: tx.inner.value().to::<u128>(),
                 gas_price_gwei,
                 tx_hash,
                 tx_count,
@@ -647,7 +647,7 @@ impl MempoolListener {
                 "type":    if is_swap { "SWAP" } else { "PENDING" },
                 "dex":     dex_lbl,
                 "token":   if is_swap { "WETH/USDC" } else { "UNK" },
-                "size":    format!("${:.0}k", (tx.value.to::<u128>() as f64 / 1e18) * 3000.0 / 1000.0),
+                "size":    format!("${:.0}k", (tx.inner.value().to::<u128>() as f64 / 1e18) * 3000.0 / 1000.0),
                 "color":   if is_swap { "#00FFD1" } else { "#64748B" },
                 "gasGwei": format!("{:.1}", gas_price_gwei),
                 "ts": std::time::SystemTime::now()

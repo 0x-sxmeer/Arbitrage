@@ -98,12 +98,11 @@ interface IUniswapV3Router {
         address tokenOut;
         uint24  fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
     }
-    function exactInputSingle(ExactInputSingleParams calldata params) external returns (uint256 amountOut);
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -280,7 +279,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 borrowAmount,
         bytes calldata params,
         uint256 deadline
-    ) external onlyOwner whenNotPaused nonReentrant {
+    ) external onlyOwner whenNotPaused {
         require(borrowAmount > 0, "AtomicArb: borrowAmount must be > 0");
         require(block.timestamp <= deadline, "AtomicArb: Transaction expired");
 
@@ -433,7 +432,6 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
                     tokenOut:          tokenOut,
                     fee:               fee,
                     recipient:         address(this),
-                    deadline:          swapDeadline,
                     amountIn:          amountIn,
                     amountOutMinimum:  amountOutMin,
                     sqrtPriceLimitX96: 0
