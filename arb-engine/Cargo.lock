@@ -732,6 +732,7 @@ dependencies = [
  "dashmap 5.5.3",
  "dotenvy",
  "ethabi",
+ "futures",
  "futures-util",
  "hex",
  "petgraph",

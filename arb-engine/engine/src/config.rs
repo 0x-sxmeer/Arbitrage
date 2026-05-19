@@ -41,6 +41,8 @@ pub struct Config {
     // ── MEV / Execution ───────────────────────────────────────────────────────
     /// Flashbots relay URL
     pub flashbots_url: String,
+    /// Optional private transaction RPC URL (like Flashbots Protect / MEV-Blocker / private endpoint)
+    pub private_rpc_url: Option<String>,
     /// Private key for signing execution transactions (hex, 0x-prefixed)
     pub private_key: Option<String>,
     /// Flashbots signing key (separate EOA, not the execution wallet)
@@ -98,6 +100,8 @@ impl Config {
             // ── MEV / Execution ───────────────────────────────────────────
             flashbots_url: std::env::var("FLASHBOTS_RPC_URL")
                 .unwrap_or_else(|_| "https://relay.flashbots.net".to_string()),
+
+            private_rpc_url: std::env::var("PRIVATE_RPC_URL").ok(),
 
             private_key: std::env::var("PRIVATE_KEY").ok(),
             flashbots_signing_key: std::env::var("FLASHBOTS_SIGNING_KEY").ok(),
@@ -195,6 +199,13 @@ impl Config {
             }
         }
 
+        // Validate optional Private RPC URL
+        if let Some(ref private_rpc) = self.private_rpc_url {
+            if !private_rpc.starts_with("http://") && !private_rpc.starts_with("https://") {
+                anyhow::bail!("PRIVATE_RPC_URL must start with http:// or https:// (got: {})", private_rpc);
+            }
+        }
+
         // Validate contract address format (40 hex chars with optional 0x prefix)
         if let Some(ref addr) = self.contract_address {
             let addr_stripped = addr.trim_start_matches("0x");
@@ -203,7 +214,16 @@ impl Config {
             }
         }
 
+        // Validate Redis URL scheme
+        if !self.redis_url.starts_with("redis://") && !self.redis_url.starts_with("rediss://") {
+            anyhow::bail!("REDIS_URL must start with redis:// or rediss:// (got: {})", self.redis_url);
+        }
+
         // Validate arbitrage parameter ranges
+        if self.min_profit_usd < 0.0 {
+            anyhow::bail!("MIN_PROFIT_USD must be non-negative (got: {})", self.min_profit_usd);
+        }
+
         if self.max_price_impact_bps > 500 {
             anyhow::bail!("MAX_PRICE_IMPACT_BPS > 500 (5%) is dangerously high — likely a misconfiguration");
         }
@@ -256,10 +276,14 @@ impl Config {
             has_postgres  = self.database_url.is_some(),
             contract      = ?self.contract_address,
             has_solana    = self.solana_rpc_url.is_some(),
+            has_private_rpc = self.private_rpc_url.is_some(),
             min_profit_usd = self.min_profit_usd,
             max_hops       = self.max_hops,
             "Configuration loaded"
         );
+        if self.private_rpc_url.is_some() {
+            tracing::info!("🔒 MEV Protection configured via Private RPC");
+        }
         if self.private_key.is_none() {
             tracing::warn!("PRIVATE_KEY not set — execution disabled (monitoring only)");
         }

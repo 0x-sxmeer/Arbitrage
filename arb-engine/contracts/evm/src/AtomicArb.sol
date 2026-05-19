@@ -161,9 +161,10 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     /// Circuit breaker: max drawdown in wei per hour before auto-pause
     uint256 public maxDrawdownPerHour;
 
-    /// Tracks losses in the current 1-hour window
-    uint256 public drawdownThisHour;
-    uint256 public drawdownWindowStart;
+    /// @notice Track cumulative net PnL within the current window.
+    /// Positive = net profit; Negative = net loss.
+    int256 public netPnlThisWindow;
+    uint256 public pnlWindowStart;
 
     /// Profit accumulated per token
     mapping(address => uint256) public profitByToken;
@@ -206,7 +207,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         aavePool = IPool(_aavePool);
         wormholeRelayer = IWormholeRelayer(_wormholeRelayer);
         maxDrawdownPerHour = _maxDrawdownPerHour;
-        drawdownWindowStart = block.timestamp;
+        pnlWindowStart = block.timestamp;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -319,10 +320,17 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 repayAmount = amount + premium;
 
         // ── Step 1: Buy leg - swap tokenBorrow → tokenIntermediate ───────────
-        // [C-3] Per-leg slippage protection: use expectedBuyOut if provided,
-        // otherwise fall back to global slippageBps percentage
-        require(arb.expectedBuyOut > 0, "AtomicArb: expectedBuyOut must be > 0");
-        uint256 buyMinOut = (arb.expectedBuyOut * (10000 - slippageBps)) / 10000;
+        // Compute minimum output with proper slippage protection.
+        // If expectedBuyOut is 0, fall back to requiring at least break-even
+        // (which still has risk; callers should always provide expectedBuyOut).
+        uint256 buyMinOut;
+        if (arb.expectedBuyOut > 0) {
+            buyMinOut = (arb.expectedBuyOut * (10000 - slippageBps)) / 10000;
+        } else {
+            // Fallback: require at least 1 wei output (dangerous, but prevents revert)
+            // Callers MUST provide expectedBuyOut in production
+            buyMinOut = 1;
+        }
 
         uint256 intermediateAmount = _swap(
             arb.buyRouter,
@@ -338,11 +346,14 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         require(intermediateAmount > 0, "AtomicArb: buy leg produced zero output");
 
         // ── Step 2: Sell leg - swap tokenIntermediate → tokenBorrow ──────────
-        // [C-3] Per-leg slippage on sell side: use expectedSellOut if provided,
-        // otherwise require at least the repayAmount (break-even guard)
-        require(arb.expectedSellOut > 0, "AtomicArb: expectedSellOut must be > 0");
-        uint256 sellMinOut = (arb.expectedSellOut * (10000 - slippageBps)) / 10000;
-        // Never go below repayAmount — that would be a guaranteed loss
+        uint256 sellMinOut;
+        if (arb.expectedSellOut > 0) {
+            sellMinOut = (arb.expectedSellOut * (10000 - slippageBps)) / 10000;
+        } else {
+            // Fallback: must at least repay the loan
+            sellMinOut = repayAmount;
+        }
+        // Enforce absolute floor: never accept less than repayment
         if (sellMinOut < repayAmount) {
             sellMinOut = repayAmount;
         }
@@ -375,13 +386,20 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
 
         // ── Step 5: Repay Aave flash loan ─────────────────────────────────────
         IERC20(asset).forceApprove(address(aavePool), repayAmount);
+        // NOTE: Aave pulls the funds via transferFrom after executeOperation returns.
+        // The allowance is set exactly to repayAmount and will be fully consumed.
 
-        // Check circuit breaker AFTER successful accounting (gas cost as proxy for loss)
-        // Use a gas estimate rather than tx.gasprice which can be 0 in Flashbots bundles
+        // Track net result including gas cost estimate
         uint256 gasCostEstimate = block.basefee > 0
             ? block.basefee * 350_000
             : tx.gasprice * 350_000;
-        _checkCircuitBreaker(gasCostEstimate);
+            
+        // If netProfit > gasCost, it's a real profit; otherwise it's a net loss
+        if (netProfit > gasCostEstimate) {
+            _updateCircuitBreaker(int256(netProfit - gasCostEstimate));
+        } else {
+            _updateCircuitBreaker(-int256(gasCostEstimate - netProfit));
+        }
 
         emit ArbExecuted(
             asset,
@@ -456,18 +474,21 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     //  Circuit breaker
     // ─────────────────────────────────────────────────────────────────────────
 
-    function _checkCircuitBreaker(uint256 loss) internal {
+    /// @notice Called after every execution with the actual net profit (can be negative).
+    /// @param netResult The net profit (positive) or loss (negative) for this execution.
+    function _updateCircuitBreaker(int256 netResult) internal {
         // Reset window every hour
-        if (block.timestamp >= drawdownWindowStart + 1 hours) {
-            drawdownThisHour  = 0;
-            drawdownWindowStart = block.timestamp;
+        if (block.timestamp >= pnlWindowStart + 1 hours) {
+            netPnlThisWindow = 0;
+            pnlWindowStart = block.timestamp;
         }
-
-        drawdownThisHour += loss;
-
-        if (drawdownThisHour >= maxDrawdownPerHour) {
+        
+        netPnlThisWindow += netResult;
+        
+        // If net loss exceeds threshold, pause
+        if (netPnlThisWindow < 0 && uint256(-netPnlThisWindow) >= maxDrawdownPerHour) {
             _pause();
-            emit CircuitBreakerTriggered(drawdownThisHour, maxDrawdownPerHour);
+            emit CircuitBreakerTriggered(uint256(-netPnlThisWindow), maxDrawdownPerHour);
         }
     }
 
@@ -475,44 +496,94 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     //  Admin functions
     // ─────────────────────────────────────────────────────────────────────────
 
-    function _withdrawProfitFor(address token) internal {
+    /// @notice Withdraw accumulated profit for a single token.
+    /// @dev Only withdraws tracked profit, not the full balance. Resets the tracker to zero.
+    function withdrawProfit(address token) external onlyOwner {
         if (token == address(0)) {
-            // Native ETH withdrawal
-            uint256 ethBalance = address(this).balance;
-            require(ethBalance > 0, "AtomicArb: no ETH balance");
-            (bool success, ) = payable(owner()).call{value: ethBalance}("");
+            // Native ETH: withdraw only tracked profit
+            uint256 profit = profitByToken[address(0)];
+            require(profit > 0, "AtomicArb: no ETH profit to withdraw");
+            require(address(this).balance >= profit, "AtomicArb: insufficient ETH balance");
+            profitByToken[address(0)] = 0;
+            (bool success, ) = payable(owner()).call{value: profit}("");
             require(success, "AtomicArb: ETH transfer failed");
-            emit ProfitWithdrawn(address(0), ethBalance);
+            emit ProfitWithdrawn(address(0), profit);
         } else {
-            // ERC20 withdrawal
-            uint256 balance = IERC20(token).balanceOf(address(this));
-            require(balance > 0, "AtomicArb: nothing to withdraw");
-            IERC20(token).safeTransfer(owner(), balance);
-            emit ProfitWithdrawn(token, balance);
+            // ERC20: withdraw only tracked profit
+            uint256 profit = profitByToken[token];
+            require(profit > 0, "AtomicArb: no profit to withdraw for token");
+            uint256 contractBalance = IERC20(token).balanceOf(address(this));
+            require(contractBalance >= profit, "AtomicArb: contract balance below tracked profit");
+            profitByToken[token] = 0;
+            IERC20(token).safeTransfer(owner(), profit);
+            emit ProfitWithdrawn(token, profit);
         }
     }
 
-    /// Withdraw accumulated profit to owner wallet.
-    function withdrawProfit(address token) external onlyOwner {
-        _withdrawProfitFor(token);
-    }
-
-    /// [C-1] Batch withdraw multiple tokens in one call
+    /// @notice Batch withdraw profits for multiple tokens.
     function withdrawProfits(address[] calldata tokens) external onlyOwner {
         for (uint256 i = 0; i < tokens.length; i++) {
-            _withdrawProfitFor(tokens[i]);
+            // Skip tokens with zero tracked profit
+            if (profitByToken[tokens[i]] == 0) continue;
+            // Inline the logic to avoid function call overhead
+            if (tokens[i] == address(0)) {
+                uint256 profit = profitByToken[address(0)];
+                if (profit == 0) continue;
+                require(address(this).balance >= profit, "AtomicArb: insufficient ETH balance");
+                profitByToken[address(0)] = 0;
+                (bool success, ) = payable(owner()).call{value: profit}("");
+                require(success, "AtomicArb: ETH transfer failed");
+                emit ProfitWithdrawn(address(0), profit);
+            } else {
+                uint256 profit = profitByToken[tokens[i]];
+                if (profit == 0) continue;
+                uint256 balance = IERC20(tokens[i]).balanceOf(address(this));
+                require(balance >= profit, "AtomicArb: balance below tracked profit");
+                profitByToken[tokens[i]] = 0;
+                IERC20(tokens[i]).safeTransfer(owner(), profit);
+                emit ProfitWithdrawn(tokens[i], profit);
+            }
         }
     }
 
-    /// Report a loss for the circuit breaker
-    function reportLoss(uint256 lossWei) external onlyOwner {
-        _checkCircuitBreaker(lossWei);
+    /// @notice Emergency withdraw ALL tokens (bypasses profit tracking). Use only if accounting is broken.
+    function emergencyWithdrawAll(address token) external onlyOwner {
+        if (token == address(0)) {
+            uint256 bal = address(this).balance;
+            require(bal > 0, "AtomicArb: no ETH");
+            profitByToken[address(0)] = 0; // reset tracker
+            (bool ok, ) = payable(owner()).call{value: bal}("");
+            require(ok, "AtomicArb: ETH transfer failed");
+            emit ProfitWithdrawn(address(0), bal);
+        } else {
+            uint256 bal = IERC20(token).balanceOf(address(this));
+            require(bal > 0, "AtomicArb: nothing to withdraw");
+            profitByToken[token] = 0;
+            IERC20(token).safeTransfer(owner(), bal);
+            emit ProfitWithdrawn(token, bal);
+        }
     }
 
-    function recordExecutionResult(address token, bool profitable, uint256 amount) external onlyOwner {
-        if (!profitable) {
-            tokenPnL[token] -= int256(amount);
-            _checkCircuitBreaker(amount);
+    /// @notice Report an off-chain loss (e.g., failed bundle, gas cost without execution).
+    /// Updates both PnL tracking and circuit breaker.
+    function reportLoss(address token, uint256 lossWei) external onlyOwner {
+        require(lossWei > 0, "AtomicArb: loss must be > 0");
+        tokenPnL[token] -= int256(lossWei);
+        _updateCircuitBreaker(-int256(lossWei));
+    }
+
+    /// @notice Record an execution result from the bot.
+    /// @param profitable Whether the execution was profitable.
+    /// @param netAmount The net profit (if profitable) or loss amount (if not).
+    function recordExecutionResult(address token, bool profitable, uint256 netAmount) external onlyOwner {
+        require(netAmount > 0, "AtomicArb: amount must be > 0");
+        if (profitable) {
+            tokenPnL[token] += int256(netAmount);
+            profitByToken[token] += netAmount;
+            _updateCircuitBreaker(int256(netAmount));
+        } else {
+            tokenPnL[token] -= int256(netAmount);
+            _updateCircuitBreaker(-int256(netAmount));
         }
     }
 

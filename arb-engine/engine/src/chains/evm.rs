@@ -123,6 +123,7 @@ pub struct EvmConfig {
     pub contract_address:     Option<String>,
     pub private_key:          Option<String>,
     pub flashbots_signing_key: Option<String>,
+    pub private_rpc_url:      Option<String>,
 }
 
 pub struct EvmAdapter {
@@ -285,6 +286,25 @@ impl EvmAdapter {
         
         let premium = aave_pool.FLASHLOAN_PREMIUM_TOTAL().call().await?._0;
         Ok(premium as u32)
+    }
+
+    /// Fetch the actual flash loan fee from the Aave V3 pool.
+    /// Returns fee in basis points (1 BPS = 0.01%).
+    pub async fn get_flash_loan_fee_bps(&self, pool_address: &str) -> Result<u32> {
+        let pool_addr: Address = pool_address.parse()
+            .context("Invalid Aave pool address")?;
+        let provider = self.get_or_connect_http().await?;
+        
+        let contract = IAavePool::new(pool_addr, provider);
+        
+        let premium_total = contract.FLASHLOAN_PREMIUM_TOTAL()
+            .call()
+            .await
+            .context("Failed to call FLASHLOAN_PREMIUM_TOTAL")?
+            ._0;
+
+        // FLASHLOAN_PREMIUM_TOTAL returns the fee in basis points (100 = 1%)
+        Ok(premium_total as u32)
     }
 
     // ── Live Pool State Fetching ─────────────────────────────────────────────
@@ -471,9 +491,16 @@ impl EvmAdapter {
         let signer: PrivateKeySigner = pk.parse().context("Failed to parse PRIVATE_KEY")?;
         let wallet = EthereumWallet::from(signer.clone());
 
+        let exec_url = self.config.private_rpc_url.as_deref().unwrap_or(&self.config.http_url);
+        if self.config.private_rpc_url.is_some() {
+            info!(url = %exec_url, "🔒 Utilizing configured Private RPC endpoint for transaction execution (MEV Protection)");
+        } else {
+            info!("⚡ Utilizing standard HTTP RPC endpoint for transaction execution");
+        }
+
         let provider = ProviderBuilder::new()
             .wallet(wallet.clone())
-            .on_builtin(&self.config.http_url)
+            .on_builtin(exec_url)
             .await
             .context("Failed to connect execution provider")?;
 
@@ -539,11 +566,15 @@ impl EvmAdapter {
         use alloy::eips::eip2718::Encodable2718;
         let signed_bytes = envelope.encoded_2718();
         
-        let (receipt, receipt_str) = if self.config.chain == ChainId::Base {
-            info!("Directly broadcasting raw transaction on Base Mainnet...");
+        let (receipt, receipt_str) = if self.config.chain == ChainId::Base || self.config.chain == ChainId::Arbitrum || self.config.private_rpc_url.is_some() {
+            if self.config.private_rpc_url.is_some() {
+                info!("🔒 Broadcasting raw transaction via private/MEV-protected RPC relay...");
+            } else {
+                info!(chain = %self.config.chain.name(), "Directly broadcasting raw transaction to L2 sequencer (private mempool)...");
+            }
             let tx_hash = envelope.tx_hash();
             let _pending_tx = provider.send_raw_transaction(&signed_bytes).await
-                .context("Failed to send raw transaction on Base")?;
+                .context("Failed to send raw transaction")?;
             
             let mut receipt = None;
             for _ in 0..15 { // wait up to 15 seconds
@@ -586,7 +617,7 @@ impl EvmAdapter {
             gas_used    = ?receipt.gas_used,
             latency     = ?elapsed,
             exec_number = exec_num,
-            "✅ Arbitrage Bundle Submitted to Flashbots!"
+            "✅ Arbitrage Transaction executed successfully!"
         );
 
         Ok(())
@@ -857,60 +888,29 @@ impl EvmAdapter {
         bundle_txs: Vec<Vec<u8>>,
         target_block: u64,
     ) -> Result<String> {
-        let relay = self.config.flashbots_url.as_deref()
-            .unwrap_or("https://relay.flashbots.net");
-
-        if bundle_txs.is_empty() {
-            bail!("Cannot submit empty bundle");
-        }
-
-        info!(relay, num_txs = bundle_txs.len(), target_block,
-              "📦 Submitting Flashbots bundle");
-
-        let hex_txs: Vec<String> = bundle_txs.iter()
-            .map(|tx| format!("0x{}", hex::encode(tx)))
-            .collect();
-
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_sendBundle",
-            "params": [{ "txs": hex_txs, "blockNumber": format!("0x{:x}", target_block) }]
-        });
-
-        let payload_string = serde_json::to_string(&payload)?;
-
-        let signer: PrivateKeySigner = match self.config.flashbots_signing_key.as_deref() {
-            Some(key) => key.parse().context("Failed to parse FLASHBOTS_SIGNING_KEY")?,
+        let relay = self.config.flashbots_url.clone().unwrap_or_else(|| "https://relay.flashbots.net".to_string());
+        
+        let signing_key = match self.config.flashbots_signing_key.as_deref() {
+            Some(key) => key.to_string(),
             None => {
                 warn!("FLASHBOTS_SIGNING_KEY not set — using random key (no reputation!)");
-                alloy::signers::local::PrivateKeySigner::random()
+                let temp_key = alloy::signers::local::PrivateKeySigner::random();
+                format!("0x{}", hex::encode(temp_key.to_bytes()))
             }
         };
 
-        let body_hash  = alloy::primitives::keccak256(payload_string.as_bytes());
-        let signature  = alloy::signers::Signer::sign_message(&signer, body_hash.as_slice()).await?;
-        let header_val = format!("{}:{}", signer.address(), hex::encode(signature.as_bytes()));
+        let contract_addr_str = self.config.contract_address.as_deref().unwrap_or("0x0000000000000000000000000000000000000000");
+        let contract_addr = Address::from_str(contract_addr_str).unwrap_or(Address::ZERO);
+        let chain_id = self.config.chain.evm_chain_id().unwrap_or(1);
 
-        let client = reqwest::Client::new();
-        let res = client
-            .post(relay)
-            .header("Content-Type", "application/json")
-            .header("X-Flashbots-Signature", header_val)
-            .body(payload_string)
-            .send()
-            .await
-            .context("Failed to send Flashbots request")?;
+        let submitter = crate::executor::FlashbotsSubmitter::new(
+            relay,
+            &signing_key,
+            contract_addr,
+            chain_id,
+        )?;
 
-        let status = res.status();
-        let text   = res.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            bail!("Flashbots submission failed ({status}): {text}");
-        }
-
-        info!(response = %text, "✓ Flashbots bundle submitted");
-        Ok(text)
+        submitter.submit_raw_bundle(bundle_txs, target_block).await
     }
 
     pub fn execution_count(&self) -> u64 {

@@ -23,6 +23,7 @@ mod arb;
 mod chains;
 mod config;
 mod db;
+mod executor;
 mod mempool;
 mod metrics;
 mod pool;
@@ -145,6 +146,7 @@ async fn main() {
             private_key:      config.private_key.clone(),
             contract_address: config.contract_address.clone(),
             flashbots_signing_key: config.flashbots_signing_key.clone(),
+            private_rpc_url:  config.private_rpc_url.clone(),
         };
         let adapter = EvmAdapter::new(evm_config);
         let ws_preview = if active_ws_url.len() > 40 {
@@ -154,6 +156,33 @@ async fn main() {
         };
         info!("✓ EVM adapter initialized (chain={}, ws={}...)", active_chain.name(), ws_preview);
         Some(Arc::new(adapter))
+    };
+
+    // ── Initialize Flashbots Submitter ────────────────────────────────────────
+    let _flashbots_submitter = if let Some(ref signing_key) = config.flashbots_signing_key {
+        let contract_addr = if let Some(ref addr) = config.contract_address {
+            use std::str::FromStr;
+            alloy::primitives::Address::from_str(addr).unwrap_or(alloy::primitives::Address::ZERO)
+        } else {
+            alloy::primitives::Address::ZERO
+        };
+        match executor::FlashbotsSubmitter::new(
+            config.flashbots_url.clone(),
+            signing_key,
+            contract_addr,
+            active_chain.evm_chain_id().unwrap_or(1),
+        ) {
+            Ok(submitter) => {
+                info!("✓ Flashbots Submitter initialized at {}", config.flashbots_url);
+                Some(Arc::new(submitter))
+            }
+            Err(e) => {
+                warn!("⚠ Failed to initialize Flashbots Submitter: {}", e);
+                None
+            }
+        }
+    } else {
+        None
     };
 
     // ── Build LiquidityGraph ──────────────────────────────────────────────────

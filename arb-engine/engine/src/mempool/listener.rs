@@ -261,6 +261,25 @@ impl MempoolListener {
             Err(e)    => warn!("Could not fetch block number: {}", e),
         }
 
+        let (abort_tx, mut abort_rx) = mpsc::channel::<()>(1);
+        let provider_check = provider.clone();
+        let abort_tx_check = abort_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(30)).await;
+                match tokio::time::timeout(Duration::from_secs(5), provider_check.get_block_number()).await {
+                    Ok(Ok(_)) => {
+                        debug!("Health check: WebSocket connection active");
+                    }
+                    _ => {
+                        warn!("Health check failed or timed out! Forcing WebSocket reconnect...");
+                        let _ = abort_tx_check.send(()).await;
+                        break;
+                    }
+                }
+            }
+        });
+
         // HIGH-3: Spawn a non-blocking re-fetch of pool states
         let evm_clone = self.evm_adapter.clone();
         let graph_clone = self.graph.clone();
@@ -322,175 +341,186 @@ impl MempoolListener {
             let mut stream = sub.into_stream();
             let mut block_count: u64 = 0;
 
-            while let Some(block) = stream.next().await {
-                block_count += 1;
-                let block_number = block.inner.number;
+            loop {
+                tokio::select! {
+                    maybe_block = stream.next() => {
+                        let block = match maybe_block {
+                            Some(b) => b,
+                            None => break,
+                        };
+                        block_count += 1;
+                        let block_number = block.inner.number;
 
-                info!(block = block_number, "📦 New L2 block received — refreshing pool states!");
+                        info!(block = block_number, "📦 New L2 block received — refreshing pool states!");
 
-                let pools: Vec<Pool> = {
-                    let graph = self.graph.read().await;
-                    graph.get_all_pools().map(|(_, p)| (**p).clone()).collect()
-                };
+                        let pools: Vec<Pool> = {
+                            let graph = self.graph.read().await;
+                            graph.get_all_pools().map(|(_, p)| (**p).clone()).collect()
+                        };
 
-                let evm_adapter = match self.evm_adapter {
-                    Some(ref adapter) => Arc::clone(adapter),
-                    None => continue,
-                };
-                let graph_arc = Arc::clone(&self.graph);
-                let metrics = Arc::clone(&self.metrics);
-                let redis_cache = Arc::clone(&self.redis_cache);
-                let pg_store = self.pg_store.clone();
-                let router_config = self.router_config.clone();
+                        let evm_adapter = match self.evm_adapter {
+                            Some(ref adapter) => Arc::clone(adapter),
+                            None => continue,
+                        };
+                        let graph_arc = Arc::clone(&self.graph);
+                        let metrics = Arc::clone(&self.metrics);
+                        let redis_cache = Arc::clone(&self.redis_cache);
+                        let pg_store = self.pg_store.clone();
+                        let router_config = self.router_config.clone();
 
-                tokio::spawn(async move {
-                    let start_time = std::time::Instant::now();
-                    let mut futures = Vec::new();
-                    for pool in pools {
-                        let evm = Arc::clone(&evm_adapter);
-                        futures.push(async move {
-                            match evm.fetch_pool_state(&pool).await {
-                                Ok(state) => {
-                                    let mut p = pool;
-                                    p.state = state;
-                                    p.last_updated_block = block_number;
-                                    p.last_updated_ts = chrono::Utc::now().timestamp();
-                                    Some(p)
-                                }
-                                Err(e) => {
-                                    debug!("Failed to fetch state for pool {}: {}", pool.id, e);
-                                    None
-                                }
-                            }
-                        });
-                    }
-
-                    let results = futures_util::future::join_all(futures).await;
-                    let mut updated_count = 0;
-
-                    let mut g = graph_arc.write().await;
-                    for pool_opt in results {
-                        if let Some(p) = pool_opt {
-                            g.upsert_pool(p);
-                            updated_count += 1;
-                        }
-                    }
-                    drop(g);
-
-                    debug!("Refreshed {} pool states in {:?}", updated_count, start_time.elapsed());
-
-                    // Tick metrics to make UI glow
-                    metrics.inc_txs_seen();
-                    metrics.inc_txs_filtered();
-                    metrics.inc_txs_decoded();
-
-                    // Visual visual green Emerald Row in the dashboard showing sync status!
-                    let tokens = [
-                        ("0x4200000000000000000000000000000000000006", "WETH"),
-                        ("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "USDC"),
-                        ("0x0555e30da8f98308edb960aa94c0db47230d2b9c", "WBTC"),
-                        ("0x50c5725949a6f0c72e6c4a641f24049a917db0cb", "DAI"),
-                        ("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2", "USDT"),
-                    ];
-                    let r_idx = block_number as usize;
-                    let sym_in = tokens[r_idx % tokens.len()].1;
-                    let sym_out = tokens[(r_idx + 1) % tokens.len()].1;
-                    let size = 15.0 + (block_number % 85) as f64 * 3.5;
-                    let hash = format!("0x{:04x}base{}", block_number, block_number);
-
-                    if let Ok(mut txs) = metrics.recent_mempool_txs.try_write() {
-                        let entry = serde_json::json!({
-                            "id":      block_number,
-                            "hash":    &hash[..12.min(hash.len())],
-                            "type":    "BLOCK_SYNC",
-                            "dex":     "Base L2 Block",
-                            "token":   format!("{}/{}", sym_in, sym_out),
-                            "size":    format!("${:.1}k", size),
-                            "color":   "#10B981", // Emerald Green
-                            "gasGwei": "0.15",
-                            "ts": std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis(),
-                        });
-                        txs.push_front(entry);
-                        if txs.len() > 50 { txs.pop_back(); }
-                    }
-
-                    // Run the pathfinder scan!
-                    let start_tokens = [
-                        "0x4200000000000000000000000000000000000006", // WETH
-                        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
-                        "0x0555e30da8f98308edb960aa94c0db47230d2b9c", // WBTC
-                    ];
-
-                    let mut config = router_config.clone();
-                    config.gas_price_gwei = 0.15;
-                    metrics.inc_router_scans();
-
-                    let opportunities = {
-                        let graph = graph_arc.read().await;
-                        let mut opps = Vec::new();
-                        for start_token in start_tokens {
-                            opps.extend(graph.find_opportunities(start_token, &config));
-                        }
-                        opps.extend(find_arbitrage_cycles(&graph, &config));
-                        opps
-                    };
-
-                    {
-                        let mut graph = graph_arc.write().await;
-                        reset_changed_tokens(&mut graph);
-                    }
-
-                    for opp in opportunities {
-                        metrics.inc_opportunities_found();
-                        if !opp.is_executable { continue; }
-                        metrics.inc_opportunities_executable();
-
-                        info!(
-                            id      = %opp.id,
-                            nev_wei = opp.net_expected_value,
-                            route   = %opp.route_description(),
-                            hops    = opp.route.len(),
-                            "🚀 Executable L2 block arbitrage opportunity found!"
-                        );
-
-                        let is_new = redis_cache
-                            .mark_opportunity_seen(&opp.id.to_string())
-                            .await
-                            .unwrap_or(true);
-                        if !is_new { continue; }
-
-                        if let Some(ref pg) = pg_store {
-                            let _ = pg.insert_opportunity(&opp).await;
-                        }
-
-                        match evm_adapter.simulate_arbitrage(&opp).await {
-                            Ok(()) => {
-                                info!(id = %opp.id, "✓ Block simulation passed");
-                                let adapter_clone = Arc::clone(&evm_adapter);
-                                let opp_clone = opp.clone();
-                                tokio::spawn(async move {
-                                    match adapter_clone.execute_arbitrage(&opp_clone).await {
-                                        Ok(()) => info!(id = %opp_clone.id, "✅ Block execution completed"),
-                                        Err(e) => error!(id = %opp_clone.id, error = %e, "❌ Block execution failed"),
+                        tokio::spawn(async move {
+                            let start_time = std::time::Instant::now();
+                            let mut futures = Vec::new();
+                            for pool in pools {
+                                let evm = Arc::clone(&evm_adapter);
+                                futures.push(async move {
+                                    match evm.fetch_pool_state(&pool).await {
+                                        Ok(state) => {
+                                            let mut p = pool;
+                                            p.state = state;
+                                            p.last_updated_block = block_number;
+                                            p.last_updated_ts = chrono::Utc::now().timestamp();
+                                            Some(p)
+                                        }
+                                        Err(e) => {
+                                            debug!("Failed to fetch state for pool {}: {}", pool.id, e);
+                                            None
+                                        }
                                     }
                                 });
                             }
-                            Err(e) => {
-                                warn!(id = %opp.id, error = %e, "❌ Simulation failed");
+
+                            let results = futures_util::future::join_all(futures).await;
+                            let mut updated_count = 0;
+
+                            let mut g = graph_arc.write().await;
+                            for pool_opt in results {
+                                if let Some(p) = pool_opt {
+                                    g.upsert_pool(p);
+                                    updated_count += 1;
+                                }
                             }
+                            drop(g);
+
+                            debug!("Refreshed {} pool states in {:?}", updated_count, start_time.elapsed());
+
+                            // Tick metrics to make UI glow
+                            metrics.inc_txs_seen();
+                            metrics.inc_txs_filtered();
+                            metrics.inc_txs_decoded();
+
+                            // Visual visual green Emerald Row in the dashboard showing sync status!
+                            let tokens = [
+                                ("0x4200000000000000000000000000000000000006", "WETH"),
+                                ("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "USDC"),
+                                ("0x0555e30da8f98308edb960aa94c0db47230d2b9c", "WBTC"),
+                                ("0x50c5725949a6f0c72e6c4a641f24049a917db0cb", "DAI"),
+                                ("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2", "USDT"),
+                            ];
+                            let r_idx = block_number as usize;
+                            let sym_in = tokens[r_idx % tokens.len()].1;
+                            let sym_out = tokens[(r_idx + 1) % tokens.len()].1;
+                            let size = 15.0 + (block_number % 85) as f64 * 3.5;
+                            let hash = format!("0x{:04x}base{}", block_number, block_number);
+
+                            if let Ok(mut txs) = metrics.recent_mempool_txs.try_write() {
+                                let entry = serde_json::json!({
+                                    "id":      block_number,
+                                    "hash":    &hash[..12.min(hash.len())],
+                                    "type":    "BLOCK_SYNC",
+                                    "dex":     "Base L2 Block",
+                                    "token":   format!("{}/{}", sym_in, sym_out),
+                                    "size":    format!("${:.1}k", size),
+                                    "color":   "#10B981", // Emerald Green
+                                    "gasGwei": "0.15",
+                                    "ts": std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis(),
+                                });
+                                txs.push_front(entry);
+                                if txs.len() > 50 { txs.pop_back(); }
+                            }
+
+                            // Run the pathfinder scan!
+                            let start_tokens = [
+                                "0x4200000000000000000000000000000000000006", // WETH
+                                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
+                                "0x0555e30da8f98308edb960aa94c0db47230d2b9c", // WBTC
+                            ];
+
+                            let mut config = router_config.clone();
+                            config.gas_price_gwei = 0.15;
+                            metrics.inc_router_scans();
+
+                            let opportunities = {
+                                let graph = graph_arc.read().await;
+                                let mut opps = Vec::new();
+                                for start_token in start_tokens {
+                                    opps.extend(graph.find_opportunities(start_token, &config));
+                                }
+                                opps.extend(find_arbitrage_cycles(&graph, &config));
+                                opps
+                            };
+
+                            {
+                                let mut graph = graph_arc.write().await;
+                                reset_changed_tokens(&mut graph);
+                            }
+
+                            for opp in opportunities {
+                                metrics.inc_opportunities_found();
+                                if !opp.is_executable { continue; }
+                                metrics.inc_opportunities_executable();
+
+                                info!(
+                                    id      = %opp.id,
+                                    nev_wei = opp.net_expected_value,
+                                    route   = %opp.route_description(),
+                                    hops    = opp.route.len(),
+                                    "🚀 Executable L2 block arbitrage opportunity found!"
+                                );
+
+                                let is_new = redis_cache
+                                    .mark_opportunity_seen(&opp.id.to_string())
+                                    .await
+                                    .unwrap_or(true);
+                                if !is_new { continue; }
+
+                                if let Some(ref pg) = pg_store {
+                                    let _ = pg.insert_opportunity(&opp).await;
+                                }
+
+                                match evm_adapter.simulate_arbitrage(&opp).await {
+                                    Ok(()) => {
+                                        info!(id = %opp.id, "✓ Block simulation passed");
+                                        let adapter_clone = Arc::clone(&evm_adapter);
+                                        let opp_clone = opp.clone();
+                                        tokio::spawn(async move {
+                                            match adapter_clone.execute_arbitrage(&opp_clone).await {
+                                                Ok(()) => info!(id = %opp_clone.id, "✅ Block execution completed"),
+                                                Err(e) => error!(id = %opp_clone.id, error = %e, "❌ Block execution failed"),
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!(id = %opp.id, error = %e, "❌ Simulation failed");
+                                    }
+                                }
+                            }
+                        });
+
+                        if block_count % 10 == 0 {
+                            let graph = self.graph.read().await;
+                            self.metrics.set_graph_pools(graph.pool_count() as u64);
+                            self.metrics.set_graph_tokens(graph.token_count() as u64);
+                            drop(graph);
+                            self.metrics.log_summary();
                         }
                     }
-                });
-
-                if block_count % 10 == 0 {
-                    let graph = self.graph.read().await;
-                    self.metrics.set_graph_pools(graph.pool_count() as u64);
-                    self.metrics.set_graph_tokens(graph.token_count() as u64);
-                    drop(graph);
-                    self.metrics.log_summary();
+                    _ = abort_rx.recv() => {
+                        anyhow::bail!("WebSocket connection health check failed. Aborting L2 stream.");
+                    }
                 }
             }
 
@@ -576,50 +606,61 @@ impl MempoolListener {
         }
 
         // ── Producer: stream pending tx hashes ────────────────────────────────
-        let mut stream  = sub.into_stream();
+        let mut stream = sub.into_stream();
         let mut tx_count: u64 = 0;
         let mut gas_ewa: f64  = 20.0;
 
-        while let Some(raw_hash) = stream.next().await {
-            let tx = match provider.get_transaction_by_hash(raw_hash).await {
-                Ok(Some(t)) => t,
-                _           => continue,
-            };
+        loop {
+            tokio::select! {
+                maybe_hash = stream.next() => {
+                    let raw_hash = match maybe_hash {
+                        Some(h) => h,
+                        None => break,
+                    };
+                    let tx = match provider.get_transaction_by_hash(raw_hash).await {
+                        Ok(Some(t)) => t,
+                        _           => continue,
+                    };
 
-            tx_count += 1;
-            self.metrics.inc_txs_seen();
+                    tx_count += 1;
+                    self.metrics.inc_txs_seen();
 
-            let tx_hash = tx.inner.tx_hash().to_string();
-            let to_addr = match tx.inner.to() {
-                Some(addr) => addr.to_string().to_lowercase(),
-                None       => continue,
-            };
+                    let tx_hash = tx.inner.tx_hash().to_string();
+                    let to_addr = match tx.inner.to() {
+                        Some(addr) => addr.to_string().to_lowercase(),
+                        None       => continue,
+                    };
 
-            let gas_price_gwei = tx.inner.gas_price()
-                .map(|g| g as f64 / 1e9)
-                .unwrap_or_else(|| tx.inner.max_fee_per_gas() as f64 / 1e9);
-            gas_ewa = gas_ewa * 0.95 + gas_price_gwei * 0.05;
+                    let gas_price_gwei = tx.inner.gas_price()
+                        .map(|g| g as f64 / 1e9)
+                        .unwrap_or_else(|| tx.inner.max_fee_per_gas() as f64 / 1e9);
+                    gas_ewa = gas_ewa * 0.95 + gas_price_gwei * 0.05;
 
-            self.maybe_update_dashboard(&tx_hash, &to_addr, &tx, gas_price_gwei, tx_count);
+                    self.maybe_update_dashboard(&tx_hash, &to_addr, &tx, gas_price_gwei, tx_count);
 
-            let payload = RawTxPayload {
-                to_addr,
-                input: tx.inner.input().to_vec(),
-                value: tx.inner.value().to::<u128>(),
-                gas_price_gwei,
-                tx_hash,
-                tx_count,
-            };
-            if tx_sender.try_send(payload).is_err() {
-                self.metrics.inc_txs_dropped();
-            }
+                    let payload = RawTxPayload {
+                        to_addr,
+                        input: tx.inner.input().to_vec(),
+                        value: tx.inner.value().to::<u128>(),
+                        gas_price_gwei,
+                        tx_hash,
+                        tx_count,
+                    };
+                    if tx_sender.try_send(payload).is_err() {
+                        self.metrics.inc_txs_dropped();
+                    }
 
-            if tx_count % METRICS_LOG_INTERVAL == 0 {
-                let graph = self.graph.read().await;
-                self.metrics.set_graph_pools(graph.pool_count() as u64);
-                self.metrics.set_graph_tokens(graph.token_count() as u64);
-                drop(graph);
-                self.metrics.log_summary();
+                    if tx_count % METRICS_LOG_INTERVAL == 0 {
+                        let graph = self.graph.read().await;
+                        self.metrics.set_graph_pools(graph.pool_count() as u64);
+                        self.metrics.set_graph_tokens(graph.token_count() as u64);
+                        drop(graph);
+                        self.metrics.log_summary();
+                    }
+                }
+                _ = abort_rx.recv() => {
+                    anyhow::bail!("WebSocket connection health check failed. Aborting public mempool stream.");
+                }
             }
         }
 
