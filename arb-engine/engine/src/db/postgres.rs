@@ -82,9 +82,9 @@ impl PostgresStore {
             .bind(opp.id)
             .bind(opp.chain.name())
             .bind(opp.start_token.as_str())
-            .bind(opp.input_amount.low_u128() as i64)
-            .bind(opp.gross_output.low_u128() as i64)
-            .bind(opp.net_expected_value as i64)
+            .bind(opp.input_amount.to_string())
+            .bind(opp.gross_output.to_string())
+            .bind(opp.net_expected_value.to_string())
             .bind(opp.is_executable)
             .bind(opp.estimated_gas_units as i64)
             .bind(opp.gas_price_gwei)
@@ -192,9 +192,9 @@ pub struct OpportunityRow {
     pub id:                 Uuid,
     pub chain:              String,
     pub start_token:        String,
-    pub input_amount_wei:   i64,
-    pub gross_output_wei:   i64,
-    pub net_expected_value: i64,
+    pub input_amount_wei:   sqlx::types::BigDecimal,
+    pub gross_output_wei:   sqlx::types::BigDecimal,
+    pub net_expected_value: sqlx::types::BigDecimal,
     pub is_executable:      bool,
     pub gas_units:          i64,
     pub gas_price_gwei:     f64,
@@ -282,9 +282,9 @@ CREATE TABLE IF NOT EXISTS opportunities (
     id                  UUID        PRIMARY KEY,
     chain               TEXT        NOT NULL,
     start_token         TEXT        NOT NULL,
-    input_amount_wei    BIGINT      NOT NULL,
-    gross_output_wei    BIGINT      NOT NULL,
-    net_expected_value  BIGINT      NOT NULL,
+    input_amount_wei    NUMERIC(78, 0) NOT NULL,
+    gross_output_wei    NUMERIC(78, 0) NOT NULL,
+    net_expected_value  NUMERIC(78, 0) NOT NULL,
     is_executable       BOOLEAN     NOT NULL,
     gas_units           BIGINT      NOT NULL,
     gas_price_gwei      DOUBLE PRECISION NOT NULL,
@@ -318,7 +318,7 @@ INSERT INTO opportunities (
     id, chain, start_token, input_amount_wei, gross_output_wei,
     net_expected_value, is_executable, gas_units, gas_price_gwei,
     price_impact_bps, block_number, discovered_at, route
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+) VALUES ($1,$2,$3,$4::NUMERIC,$5::NUMERIC,$6::NUMERIC,$7,$8,$9,$10,$11,$12,$13)
 ON CONFLICT (id) DO NOTHING
 "#;
 

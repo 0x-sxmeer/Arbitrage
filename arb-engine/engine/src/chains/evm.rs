@@ -275,6 +275,18 @@ impl EvmAdapter {
         Ok(premium as u32)
     }
 
+    /// Query Aave FLASHLOAN_PREMIUM_TOTAL directly bypassing our contract.
+    pub async fn get_aave_premium_direct(&self, pool_address: &str) -> Result<u32> {
+        let pool_addr = Address::from_str(pool_address)
+            .with_context(|| format!("Invalid Aave pool address: {}", pool_address))?;
+        let provider = self.get_or_connect_http().await?;
+        
+        let aave_pool = IAavePool::new(pool_addr, provider);
+        
+        let premium = aave_pool.FLASHLOAN_PREMIUM_TOTAL().call().await?._0;
+        Ok(premium as u32)
+    }
+
     // ── Live Pool State Fetching ─────────────────────────────────────────────
 
     /// FIX-6: uses the cached HTTP provider instead of creating a new one.

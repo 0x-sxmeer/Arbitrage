@@ -398,15 +398,19 @@ async fn main() {
     }
 
     // ── Fetch Aave Flash Loan fee dynamically ────────────────────────────────
-    let mut aave_fee_bps = 5; // Default fallback
+    let mut aave_fee_bps: u32 = 5;
     if let Some(ref evm) = evm_adapter {
-        match evm.get_aave_premium().await {
-            Ok(premium) => {
-                info!("✓ Dynamically fetched Aave flash loan fee: {} bps", premium);
-                aave_fee_bps = premium;
-            }
-            Err(e) => {
-                warn!("⚠ Failed to fetch Aave flash loan fee: {} — falling back to {} bps", e, aave_fee_bps);
+        // Try direct fetch first (works before contract deployment)
+        let aave_pool_for_chain = match active_chain {
+            ChainId::Base     => Some("0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"),
+            ChainId::Arbitrum => Some("0x794a61358D6845594F94dc1DB02A252b5b4814aD"),
+            ChainId::Ethereum => Some("0x87870B27f0bf4296857d44E8a96a1B714F24F5C9"),
+            _ => None,
+        };
+        if let Some(pool_addr) = config.aave_pool_address.as_deref().or(aave_pool_for_chain) {
+            match evm.get_aave_premium_direct(pool_addr).await {
+                Ok(p) => { info!("✓ Aave flash loan fee: {} bps", p); aave_fee_bps = p; }
+                Err(e) => warn!("⚠ Aave fee fetch failed: {} — using {} bps default", e, aave_fee_bps),
             }
         }
     }
@@ -452,7 +456,9 @@ async fn main() {
     });
 
     // Start local API server for the React dashboard
-    api::start_api_server(metrics.clone(), 3000).await;
+    tokio::spawn(async move {
+        api::start_api_server(metrics.clone(), 3000).await;
+    });
 
     // Run listener (blocks forever)
     if let Err(e) = listener.run().await {

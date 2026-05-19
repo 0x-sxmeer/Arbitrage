@@ -25,8 +25,8 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import {Pausable} from "@openzeppelin/contracts/security/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
 // ── Aave V3 interfaces ────────────────────────────────────────────────────────
 
@@ -166,8 +166,14 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     uint256 public drawdownThisHour;
     uint256 public drawdownWindowStart;
 
-    /// Total profit accumulated (wei, token varies by arb)
-    uint256 public totalProfitAccumulated;
+    /// Profit accumulated per token
+    mapping(address => uint256) public profitByToken;
+    /// Track cumulative profit/loss per token
+    mapping(address => int256) public tokenPnL;
+
+    function getProfit(address token) external view returns (uint256) {
+        return profitByToken[token];
+    }
 
     // ── Events ─────────────────────────────────────────────────────────────────
 
@@ -195,7 +201,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
 
     // ── Constructor ────────────────────────────────────────────────────────────
 
-    constructor(address _aavePool, address _wormholeRelayer, uint256 _maxDrawdownPerHour) Ownable() {
+    constructor(address _aavePool, address _wormholeRelayer, uint256 _maxDrawdownPerHour) Ownable(msg.sender) {
         require(_aavePool != address(0), "AtomicArb: zero aave pool");
         require(_wormholeRelayer != address(0), "AtomicArb: zero wormhole relayer");
         aavePool = IPool(_aavePool);
@@ -225,7 +231,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         );
         require(msg.value >= deliveryCost, "AtomicArb: Insufficient relayer fee");
 
-        wormholeRelayer.sendPayloadToEvm{value: deliveryCost}(
+        wormholeRelayer.sendPayloadToEvm{value: msg.value}(
             targetChain,
             crossChainReceivers[targetChain] != address(0)
                 ? crossChainReceivers[targetChain]
@@ -305,7 +311,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 premium,
         address initiator,
         bytes calldata params
-    ) external override returns (bool) {
+    ) external override nonReentrant returns (bool) {
         // Security: only Aave Pool can call this
         require(msg.sender == address(aavePool), "AtomicArb: caller is not Aave Pool");
         require(initiator == address(this), "AtomicArb: invalid initiator");
@@ -364,12 +370,19 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         // exactly finalAmount - repayAmount, which is correctly recorded and emitted.
         uint256 netProfit = finalAmount - repayAmount;
 
-        // ── Step 4: Repay Aave flash loan ─────────────────────────────────────
+        // ── Step 4: Update accounting BEFORE side-effects ─────────────────────
+        profitByToken[asset] += netProfit;
+        tokenPnL[asset] += int256(netProfit);
+
+        // ── Step 5: Repay Aave flash loan ─────────────────────────────────────
         IERC20(asset).forceApprove(address(aavePool), repayAmount);
 
-        // ── Step 5: Update accounting ─────────────────────────────────────────
-        totalProfitAccumulated += netProfit;
-        _checkCircuitBreaker(tx.gasprice * 350_000); // record approx gas cost as loss
+        // Check circuit breaker AFTER successful accounting (gas cost as proxy for loss)
+        // Use a gas estimate rather than tx.gasprice which can be 0 in Flashbots bundles
+        uint256 gasCostEstimate = block.basefee > 0
+            ? block.basefee * 350_000
+            : tx.gasprice * 350_000;
+        _checkCircuitBreaker(gasCostEstimate);
 
         emit ArbExecuted(
             asset,
@@ -381,7 +394,6 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
             block.timestamp
         );
 
-        IERC20(asset).forceApprove(address(aavePool), 0);
         return true;
     }
 
@@ -399,6 +411,10 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 amountIn,
         uint256 amountOutMin
     ) internal returns (uint256 amountOut) {
+        require(router != address(0), "AtomicArb: zero router address");
+        require(tokenIn != address(0) && tokenOut != address(0), "AtomicArb: zero token address");
+        require(amountIn > 0, "AtomicArb: zero amountIn");
+
         if (!isV3) {
             require(path.length >= 2, "AtomicArb: V2 path too short");
             require(path[0] == tokenIn, "AtomicArb: path[0] != tokenIn");
@@ -408,6 +424,8 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         // FIX: Use forceApprove instead of safeApprove for OpenZeppelin v5 compatibility
         IERC20(tokenIn).forceApprove(router, amountIn);
 
+        uint256 swapDeadline = block.timestamp + 30;
+
         if (isV3) {
             IUniswapV3Router.ExactInputSingleParams memory v3Params =
                 IUniswapV3Router.ExactInputSingleParams({
@@ -415,7 +433,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
                     tokenOut:          tokenOut,
                     fee:               fee,
                     recipient:         address(this),
-                    deadline:          block.timestamp,
+                    deadline:          swapDeadline,
                     amountIn:          amountIn,
                     amountOutMinimum:  amountOutMin,
                     sqrtPriceLimitX96: 0
@@ -427,7 +445,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
                 amountOutMin,
                 path,
                 address(this),
-                block.timestamp
+                swapDeadline
             );
             amountOut = amounts[amounts.length - 1];
         }
@@ -491,6 +509,13 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     /// Report a loss for the circuit breaker
     function reportLoss(uint256 lossWei) external onlyOwner {
         _checkCircuitBreaker(lossWei);
+    }
+
+    function recordExecutionResult(address token, bool profitable, uint256 amount) external onlyOwner {
+        if (!profitable) {
+            tokenPnL[token] -= int256(amount);
+            _checkCircuitBreaker(amount);
+        }
     }
 
     /// [C-3] Set slippage tolerance (owner only, max 2%)

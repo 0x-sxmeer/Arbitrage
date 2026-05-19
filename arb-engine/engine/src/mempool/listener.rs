@@ -260,6 +260,27 @@ impl MempoolListener {
             Err(e)    => warn!("Could not fetch block number: {}", e),
         }
 
+        // HIGH-3: Spawn a non-blocking re-fetch of pool states
+        let evm_clone = self.evm_adapter.clone();
+        let graph_clone = self.graph.clone();
+        tokio::spawn(async move {
+            if let Some(evm) = evm_clone {
+                tracing::warn!("WebSocket reconnected — refreshing pool states");
+                let pools: Vec<_> = {
+                    let g = graph_clone.read().await;
+                    g.get_all_pools().map(|(_, p)| (**p).clone()).collect()
+                };
+                for pool in pools {
+                    if let Ok(state) = evm.fetch_pool_state(&pool).await {
+                        let mut p = pool.clone();
+                        p.state = state;
+                        let mut g = graph_clone.write().await;
+                        g.upsert_pool(p);
+                    }
+                }
+            }
+        });
+
         let active_chain = if let Some(ref adapter) = self.evm_adapter {
             adapter.chain()
         } else {

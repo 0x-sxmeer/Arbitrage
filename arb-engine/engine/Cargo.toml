@@ -22,7 +22,7 @@ path = "src/bin/cross_chain_testnet.rs"
 tokio = { version = "1.35", features = ["full"] }
 
 # ── Ethereum / EVM ────────────────────────────────────────────────────────────
-alloy = { version = "0.3", features = ["providers", "signers", "signer-local", "contract", "rpc-types", "pubsub", "transport-ws", "provider-ws", "node-bindings", "sol-types"] }
+alloy = { version = "0.7", features = ["providers", "signers", "signer-local", "contract", "rpc-types", "pubsub", "transport-ws", "provider-ws", "sol-types"] }
 
 # ── Solana ────────────────────────────────────────────────────────────────────
 solana-client = "2.0"

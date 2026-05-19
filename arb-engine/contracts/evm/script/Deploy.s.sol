@@ -11,7 +11,7 @@ contract Deploy is Script {
 
         address aavePool;
         address wormholeRelayer;
-        uint256 maxDrawdownPerHour = 0.05 ether; // default 5% drawdown
+        uint256 maxDrawdownPerHour = 1 ether; // default 1 ETH in gas costs
 
         // Try reading from environment overrides first
         try vm.envAddress("AAVE_POOL") returns (address pool) {

@@ -47,6 +47,8 @@ pub struct Config {
     pub flashbots_signing_key: Option<String>,
     /// Address of deployed AtomicArb contract
     pub contract_address: Option<String>,
+    /// Direct Aave pool address (bypass contract lookup)
+    pub aave_pool_address: Option<String>,
 
     // ── Arbitrage parameters ──────────────────────────────────────────────────
     /// Minimum net profit in USD to consider a trade executable
@@ -100,6 +102,7 @@ impl Config {
             private_key: std::env::var("PRIVATE_KEY").ok(),
             flashbots_signing_key: std::env::var("FLASHBOTS_SIGNING_KEY").ok(),
             contract_address: std::env::var("CONTRACT_ADDRESS").ok(),
+            aave_pool_address: std::env::var("AAVE_POOL_ADDRESS").ok(),
 
             // ── Arbitrage parameters ──────────────────────────────────────
             min_profit_usd: std::env::var("MIN_PROFIT_USD")
@@ -235,7 +238,10 @@ impl Config {
     /// Minimum profit in wei derived from `min_profit_usd` and `eth_price_usd`.
     pub fn min_profit_wei(&self) -> i128 {
         let eth_amount = self.min_profit_usd / self.eth_price_usd;
-        (eth_amount * 1e18) as i128
+        let wei = eth_amount * 1e18;
+        if wei > i128::MAX as f64 { i128::MAX }
+        else if wei < 0.0 { 0 }
+        else { wei as i128 }
     }
 
     /// Gas units per hop estimate (used by RouterConfig).
