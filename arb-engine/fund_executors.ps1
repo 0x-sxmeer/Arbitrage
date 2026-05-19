@@ -1,8 +1,8 @@
 # fund_executors.ps1
 # Script to supply native gas tokens to executor contracts for transaction fees
 param (
-    [string]$ArbitrumContract = "0xYourArbitrumContractAddress",
-    [string]$SolanaContract = "YourSolanaContractAddress"
+    [string]$ArbitrumContract = "0x999Bf5B7B4dF7F1c3F324c9084aF9911a4798345",
+    [string]$SolanaContract = "EJ4iS1oA8x5QW2C7G6Z9N2XvY1W9K1R6M7C6H2N1D2F3"
 )
 
 Write-Host "Capital Initialization for Arbitrage Executors"

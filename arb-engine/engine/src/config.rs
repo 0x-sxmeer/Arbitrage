@@ -69,8 +69,9 @@ impl Config {
     /// Load configuration from environment variables.
     ///
     /// Fails fast with a descriptive error if a required variable is missing.
+    /// [H-3] Now includes comprehensive validation of all fields.
     pub fn from_env() -> Result<Self> {
-        Ok(Self {
+        let cfg = Self {
             // ── RPC endpoints ─────────────────────────────────────────────
             eth_ws_url: std::env::var("ETH_WS_URL")
                 .unwrap_or_else(|_| "wss://mainnet.infura.io/ws/v3/demo".to_string()),
@@ -133,7 +134,92 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(20.0),
-        })
+        };
+
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// [H-3] Comprehensive validation of all configuration values.
+    fn validate(&self) -> Result<()> {
+        // Validate WebSocket URL scheme
+        if !self.eth_ws_url.starts_with("ws://") && !self.eth_ws_url.starts_with("wss://") {
+            anyhow::bail!("ETH_WS_URL must start with ws:// or wss:// (got: {})", self.eth_ws_url);
+        }
+
+        // Validate HTTP URL scheme
+        if !self.eth_http_url.starts_with("http://") && !self.eth_http_url.starts_with("https://") {
+            anyhow::bail!("ETH_HTTP_URL must start with http:// or https:// (got: {})", self.eth_http_url);
+        }
+
+        // Validate optional Base WS URL
+        if let Some(ref base_ws) = self.base_ws_url {
+            if !base_ws.starts_with("ws://") && !base_ws.starts_with("wss://") {
+                anyhow::bail!("BASE_WS_URL must start with ws:// or wss:// (got: {})", base_ws);
+            }
+        }
+
+        // Validate optional Arbitrum WS URL
+        if let Some(ref arb_ws) = self.arb_ws_url {
+            if !arb_ws.starts_with("ws://") && !arb_ws.starts_with("wss://") {
+                anyhow::bail!("ARB_WS_URL must start with ws:// or wss:// (got: {})", arb_ws);
+            }
+        }
+
+        // Validate private key format (64 hex chars with optional 0x prefix)
+        if let Some(ref pk) = self.private_key {
+            let pk_stripped = pk.trim_start_matches("0x");
+            if pk_stripped.len() != 64 || !pk_stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+                anyhow::bail!("PRIVATE_KEY must be a 32-byte hex string (64 hex chars, optional 0x prefix)");
+            }
+        }
+
+        // Validate Flashbots signing key format
+        if let Some(ref fk) = self.flashbots_signing_key {
+            let fk_stripped = fk.trim_start_matches("0x");
+            if fk_stripped.len() != 64 || !fk_stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+                anyhow::bail!("FLASHBOTS_SIGNING_KEY must be a 32-byte hex string (64 hex chars)");
+            }
+        }
+
+        // Validate contract address format (40 hex chars with optional 0x prefix)
+        if let Some(ref addr) = self.contract_address {
+            let addr_stripped = addr.trim_start_matches("0x");
+            if addr_stripped.len() != 40 || !addr_stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+                anyhow::bail!("CONTRACT_ADDRESS must be a valid Ethereum address (40 hex chars, optional 0x prefix)");
+            }
+        }
+
+        // Validate arbitrage parameter ranges
+        if self.max_price_impact_bps > 500 {
+            anyhow::bail!("MAX_PRICE_IMPACT_BPS > 500 (5%) is dangerously high — likely a misconfiguration");
+        }
+
+        if self.max_hops == 0 || self.max_hops > 6 {
+            anyhow::bail!("MAX_HOPS must be between 1 and 6 (got: {})", self.max_hops);
+        }
+
+        if self.max_trade_size_pct <= 0.0 || self.max_trade_size_pct > 0.10 {
+            anyhow::bail!("MAX_TRADE_SIZE_PCT must be between 0 and 0.10 (10%) (got: {})", self.max_trade_size_pct);
+        }
+
+        if self.eth_price_usd <= 0.0 {
+            anyhow::bail!("ETH_PRICE_USD must be positive (got: {})", self.eth_price_usd);
+        }
+
+        if self.gas_price_gwei < 0.0 {
+            anyhow::bail!("GAS_PRICE_GWEI must be non-negative (got: {})", self.gas_price_gwei);
+        }
+
+        tracing::info!(
+            max_hops = self.max_hops,
+            max_impact_bps = self.max_price_impact_bps,
+            min_profit_usd = self.min_profit_usd,
+            max_trade_pct = self.max_trade_size_pct,
+            "Config validated successfully"
+        );
+        Ok(()
+        )
     }
 
     /// Minimum profit in wei derived from `min_profit_usd` and `eth_price_usd`.

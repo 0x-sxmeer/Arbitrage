@@ -46,6 +46,8 @@ impl PostgresStore {
     }
 
     /// Run embedded SQL migrations to create tables if they don't exist.
+    /// [H-2] Creates all required tables: opportunities, pool_registry,
+    ///        executions, and circuit_breaker_events.
     pub async fn run_migrations(&self) -> Result<()> {
         sqlx::query(CREATE_OPPORTUNITIES_TABLE)
             .execute(&self.pool)
@@ -57,12 +59,27 @@ impl PostgresStore {
             .await
             .context("Failed to create pool_registry table")?;
 
+        sqlx::query(CREATE_EXECUTIONS_TABLE)
+            .execute(&self.pool)
+            .await
+            .context("Failed to create executions table")?;
+
+        sqlx::query(CREATE_CIRCUIT_BREAKER_TABLE)
+            .execute(&self.pool)
+            .await
+            .context("Failed to create circuit_breaker_events table")?;
+
         sqlx::query(CREATE_OPPORTUNITIES_INDEX)
             .execute(&self.pool)
             .await
             .context("Failed to create opportunities index")?;
 
-        info!("✓ Database migrations applied");
+        sqlx::query(CREATE_EXECUTIONS_INDEX)
+            .execute(&self.pool)
+            .await
+            .context("Failed to create executions index")?;
+
+        info!("✓ Database migrations applied (6 tables/indexes)");
         Ok(())
     }
 
@@ -366,4 +383,37 @@ SELECT COUNT(*) as count
 FROM opportunities
 WHERE is_executable = true
   AND discovered_at > NOW() - ($1 * INTERVAL '1 minute')
+"#;
+
+// ── [H-2] Execution tracking table ───────────────────────────────────────────
+const CREATE_EXECUTIONS_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS executions (
+    id              BIGSERIAL PRIMARY KEY,
+    opportunity_id  UUID REFERENCES opportunities(id),
+    tx_hash         VARCHAR(66) NOT NULL UNIQUE,
+    block_number    BIGINT,
+    gas_used        BIGINT,
+    actual_profit   NUMERIC(78, 0),
+    status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    confirmed_at    TIMESTAMPTZ
+)
+"#;
+
+const CREATE_EXECUTIONS_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_executions_tx_hash
+    ON executions(tx_hash);
+CREATE INDEX IF NOT EXISTS idx_executions_status
+    ON executions(status, submitted_at DESC);
+"#;
+
+// ── [H-2] Circuit breaker event log ──────────────────────────────────────────
+const CREATE_CIRCUIT_BREAKER_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS circuit_breaker_events (
+    id              BIGSERIAL PRIMARY KEY,
+    event_type      VARCHAR(20) NOT NULL,
+    loss_amount     NUMERIC(78, 0),
+    reason          TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
 "#;

@@ -60,10 +60,12 @@ sol! {
         function executeArbitrage(
             address asset,
             uint256 borrowAmount,
-            bytes calldata params
+            bytes calldata params,
+            uint256 deadline
         ) external;
     }
 
+    // [C-3] Updated to include per-leg expected outputs for slippage protection
     struct ArbParams {
         address buyRouter;
         bool    buyIsV3;
@@ -76,6 +78,8 @@ sol! {
         address tokenBorrow;
         address tokenIntermediate;
         uint256 minProfitWei;
+        uint256 expectedBuyOut;   // expected output from buy leg (0 = use global slippageBps)
+        uint256 expectedSellOut;  // expected output from sell leg (0 = use global slippageBps)
     }
 }
 
@@ -385,6 +389,20 @@ impl EvmAdapter {
         let min_profit = alloy::primitives::U256::from_str(&arb.net_expected_value.to_string())
             .unwrap_or_default();
 
+        // [C-3] Calculate expected outputs for per-leg slippage protection
+        let expected_buy_out = if arb.route.len() > 0 {
+            alloy::primitives::U256::from_str(&arb.route[0].expected_amount_out.to_string())
+                .unwrap_or_default()
+        } else {
+            alloy::primitives::U256::ZERO
+        };
+        let expected_sell_out = if arb.route.len() > 1 {
+            alloy::primitives::U256::from_str(&arb.route[1].expected_amount_out.to_string())
+                .unwrap_or_default()
+        } else {
+            alloy::primitives::U256::ZERO
+        };
+
         Ok(ArbParams {
             buyRouter:         buy_router,
             buyIsV3:           buy_is_v3,
@@ -397,6 +415,8 @@ impl EvmAdapter {
             tokenBorrow:       token_borrow,
             tokenIntermediate: token_intermediate,
             minProfitWei:      min_profit,
+            expectedBuyOut:    expected_buy_out,
+            expectedSellOut:   expected_sell_out,
         })
     }
 
@@ -451,10 +471,19 @@ impl EvmAdapter {
             "⚡ Firing execution bundle → AtomicArb"
         );
 
+        // [L-3] Deadline: current timestamp + 5 minutes (300 seconds)
+        let deadline = alloy::primitives::U256::from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() + 300
+        );
+
         let tx = atomic_arb.executeArbitrage(
             params.tokenBorrow,
             borrow_amount,
             Bytes::from(encoded_params),
+            deadline,
         );
 
         match tx.send().await {
@@ -516,11 +545,20 @@ impl EvmAdapter {
         let borrow_amount = alloy::primitives::U256::from_str(&arb.input_amount.to_string())
             .unwrap_or_default();
 
+        // [L-3] Deadline for simulation: current timestamp + 5 minutes
+        let deadline = alloy::primitives::U256::from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() + 300
+        );
+
         use alloy::sol_types::SolCall;
         let call = IAtomicArb::executeArbitrageCall {
             asset:        params.tokenBorrow,
             borrowAmount: borrow_amount,
             params:       Bytes::from(encoded_params),
+            deadline,
         };
         let calldata = call.abi_encode();
 

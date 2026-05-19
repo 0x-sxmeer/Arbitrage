@@ -7,10 +7,13 @@
 engine/target/
 **/*.rs.bk
 
-# Environment — NEVER commit private keys or API keys
+# Environment — NEVER commit private keys or API keys [S-1]
 .env
+.env.*
 .env.local
 .env.*.local
+*.pem
+keystore/
 
 # IDE
 .idea/

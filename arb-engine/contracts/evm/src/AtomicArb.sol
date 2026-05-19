@@ -72,6 +72,12 @@ interface IWormholeRelayer {
         uint256 receiverValue,
         uint256 gasLimit
     ) external payable returns (uint64 sequence);
+
+    function quoteEVMDeliveryPrice(
+        uint16 targetChain,
+        uint256 receiverValue,
+        uint256 gasLimit
+    ) external view returns (uint256 nativePriceQuote, uint256 targetChainRefundPerGasUnused);
     
     function send(
         uint16 targetChain,
@@ -132,6 +138,9 @@ struct ArbParams {
     address tokenIntermediate;// token we receive on buy leg
     // Slippage
     uint256 minProfitWei;     // minimum net profit required (in tokenBorrow units)
+    // [C-3] Per-leg expected outputs for slippage protection
+    uint256 expectedBuyOut;   // expected output from buy leg (0 = use global slippageBps)
+    uint256 expectedSellOut;  // expected output from sell leg (0 = use global slippageBps)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +161,19 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     /// Aave V3 flash loan fee: 0.05% = 5 bps
     uint256 public constant AAVE_FLASH_LOAN_FEE_BPS = 5;
 
+    /// [C-3] Slippage tolerance in basis points (default 0.5%, max 2%)
+    uint256 public slippageBps = 50;
+
+    /// [C-6] Cross-chain bridging is gated until fully implemented
+    bool public crossChainEnabled = false;
+
+    /// [C-6] Wormhole delivery deduplication
+    mapping(bytes32 => bool) public processedDeliveries;
+    /// [C-6] Registered cross-chain senders by source chain
+    mapping(uint16 => bytes32) public registeredSenders;
+    /// [C-6] Pre-registered receiver addresses by target chain
+    mapping(uint16 => address) public crossChainReceivers;
+
     /// Circuit breaker: max drawdown in wei per hour before auto-pause
     uint256 public maxDrawdownPerHour;
 
@@ -164,19 +186,27 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
 
     // ── Events ─────────────────────────────────────────────────────────────────
 
+    // [L-2] Events with indexed fields for efficient off-chain querying
     event ArbExecuted(
         address indexed tokenBorrow,
         uint256 borrowAmount,
         uint256 netProfit,
-        address buyRouter,
-        address sellRouter,
-        uint256 blockNumber
+        address indexed buyRouter,
+        address indexed sellRouter,
+        uint256 blockNumber,
+        uint256 timestamp
     );
 
     event CircuitBreakerTriggered(uint256 drawdown, uint256 threshold);
-    event ProfitWithdrawn(address token, uint256 amount);
-    event CrossChainMessageReceived(uint16 sourceChain, bytes32 sourceAddress, bytes payload);
-    event CrossChainMessageSent(uint16 targetChain, bytes32 targetAddress, bytes payload);
+    event ProfitWithdrawn(address indexed token, uint256 amount);
+    event EthReceived(address indexed sender, uint256 amount);
+    event SlippageUpdated(uint256 oldBps, uint256 newBps);
+    event CrossChainToggled(bool enabled);
+    event CrossChainSenderRegistered(uint16 indexed sourceChain, bytes32 sender);
+    event CrossChainReceiverRegistered(uint16 indexed targetChain, address receiver);
+    event CrossChainMessageReceived(uint16 indexed sourceChain, bytes32 sourceAddress, bytes payload);
+    event CrossChainMessageSent(uint16 indexed targetChain, bytes32 targetAddress, bytes payload);
+    event CrossChainBridgeInitiated(uint16 indexed targetChain, address recipient, address token, uint256 amount);
 
     // ── Constructor ────────────────────────────────────────────────────────────
 
@@ -191,37 +221,51 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     //  Cross-Chain Relayer Functions
     // ─────────────────────────────────────────────────────────────────────────
 
+    // [C-6] Gated until fully implemented + proper delivery cost quoting
     function sendCrossChainMessage(
         uint16 targetChain,
         bytes32 targetAddress,
         bytes memory payload
     ) external payable onlyOwner {
-        uint256 cost = msg.value;
-        require(cost > 0, "AtomicArb: Insufficient value for relayer fee");
+        require(crossChainEnabled, "AtomicArb: Cross-chain not yet enabled");
+        require(address(wormholeRelayer) != address(0), "AtomicArb: Wormhole not configured");
 
-        wormholeRelayer.send{value: cost}(
+        // [C-6] Calculate delivery cost from Wormhole instead of trusting msg.value blindly
+        (uint256 deliveryCost, ) = wormholeRelayer.quoteEVMDeliveryPrice(
             targetChain,
-            targetAddress,
+            0,          // no extra receiverValue
+            200_000     // sufficient gas for receiver
+        );
+        require(msg.value >= deliveryCost, "AtomicArb: Insufficient relayer fee");
+
+        wormholeRelayer.sendPayloadToEvm{value: deliveryCost}(
+            targetChain,
+            crossChainReceivers[targetChain] != address(0)
+                ? crossChainReceivers[targetChain]
+                : address(uint160(uint256(targetAddress))),
             payload,
-            0, // no receiver value
-            0,
-            targetChain,
-            msg.sender,
-            address(0),
-            0
+            0,          // no extra receiverValue
+            200_000     // sufficient gas for receiver
         );
         emit CrossChainMessageSent(targetChain, targetAddress, payload);
     }
 
+    // [C-6] Receiver with delivery deduplication + sender verification
     function receiveWormholeMessages(
         bytes memory payload,
         bytes[] memory /* additionalVaas */,
         bytes32 sourceAddress,
         uint16 sourceChain,
-        bytes32 /* deliveryHash */
+        bytes32 deliveryHash
     ) external payable override {
         require(msg.sender == address(wormholeRelayer), "AtomicArb: Only relayer can call");
-        // Process the message (e.g. trigger execution or sync state)
+        require(!processedDeliveries[deliveryHash], "AtomicArb: Already processed");
+        require(
+            registeredSenders[sourceChain] == bytes32(0) || registeredSenders[sourceChain] == sourceAddress,
+            "AtomicArb: Unknown sender"
+        );
+
+        processedDeliveries[deliveryHash] = true;
         emit CrossChainMessageReceived(sourceChain, sourceAddress, payload);
     }
 
@@ -237,12 +281,15 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
      * @param borrowAmount   Amount to borrow (in asset units)
      * @param params         ABI-encoded ArbParams struct
      */
+    // [L-3] Added deadline parameter for transaction expiry protection
     function executeArbitrage(
         address asset,
         uint256 borrowAmount,
-        bytes calldata params
+        bytes calldata params,
+        uint256 deadline
     ) external onlyOwner whenNotPaused nonReentrant {
         require(borrowAmount > 0, "AtomicArb: borrowAmount must be > 0");
+        require(block.timestamp <= deadline, "AtomicArb: Transaction expired");
 
         // Initiate flash loan - Aave calls back executeOperation()
         aavePool.flashLoanSimple(
@@ -280,6 +327,15 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 repayAmount = amount + premium;
 
         // ── Step 1: Buy leg - swap tokenBorrow → tokenIntermediate ───────────
+        // [C-3] Per-leg slippage protection: use expectedBuyOut if provided,
+        // otherwise fall back to global slippageBps percentage
+        uint256 buyMinOut;
+        if (arb.expectedBuyOut > 0) {
+            buyMinOut = (arb.expectedBuyOut * (10000 - slippageBps)) / 10000;
+        } else {
+            buyMinOut = 1; // fallback: final profit check still guards overall outcome
+        }
+
         uint256 intermediateAmount = _swap(
             arb.buyRouter,
             arb.buyIsV3,
@@ -288,12 +344,25 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
             asset,
             arb.tokenIntermediate,
             amount,
-            1 // amountOutMin = 1 (we check profit at the end, not per-leg)
+            buyMinOut
         );
 
         require(intermediateAmount > 0, "AtomicArb: buy leg produced zero output");
 
         // ── Step 2: Sell leg - swap tokenIntermediate → tokenBorrow ──────────
+        // [C-3] Per-leg slippage on sell side: use expectedSellOut if provided,
+        // otherwise require at least the repayAmount (break-even guard)
+        uint256 sellMinOut;
+        if (arb.expectedSellOut > 0) {
+            sellMinOut = (arb.expectedSellOut * (10000 - slippageBps)) / 10000;
+            // Never go below repayAmount — that would be a guaranteed loss
+            if (sellMinOut < repayAmount) {
+                sellMinOut = repayAmount;
+            }
+        } else {
+            sellMinOut = repayAmount;
+        }
+
         uint256 finalAmount = _swap(
             arb.sellRouter,
             arb.sellIsV3,
@@ -302,7 +371,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
             arb.tokenIntermediate,
             asset,
             intermediateAmount,
-            repayAmount // amountOutMin = repay amount (must at least break even)
+            sellMinOut
         );
 
         // ── Step 3: Profit check - revert if not profitable ───────────────────
@@ -329,7 +398,8 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
             netProfit,
             arb.buyRouter,
             arb.sellRouter,
-            block.number
+            block.number,
+            block.timestamp
         );
 
         return true;
@@ -405,18 +475,53 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
 
     /// Withdraw accumulated profit to owner wallet.
     function withdrawProfit(address token) external onlyOwner {
-        uint256 balance = IERC20(token).balanceOf(address(this));
-        require(balance > 0, "AtomicArb: nothing to withdraw");
-        IERC20(token).safeTransfer(owner(), balance);
-        emit ProfitWithdrawn(token, balance);
+        if (token == address(0)) {
+            // Native ETH withdrawal
+            uint256 ethBalance = address(this).balance;
+            require(ethBalance > 0, "AtomicArb: no ETH balance");
+            (bool success, ) = payable(owner()).call{value: ethBalance}("");
+            require(success, "AtomicArb: ETH transfer failed");
+            emit ProfitWithdrawn(address(0), ethBalance);
+        } else {
+            // ERC20 withdrawal
+            uint256 balance = IERC20(token).balanceOf(address(this));
+            require(balance > 0, "AtomicArb: nothing to withdraw");
+            IERC20(token).safeTransfer(owner(), balance);
+            emit ProfitWithdrawn(token, balance);
+        }
     }
 
-    /// Withdraw native ETH (for gas refunds if needed).
-    function withdrawEth() external onlyOwner {
-        uint256 balance = address(this).balance;
-        require(balance > 0, "AtomicArb: no ETH balance");
-        (bool success, ) = owner().call{value: balance}("");
-        require(success, "AtomicArb: ETH transfer failed");
+    /// [C-1] Batch withdraw multiple tokens in one call
+    function withdrawProfits(address[] calldata tokens) external onlyOwner {
+        for (uint256 i = 0; i < tokens.length; i++) {
+            this.withdrawProfit(tokens[i]);
+        }
+    }
+
+    /// [C-3] Set slippage tolerance (owner only, max 2%)
+    function setSlippage(uint256 _bps) external onlyOwner {
+        require(_bps <= 200, "AtomicArb: Max 2% slippage");
+        uint256 oldBps = slippageBps;
+        slippageBps = _bps;
+        emit SlippageUpdated(oldBps, _bps);
+    }
+
+    /// [C-6] Toggle cross-chain bridging (disabled by default)
+    function setCrossChainEnabled(bool _enabled) external onlyOwner {
+        crossChainEnabled = _enabled;
+        emit CrossChainToggled(_enabled);
+    }
+
+    /// [C-6] Register a trusted sender for a source chain
+    function registerCrossChainSender(uint16 sourceChain, bytes32 sender) external onlyOwner {
+        registeredSenders[sourceChain] = sender;
+        emit CrossChainSenderRegistered(sourceChain, sender);
+    }
+
+    /// [C-6] Register a receiver address for a target chain
+    function registerCrossChainReceiver(uint16 targetChain, address receiver) external onlyOwner {
+        crossChainReceivers[targetChain] = receiver;
+        emit CrossChainReceiverRegistered(targetChain, receiver);
     }
 
     /// Update the circuit breaker threshold.
@@ -430,6 +535,8 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     /// Resume execution after circuit breaker or manual pause.
     function unpause() external onlyOwner { _unpause(); }
 
-    /// Accept ETH (needed for WETH unwrap scenarios).
-    receive() external payable {}
+    /// Accept ETH (needed for WETH unwrap scenarios + gas tips).
+    receive() external payable {
+        emit EthReceived(msg.sender, msg.value);
+    }
 }

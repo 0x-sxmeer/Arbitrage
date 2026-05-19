@@ -18,8 +18,9 @@ use tracing::{debug, info, warn};
 use crate::pool::{ChainId, Pool};
 
 // ── TTL constants (seconds) ───────────────────────────────────────────────────
-/// Pool state expires after 2 Ethereum blocks (≈ 24 seconds)
-const POOL_STATE_TTL_SECS: u64 = 24;
+/// [FIX-8] Pool state expires after 24 Ethereum blocks (24 × 12s = 288 seconds)
+/// Previously erroneously set to 24 seconds (≈2 blocks).
+const POOL_STATE_TTL_SECS: u64 = 288;
 /// Opportunity record TTL — kept long enough for execution monitoring
 const OPPORTUNITY_TTL_SECS: u64 = 60;
 /// Gas price TTL — 1 Ethereum block

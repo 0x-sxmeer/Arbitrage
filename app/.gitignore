@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# Environment — NEVER commit private keys [S-1]
+.env
+.env.*
+*.pem
+keystore/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
