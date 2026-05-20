@@ -67,6 +67,8 @@ pub struct Config {
     // ── Market data ───────────────────────────────────────────────────────────
     /// ETH price in USD (used for gas cost normalisation until oracle is wired)
     pub eth_price_usd: f64,
+    /// BTC price in USD
+    pub btc_price_usd: f64,
     /// Current effective gas price in gwei (default; overridden by Redis cache)
     pub gas_price_gwei: f64,
 }
@@ -80,10 +82,10 @@ impl Config {
         let cfg = Self {
             // ── RPC endpoints ─────────────────────────────────────────────
             eth_ws_url: std::env::var("ETH_WS_URL")
-                .unwrap_or_else(|_| "wss://mainnet.infura.io/ws/v3/demo".to_string()),
+                .map_err(|_| anyhow::anyhow!("ETH_WS_URL is required in .env"))?,
 
             eth_http_url: std::env::var("ETH_HTTP_URL")
-                .unwrap_or_else(|_| "https://cloudflare-eth.com".to_string()),
+                .map_err(|_| anyhow::anyhow!("ETH_HTTP_URL is required in .env"))?,
 
             base_ws_url: std::env::var("BASE_WS_URL").ok(),
             base_http_url: std::env::var("BASE_HTTP_URL").ok(),
@@ -144,6 +146,11 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(20.0),
+
+            btc_price_usd: std::env::var("BTC_PRICE_USD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(95000.0),
         };
 
         cfg.validate()?;
@@ -270,9 +277,9 @@ impl Config {
     /// Log a sanitised summary (no secrets).
     pub fn log_summary(&self) {
         tracing::info!(
-            eth_ws        = %self.eth_ws_url,
-            eth_http      = %self.eth_http_url,
-            redis         = %self.redis_url,
+            eth_ws        = %redact_url(&self.eth_ws_url),
+            eth_http      = %redact_url(&self.eth_http_url),
+            redis         = %redact_url(&self.redis_url),
             has_postgres  = self.database_url.is_some(),
             contract      = ?self.contract_address,
             has_solana    = self.solana_rpc_url.is_some(),
@@ -287,5 +294,16 @@ impl Config {
         if self.private_key.is_none() {
             tracing::warn!("PRIVATE_KEY not set — execution disabled (monitoring only)");
         }
+    }
+}
+
+fn redact_url(url: &str) -> String {
+    let mut parts = url.split('/').collect::<Vec<_>>();
+    if parts.len() > 3 && url.contains("api") || url.contains("v3") || url.contains("key") || url.contains("@") {
+        let last = parts.len() - 1;
+        parts[last] = "***";
+        parts.join("/")
+    } else {
+        url.to_string()
     }
 }

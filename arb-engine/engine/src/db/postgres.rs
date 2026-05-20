@@ -78,13 +78,21 @@ impl PostgresStore {
         let route_json = serde_json::to_value(&opp.route)
             .context("Failed to serialize route")?;
 
+        use std::str::FromStr;
+        let input_amount_bd = sqlx::types::BigDecimal::from_str(&opp.input_amount.to_string())
+            .context("Failed to parse input_amount as BigDecimal")?;
+        let gross_output_bd = sqlx::types::BigDecimal::from_str(&opp.gross_output.to_string())
+            .context("Failed to parse gross_output as BigDecimal")?;
+        let nev_bd = sqlx::types::BigDecimal::from_str(&opp.net_expected_value.to_string())
+            .context("Failed to parse net_expected_value as BigDecimal")?;
+
         sqlx::query(INSERT_OPPORTUNITY)
             .bind(opp.id)
             .bind(opp.chain.name())
             .bind(opp.start_token.as_str())
-            .bind(opp.input_amount.to_string())
-            .bind(opp.gross_output.to_string())
-            .bind(opp.net_expected_value.to_string())
+            .bind(input_amount_bd)
+            .bind(gross_output_bd)
+            .bind(nev_bd)
             .bind(opp.is_executable)
             .bind(opp.estimated_gas_units as i64)
             .bind(opp.gas_price_gwei)
@@ -318,7 +326,7 @@ INSERT INTO opportunities (
     id, chain, start_token, input_amount_wei, gross_output_wei,
     net_expected_value, is_executable, gas_units, gas_price_gwei,
     price_impact_bps, block_number, discovered_at, route
-) VALUES ($1,$2,$3,$4::NUMERIC,$5::NUMERIC,$6::NUMERIC,$7,$8,$9,$10,$11,$12,$13)
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 ON CONFLICT (id) DO NOTHING
 "#;
 
@@ -372,7 +380,7 @@ WHERE is_executable = true
 const CREATE_EXECUTIONS_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS executions (
     id              BIGSERIAL PRIMARY KEY,
-    opportunity_id  UUID REFERENCES opportunities(id),
+    opportunity_id  UUID REFERENCES opportunities(id) ON DELETE CASCADE,
     tx_hash         VARCHAR(66) NOT NULL UNIQUE,
     block_number    BIGINT,
     gas_used        BIGINT,

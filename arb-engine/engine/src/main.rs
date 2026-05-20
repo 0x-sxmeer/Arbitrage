@@ -137,29 +137,8 @@ async fn main() {
             (ChainId::Ethereum, config.eth_ws_url.clone(), config.eth_http_url.clone())
         };
 
-    let evm_adapter = {
-        let evm_config = EvmConfig {
-            chain:            active_chain,
-            ws_url:           active_ws_url.clone(),
-            http_url:         active_http_url.clone(),
-            flashbots_url:    Some(config.flashbots_url.clone()),
-            private_key:      config.private_key.clone(),
-            contract_address: config.contract_address.clone(),
-            flashbots_signing_key: config.flashbots_signing_key.clone(),
-            private_rpc_url:  config.private_rpc_url.clone(),
-        };
-        let adapter = EvmAdapter::new(evm_config);
-        let ws_preview = if active_ws_url.len() > 40 {
-            &active_ws_url[..40]
-        } else {
-            &active_ws_url
-        };
-        info!("✓ EVM adapter initialized (chain={}, ws={}...)", active_chain.name(), ws_preview);
-        Some(Arc::new(adapter))
-    };
-
     // ── Initialize Flashbots Submitter ────────────────────────────────────────
-    let _flashbots_submitter = if let Some(ref signing_key) = config.flashbots_signing_key {
+    let flashbots_submitter = if let Some(ref signing_key) = config.flashbots_signing_key {
         let contract_addr = if let Some(ref addr) = config.contract_address {
             use std::str::FromStr;
             alloy::primitives::Address::from_str(addr).unwrap_or(alloy::primitives::Address::ZERO)
@@ -183,6 +162,27 @@ async fn main() {
         }
     } else {
         None
+    };
+
+    let evm_adapter = {
+        let evm_config = EvmConfig {
+            chain:            active_chain,
+            ws_url:           active_ws_url.clone(),
+            http_url:         active_http_url.clone(),
+            flashbots_url:    Some(config.flashbots_url.clone()),
+            private_key:      config.private_key.clone(),
+            contract_address: config.contract_address.clone(),
+            flashbots_signing_key: config.flashbots_signing_key.clone(),
+            private_rpc_url:  config.private_rpc_url.clone(),
+        };
+        let adapter = EvmAdapter::new(evm_config, flashbots_submitter.clone());
+        let ws_preview = if active_ws_url.len() > 40 {
+            &active_ws_url[..40]
+        } else {
+            &active_ws_url
+        };
+        info!("✓ EVM adapter initialized (chain={}, ws={}...)", active_chain.name(), ws_preview);
+        Some(Arc::new(adapter))
     };
 
     // ── Build LiquidityGraph ──────────────────────────────────────────────────
@@ -248,10 +248,17 @@ async fn main() {
 
         info!("  ⏳ Fetching live pool states from Alchemy ({} V3 pools)...", pools_to_sync.len());
 
+        let fetch_v3_futures = pools_to_sync.iter().map(|def| {
+            let evm = evm.clone();
+            let addr = def.address;
+            async move { (def, evm.get_v3_pool_state(addr).await) }
+        });
+        let v3_results = futures_util::future::join_all(fetch_v3_futures).await;
+
         let mut g = graph.write().await;
 
-        for def in &pools_to_sync {
-            match evm.get_v3_pool_state(def.address).await {
+        for (def, result) in v3_results {
+            match result {
                 Ok((sqrt_price, tick, liq)) => {
                     g.upsert_pool(Pool {
                         id: def.address.to_lowercase(),
@@ -312,6 +319,7 @@ async fn main() {
                 }
             }
         }
+        drop(g);
 
         // ── Phase C: V2 SushiSwap pool warm-up ────────────────────────────────
         // These are the highest-volume V2 pairs and the primary cross-DEX
@@ -337,8 +345,16 @@ async fn main() {
 
         info!("  ⏳ Fetching live V2 pool states ({} pools)...", v2_pools.len());
 
-        for def in &v2_pools {
-            match evm.get_v2_pool_state(def.address).await {
+        let fetch_v2_futures = v2_pools.iter().map(|def| {
+            let evm = evm.clone();
+            let addr = def.address;
+            async move { (def, evm.get_v2_pool_state(addr).await) }
+        });
+        let v2_results = futures_util::future::join_all(fetch_v2_futures).await;
+
+        let mut g = graph.write().await;
+        for (def, result) in v2_results {
+            match result {
                 Ok((reserve0, reserve1)) => {
                     let (reserve_a, reserve_b) = if def.token_a.address.to_lowercase() < def.token_b.address.to_lowercase() {
                         (reserve0, reserve1)
@@ -446,17 +462,17 @@ async fn main() {
 
     // ── Build router config ───────────────────────────────────────────────────
     let router_config = RouterConfig {
-        max_hops:         config.max_hops,
-        min_profit_usd:   1.0, // $1.0 baseline
-        reference_amount: crate::pool::U256::from(1_000_000_000_000_000_000u128), // 1 ETH
-        eth_price_usd:    config.eth_price_usd,
-        gas_price_gwei:   config.gas_price_gwei,
-        gas_estimate:     350_000,
-        max_price_impact_bps: 200,
-        verbose:          false,
+        gas_price_gwei:       config.gas_price_gwei,
+        gas_estimate:         350_000,
+        eth_price_usd:        config.eth_price_usd,
+        btc_price_usd:        config.btc_price_usd,
+        min_profit_usd:       config.min_profit_usd,
+        reference_amount:     crate::pool::U256::from(1_000_000_000_000_000_000u128),
+        max_price_impact_bps: config.max_price_impact_bps,
+        max_hops:             config.max_hops,
+        verbose:              false,
         aave_fee_bps,
     };
-
     // ── Start mempool listener ────────────────────────────────────────────────
     info!("═══════════════════════════════════════════════════════════════");
     info!("  🚀 Starting mempool listener...");

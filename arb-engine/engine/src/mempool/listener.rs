@@ -96,6 +96,7 @@ struct RawTxPayload {
 // ─────────────────────────────────────────────────────────────────────────────
 //  MempoolListener
 // ─────────────────────────────────────────────────────────────────────────────
+#[derive(Clone)]
 pub struct MempoolListener {
     ws_url:        String,
     solana_ws_url: Option<String>,
@@ -131,12 +132,19 @@ impl MempoolListener {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let evm_task    = self.run_evm_stream();
-        let solana_task = self.run_solana_stream();
-        tokio::select! {
-            res = evm_task    => res,
-            res = solana_task => res,
-        }
+        let listener_clone = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = listener_clone.run_solana_stream().await {
+                    tracing::error!("Solana task error: {:?} — restarting in 10s", e);
+                } else {
+                    tracing::warn!("Solana task exited cleanly — restarting in 10s");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+
+        self.run_evm_stream().await
     }
 
     // ── Solana reconnect loop ─────────────────────────────────────────────────

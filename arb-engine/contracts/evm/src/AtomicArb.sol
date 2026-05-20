@@ -145,6 +145,9 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     /// Wormhole Relayer
     IWormholeRelayer public immutable wormholeRelayer;
 
+    /// Router whitelist
+    mapping(address => bool) public allowedRouters;
+
     /// [C-3] Slippage tolerance in basis points (default 0.5%, max 2%)
     uint256 public slippageBps = 50;
 
@@ -203,7 +206,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
 
     constructor(address _aavePool, address _wormholeRelayer, uint256 _maxDrawdownPerHour) Ownable(msg.sender) {
         require(_aavePool != address(0), "AtomicArb: zero aave pool");
-        require(_wormholeRelayer != address(0), "AtomicArb: zero wormhole relayer");
+        // Wormhole relayer is optional — cross-chain is disabled by default
         aavePool = IPool(_aavePool);
         wormholeRelayer = IWormholeRelayer(_wormholeRelayer);
         maxDrawdownPerHour = _maxDrawdownPerHour;
@@ -324,13 +327,8 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         // If expectedBuyOut is 0, fall back to requiring at least break-even
         // (which still has risk; callers should always provide expectedBuyOut).
         uint256 buyMinOut;
-        if (arb.expectedBuyOut > 0) {
-            buyMinOut = (arb.expectedBuyOut * (10000 - slippageBps)) / 10000;
-        } else {
-            // Fallback: require at least 1 wei output (dangerous, but prevents revert)
-            // Callers MUST provide expectedBuyOut in production
-            buyMinOut = 1;
-        }
+        require(arb.expectedBuyOut > 0, "AtomicArb: expectedBuyOut must be set");
+        buyMinOut = (arb.expectedBuyOut * (10000 - slippageBps)) / 10000;
 
         uint256 intermediateAmount = _swap(
             arb.buyRouter,
@@ -346,13 +344,8 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         require(intermediateAmount > 0, "AtomicArb: buy leg produced zero output");
 
         // ── Step 2: Sell leg - swap tokenIntermediate → tokenBorrow ──────────
-        uint256 sellMinOut;
-        if (arb.expectedSellOut > 0) {
-            sellMinOut = (arb.expectedSellOut * (10000 - slippageBps)) / 10000;
-        } else {
-            // Fallback: must at least repay the loan
-            sellMinOut = repayAmount;
-        }
+        require(arb.expectedSellOut > 0, "AtomicArb: expectedSellOut must be set");
+        uint256 sellMinOut = (arb.expectedSellOut * (10000 - slippageBps)) / 10000;
         // Enforce absolute floor: never accept less than repayment
         if (sellMinOut < repayAmount) {
             sellMinOut = repayAmount;
@@ -390,9 +383,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         // The allowance is set exactly to repayAmount and will be fully consumed.
 
         // Track net result including gas cost estimate
-        uint256 gasCostEstimate = block.basefee > 0
-            ? block.basefee * 350_000
-            : tx.gasprice * 350_000;
+        uint256 gasCostEstimate = tx.gasprice * 350_000;
             
         // If netProfit > gasCost, it's a real profit; otherwise it's a net loss
         if (netProfit > gasCostEstimate) {
@@ -429,6 +420,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 amountOutMin
     ) internal returns (uint256 amountOut) {
         require(router != address(0), "AtomicArb: zero router address");
+        require(allowedRouters[router], "AtomicArb: router not whitelisted");
         require(tokenIn != address(0) && tokenOut != address(0), "AtomicArb: zero token address");
         require(amountIn > 0, "AtomicArb: zero amountIn");
 
@@ -495,6 +487,11 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     // ─────────────────────────────────────────────────────────────────────────
     //  Admin functions
     // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Allow a router for swapping.
+    function setRouterAllowed(address router, bool allowed) external onlyOwner {
+        allowedRouters[router] = allowed;
+    }
 
     /// @notice Withdraw accumulated profit for a single token.
     /// @dev Only withdraws tracked profit, not the full balance. Resets the tracker to zero.

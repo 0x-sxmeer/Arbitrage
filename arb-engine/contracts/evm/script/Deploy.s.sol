@@ -11,7 +11,7 @@ contract Deploy is Script {
 
         address aavePool;
         address wormholeRelayer;
-        uint256 maxDrawdownPerHour = 1 ether; // default 1 ETH in gas costs
+        uint256 maxDrawdownPerHour = 0.1 ether; // default 0.1 ETH in gas costs
 
         // Try reading from environment overrides first
         try vm.envAddress("AAVE_POOL") returns (address pool) {
@@ -38,7 +38,7 @@ contract Deploy is Script {
             if (chainId == 11155111) {
                 // Sepolia Testnet
                 if (aavePool == address(0)) aavePool = 0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951;
-                if (wormholeRelayer == address(0)) wormholeRelayer = 0x7B621fE2A04a3aB783568b919b40F40171AeFcF4;
+                if (wormholeRelayer == address(0)) wormholeRelayer = address(0);
             } else if (chainId == 8453) {
                 // Base Mainnet
                 if (aavePool == address(0)) aavePool = 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5;

@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::pool::{ChainId, Pool};
 
@@ -43,36 +43,18 @@ impl RedisCache {
     /// Uses ConnectionManager for automatic reconnection on failures.
     /// If Redis is offline, falls back to high-speed in-memory DashMap.
     pub async fn new(redis_url: &str) -> Result<Self> {
-        let client = match Client::open(redis_url) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("⚠ Invalid Redis URL: {}. Falling back to in-memory store.", e);
-                return Ok(Self {
-                    conn: None,
-                    fallback: DashMap::new(),
-                    fallback_ttl: DashMap::new(),
-                });
-            }
-        };
+        let client = Client::open(redis_url)
+            .context("Invalid Redis URL")?;
 
-        match ConnectionManager::new(client).await {
-            Ok(conn) => {
-                info!("✓ Redis connected via ConnectionManager (auto-reconnect enabled)");
-                Ok(Self {
-                    conn: Some(conn),
-                    fallback: DashMap::new(),
-                    fallback_ttl: DashMap::new(),
-                })
-            }
-            Err(e) => {
-                warn!("⚠ Redis connection failed: {}. Falling back to high-performance in-memory cache.", e);
-                Ok(Self {
-                    conn: None,
-                    fallback: DashMap::new(),
-                    fallback_ttl: DashMap::new(),
-                })
-            }
-        }
+        let conn = ConnectionManager::new(client).await
+            .context("Failed to connect to Redis (ConnectionManager)")?;
+
+        info!("✓ Redis connected via ConnectionManager (auto-reconnect enabled)");
+        Ok(Self {
+            conn: Some(conn),
+            fallback: DashMap::new(),
+            fallback_ttl: DashMap::new(),
+        })
     }
 
     /// Alias for `new()` — used by main.rs for clarity.

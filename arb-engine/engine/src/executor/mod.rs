@@ -189,9 +189,13 @@ impl FlashbotsSubmitter {
     async fn build_signature(&self, body: &serde_json::Value) -> Result<String> {
         let body_str = body.to_string();
         let body_hash = alloy::primitives::keccak256(body_str.as_bytes());
+        let body_hash_hex = format!("0x{}", hex::encode(body_hash));
         use alloy::signers::Signer;
-        let signature = self.signing_key.sign_message(body_hash.as_slice()).await?;
-        let sig_hex = format!("{}:{}", self.signing_key.address(), hex::encode(signature.as_bytes()));
+        let signature = self.signing_key
+            .sign_message(body_hash_hex.as_bytes())
+            .await
+            .context("Failed to sign Flashbots body")?;
+        let sig_hex = format!("{}:0x{}", self.signing_key.address(), hex::encode(signature.as_bytes()));
         Ok(sig_hex)
     }
 

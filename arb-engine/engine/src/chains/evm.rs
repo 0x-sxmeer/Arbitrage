@@ -135,10 +135,11 @@ pub struct EvmAdapter {
                       >>>,
     last_block:       std::sync::atomic::AtomicU64,
     execution_count:  std::sync::atomic::AtomicU64,
+    flashbots:        Option<std::sync::Arc<crate::executor::FlashbotsSubmitter>>,
 }
 
 impl EvmAdapter {
-    pub fn new(config: EvmConfig) -> Self {
+    pub fn new(config: EvmConfig, flashbots: Option<std::sync::Arc<crate::executor::FlashbotsSubmitter>>) -> Self {
         info!(
             chain           = %config.chain.name(),
             ws_url          = %config.ws_url,
@@ -152,6 +153,7 @@ impl EvmAdapter {
             http_provider: tokio::sync::RwLock::new(None),
             last_block:    std::sync::atomic::AtomicU64::new(0),
             execution_count: std::sync::atomic::AtomicU64::new(0),
+            flashbots,
         }
     }
 
@@ -588,7 +590,8 @@ impl EvmAdapter {
             (rec, format!("{:?}", tx_hash))
         } else {
             let target_block = provider.get_block_number().await.unwrap_or(0) + 1;
-            let receipt_str = self.submit_flashbots_bundle(vec![signed_bytes], target_block).await?;
+            let fb = self.flashbots.as_ref().context("Flashbots submitter not configured")?;
+            let receipt_str = fb.submit_raw_bundle(vec![signed_bytes], target_block).await?;
             
             let tx_hash = envelope.tx_hash();
             let mut receipt = None;
@@ -933,7 +936,7 @@ impl EvmManager {
 
     pub fn add_chain(&mut self, config: EvmConfig) {
         let chain = config.chain;
-        self.adapters.insert(chain, EvmAdapter::new(config));
+        self.adapters.insert(chain, EvmAdapter::new(config, None));
     }
 
     pub fn get(&self, chain: ChainId) -> Option<&EvmAdapter> {

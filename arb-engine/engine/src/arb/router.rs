@@ -58,6 +58,8 @@ pub struct RouterConfig {
     pub gas_estimate:       u64,
     /// ETH/USD price for NEV-in-USD calculation.
     pub eth_price_usd:      f64,
+    /// BTC/USD price
+    pub btc_price_usd:      f64,
     /// Minimum profit in USD before the opportunity is flagged executable.
     pub min_profit_usd:     f64,
     /// Reference amount (in raw 18-dec units) for swap simulation.
@@ -78,6 +80,7 @@ impl Default for RouterConfig {
             gas_price_gwei:       30.0,
             gas_estimate:         350_000,
             eth_price_usd:        3_000.0,
+            btc_price_usd:        95_000.0,
             min_profit_usd:       1.0,
             reference_amount:     U256::from(10u64.pow(18)), // 1 ETH-equivalent
             max_price_impact_bps: 200,   // 2% — reject high-impact paths
@@ -323,7 +326,7 @@ impl LiquidityGraph {
                 if e1.pool.id == e2.pool.id { continue; }
 
                 if let Some(mut arb) = self.evaluate_two_hop(start_token, mid, &e1.pool, &e2.pool, config) {
-                    arb.calculate_nev(config.eth_price_usd, config.aave_fee_bps);
+                    arb.calculate_nev(config.eth_price_usd, config.btc_price_usd, config.aave_fee_bps, config.min_profit_usd);
                     if arb.is_executable {
                         opps.push(arb);
                     }
@@ -410,7 +413,7 @@ impl LiquidityGraph {
         let lower_bound = U256::from(1_000_000u64) * scaling_factor;
         let start_price = match start.to_lowercase().as_str() {
             "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" | "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => 1.0,
-            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => config.eth_price_usd * 20.0,
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => config.btc_price_usd,
             _ => config.eth_price_usd,
         };
         let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
@@ -740,7 +743,7 @@ fn reconstruct_and_evaluate(
     let start_token = &cycle_edges[0].token_in;
     let start_price = match start_token.to_lowercase().as_str() {
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" | "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => 1.0,
-        "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => config.eth_price_usd * 20.0,
+        "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => config.btc_price_usd,
         _ => config.eth_price_usd,
     };
     let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
@@ -813,7 +816,7 @@ fn reconstruct_and_evaluate(
         total_impact,
         0,
     );
-    opp.calculate_nev(config.eth_price_usd, config.aave_fee_bps);
+    opp.calculate_nev(config.eth_price_usd, config.btc_price_usd, config.aave_fee_bps, config.min_profit_usd);
 
     if opp.is_executable {
         info!(

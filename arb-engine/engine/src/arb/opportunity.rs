@@ -120,74 +120,65 @@ impl ArbitrageOpportunity {
     ///
     /// All costs must be denominated in the same unit as `input_amount` (wei).
     /// Pass `eth_price_usd` for USD-denominated logging only.
-    pub fn calculate_nev(&mut self, eth_price_usd: f64, aave_fee_bps: u32) {
-        let decimals = match self.start_token.to_lowercase().as_str() {
+    pub fn calculate_nev(&mut self, eth_price_usd: f64, btc_price_usd: f64, aave_fee_bps: u32, min_profit_usd: f64) {
+        let decimals: u32 = match self.start_token.to_lowercase().as_str() {
             "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => 6, // USDC / USDT
             "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => 8, // WBTC
             _ => 18, // WETH / DAI / etc.
         };
-        let scaling_factor = 10i128.pow((18 - decimals) as u32);
+
         let token_price = match self.start_token.to_lowercase().as_str() {
             "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" | "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => 1.0,
-            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => eth_price_usd * 20.0,
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => btc_price_usd,
             _ => eth_price_usd,
         };
 
-        // 1. Gross spread: how much more we get back vs what we put in
-        let gross_profit = self.gross_output.low_u128() as i128
-            - self.input_amount.low_u128() as i128;
-        let gross_profit_scaled = gross_profit * scaling_factor;
+        // Use f64 throughout for NEV — precision is sufficient for USD comparisons
+        // and avoids i128 overflow on scaled values.
+        let scale = 10f64.powi(decimals as i32);
+        let gross_out = self.gross_output.low_u128() as f64 / scale;
+        let input_amt = self.input_amount.low_u128() as f64 / scale;
+        let gross_profit_token = gross_out - input_amt;
 
-        // 2. Gas cost: gas_units × effective_gas_price_gwei × 10^9 (gwei → wei)
-        let gas_cost_wei = (self.estimated_gas_units as f64
-            * self.gas_price_gwei
-            * 1_000_000_000.0) as i128;
-        let gas_cost_scaled = (gas_cost_wei as f64 * eth_price_usd / token_price) as i128;
+        // Gas cost in token units (gas_wei × eth_price / token_price / 1e18)
+        let gas_cost_eth = self.estimated_gas_units as f64
+            * self.gas_price_gwei * 1e-9; // ETH
+        let gas_cost_token = gas_cost_eth * eth_price_usd / token_price;
 
-        // 3. Protocol swap fees (aggregated across all hops)
-        let swap_fees = self.total_swap_fees_wei.low_u128() as i128;
-        let swap_fees_scaled = swap_fees * scaling_factor;
+        let swap_fees_token = self.total_swap_fees_wei.low_u128() as f64 / scale;
 
-        // 4. Price impact loss: our trade moves the price against us
-        //    Approximation: impact_bps/10000 × input_amount
-        let impact_loss = (self.input_amount.low_u128() as f64
-            * self.price_impact_bps as f64
-            / 10_000.0) as i128;
-        let impact_loss_scaled = impact_loss * scaling_factor;
+        let impact_loss_token = input_amt * self.price_impact_bps as f64 / 10_000.0;
 
-        // 5. Aave flashloan fee: borrowing cost
-        let aave_fee_loss = (self.input_amount.low_u128() as f64
-            * aave_fee_bps as f64
-            / 10_000.0) as i128;
-        let aave_fee_loss_scaled = aave_fee_loss * scaling_factor;
+        let aave_fee_token = input_amt * aave_fee_bps as f64 / 10_000.0;
 
-        // 6. Net Expected Value
-        self.net_expected_value = gross_profit_scaled - gas_cost_scaled - swap_fees_scaled - impact_loss_scaled - aave_fee_loss_scaled;
-        let nev_usd  = (self.net_expected_value as f64 / 1e18) * token_price;
-        self.is_executable = nev_usd >= 0.50;
+        let nev_token = gross_profit_token
+            - gas_cost_token
+            - swap_fees_token
+            - impact_loss_token
+            - aave_fee_token;
+
+        let nev_usd = nev_token * token_price;
+        // Store as wei-equivalent i128 for DB (scale back to 18-dec)
+        self.net_expected_value = (nev_token * 10f64.powi(18)) as i128;
+        self.is_executable = nev_usd >= min_profit_usd;
 
         // Logging
-        let gross_usd = gross_profit_scaled as f64 / 1e18 * token_price;
-        let gas_usd   = gas_cost_scaled as f64 / 1e18 * token_price;
-
         if self.is_executable {
             tracing::info!(
                 id = %self.id,
                 nev_usd = format!("${:.4}", nev_usd),
-                gross_usd = format!("${:.4}", gross_usd),
-                gas_usd = format!("${:.4}", gas_usd),
+                gross_usd = format!("${:.4}", gross_profit_token * token_price),
+                gas_usd = format!("${:.4}", gas_cost_token * token_price),
                 hops = self.route.len(),
                 impact_bps = self.price_impact_bps,
-                block = self.discovered_at_block,
                 "✅ EXECUTABLE arbitrage opportunity found"
             );
         } else {
             tracing::debug!(
                 id = %self.id,
                 nev_usd = format!("${:.4}", nev_usd),
-                gross_usd = format!("${:.4}", gross_usd),
-                reason = if gross_profit_scaled <= 0 { "no spread" }
-                         else if gas_cost_wei > gross_profit_scaled { "gas > spread" }
+                reason = if gross_profit_token <= 0.0 { "no spread" }
+                         else if gas_cost_token > gross_profit_token { "gas > spread" }
                          else { "below threshold" },
                 "❌ Non-profitable opportunity"
             );
@@ -245,7 +236,7 @@ mod tests {
             200_000,
             20.0, // 20 gwei
         );
-        opp.calculate_nev(3000.0, 5);
+        opp.calculate_nev(3000.0, 95_000.0, 5, 0.50);
         assert!(opp.is_executable, "Should be executable");
         assert!(opp.net_expected_value > 0);
     }
@@ -261,7 +252,7 @@ mod tests {
             300_000,
             50.0,
         );
-        opp.calculate_nev(3000.0, 5);
+        opp.calculate_nev(3000.0, 95_000.0, 5, 0.50);
         assert!(!opp.is_executable, "High gas should make this non-executable");
         assert!(opp.net_expected_value < 0);
     }
