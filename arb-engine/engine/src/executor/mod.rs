@@ -1,15 +1,12 @@
 // executor/mod.rs — Flashbots bundle submission
 use alloy::{
-    primitives::{Address, Bytes, TxKind, U256},
-    providers::{Provider, ProviderBuilder},
+    primitives::Address,
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +34,9 @@ pub struct FlashbotsSubmitter {
     client: reqwest::Client,
     relay_url: String,
     signing_key: PrivateKeySigner,
+    #[allow(dead_code)]
     contract_address: Address,
+    #[allow(dead_code)]
     chain_id: u64,
 }
 
@@ -65,6 +64,7 @@ impl FlashbotsSubmitter {
 
     /// Sign and submit a bundle to Flashbots relay.
     /// `tx` is the unsigned raw transaction request.
+    #[allow(dead_code)]
     pub async fn submit_bundle(
         &self,
         tx: TransactionRequest,
@@ -196,6 +196,7 @@ impl FlashbotsSubmitter {
     }
 
     /// Query bundle status from Flashbots
+    #[allow(dead_code)]
     pub async fn get_bundle_status(&self, bundle_hash: &str) -> Result<String> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",

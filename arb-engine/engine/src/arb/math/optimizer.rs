@@ -311,10 +311,8 @@ mod tests {
     fn test_fuzz_gss_invariants() {
         // We will simulate the GSS loop directly with random/extreme step functions
         // to see if we can trigger b < a or other invariant violations.
-        use std::cell::Cell;
 
         for seed in 0..10_000 {
-            let peak = U256::from(seed * 100);
             let sim = |x: U256| -> U256 {
                 // A highly chaotic, non-monotonic function
                 let val = x.low_u64();

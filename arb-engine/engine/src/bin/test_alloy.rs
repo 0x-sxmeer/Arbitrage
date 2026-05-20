@@ -1,8 +1,8 @@
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::ProviderBuilder;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::rpc::types::TransactionRequest;
-use alloy::primitives::{Address, U256, Bytes};
+use alloy::primitives::{Address, U256};
 use std::str::FromStr;
 use alloy::eips::eip2718::Encodable2718;
 
