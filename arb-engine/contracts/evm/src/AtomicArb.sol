@@ -62,6 +62,25 @@ interface IUniswapV2Router {
     ) external returns (uint256[] memory amounts);
 }
 
+// ── Aerodrome V2 Router (Solidly compatible) ──────────────────────────────────
+
+struct Route {
+    address from;
+    address to;
+    bool stable;
+    address factory;
+}
+
+interface IAerodromeRouter {
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Route[] calldata routes,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
 // ── Wormhole Cross-Chain Relayer Interfaces ───────────────────────────────────
 
 interface IWormholeRelayer {
@@ -447,6 +466,25 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
                     sqrtPriceLimitX96: 0
                 });
             amountOut = IUniswapV3Router(router).exactInputSingle(v3Params);
+        } else if (router == 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43) {
+            // Aerodrome V2 uses structured Route[] routes instead of plain address[] path
+            Route[] memory routes = new Route[](path.length - 1);
+            for (uint256 i = 0; i < path.length - 1; i++) {
+                routes[i] = Route({
+                    from: path[i],
+                    to: path[i + 1],
+                    stable: false,
+                    factory: 0x420DD381b31aEf6683db6B902084cB0FFECe40Da
+                });
+            }
+            uint256[] memory amounts = IAerodromeRouter(router).swapExactTokensForTokens(
+                amountIn,
+                amountOutMin,
+                routes,
+                address(this),
+                swapDeadline
+            );
+            amountOut = amounts[amounts.length - 1];
         } else {
             uint256[] memory amounts = IUniswapV2Router(router).swapExactTokensForTokens(
                 amountIn,

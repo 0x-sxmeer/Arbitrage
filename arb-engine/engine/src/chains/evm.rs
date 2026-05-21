@@ -72,6 +72,20 @@ sol! {
         function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
     }
 
+    #[sol(rpc)]
+    interface IMulticall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+        struct Result {
+            bool success;
+            bytes returnData;
+        }
+        function aggregate3(Call3[] calldata calls) external payable returns (Result[] memory returnData);
+    }
+
     // [C-3] Updated to include per-leg expected outputs for slippage protection
     struct ArbParams {
         address buyRouter;
@@ -442,8 +456,9 @@ impl EvmAdapter {
             vec![]
         };
 
-        let min_profit = alloy::primitives::U256::from_str(&arb.net_expected_value.to_string())
+        let theoretical_profit = alloy::primitives::U256::from_str(&arb.net_expected_value.to_string())
             .unwrap_or_default();
+        let min_profit = theoretical_profit / alloy::primitives::U256::from(2);
 
         // [C-3] Calculate expected outputs for per-leg slippage protection
         let expected_buy_out = if arb.route.len() > 0 {
@@ -554,12 +569,24 @@ impl EvmAdapter {
         // Estimate gas and populate tx parameters
         let nonce = provider.get_transaction_count(signer.address()).await?;
         let gas = provider.estimate_gas(&tx_req).await?;
-        let gas_price = provider.get_gas_price().await?;
+        let network_gas_price = provider.get_gas_price().await?;
         
+        // PGA: Calculate our dynamic bid in wei (1 gwei = 10^9 wei)
+        // Ensure we at least bid the network gas price, but up to optimal_gas_price
+        let optimal_wei = (arb.optimal_gas_price_gwei * 1e9) as u128;
+        let bid_gas_price = std::cmp::max(network_gas_price, optimal_wei);
+
         tx_req.set_nonce(nonce);
         tx_req.set_gas_limit(gas * 12 / 10); // 20% buffer
-        tx_req.set_max_fee_per_gas(gas_price);
-        tx_req.set_max_priority_fee_per_gas(gas_price);
+        tx_req.set_max_fee_per_gas(bid_gas_price);
+        tx_req.set_max_priority_fee_per_gas(bid_gas_price);
+
+        info!(
+            id = %arb.id,
+            network_gwei = format!("{:.1}", network_gas_price as f64 / 1e9),
+            bid_gwei = format!("{:.1}", bid_gas_price as f64 / 1e9),
+            "⛽ PGA: Aggressively bidding gas to frontrun competitors"
+        );
 
         use alloy::network::TransactionBuilder;
         let envelope = tx_req.build(&wallet).await.map_err(|e| anyhow::anyhow!("build error: {}", e))?;
@@ -729,37 +756,138 @@ impl EvmAdapter {
             "Fetching pool state from chain"
         );
 
+        // Reject placeholder pool IDs — they have no real on-chain address
         if pool.id.contains(':') {
-            debug!(pool_id = %pool.id, "Pool ID is a placeholder — returning simulated state");
-            return match pool.pool_type {
-                PoolType::ConstantProduct      => Ok(self.simulated_v2_state()),
-                PoolType::ConcentratedLiquidity => Ok(self.simulated_v3_state()),
-                PoolType::StableSwap           => Ok(self.simulated_v2_state()),
-            };
+            anyhow::bail!("Pool {} is a placeholder with no on-chain address — skipping", pool.id);
         }
 
-        match self.get_or_connect_ws().await {
-            Ok(provider) => {
-                match pool.pool_type {
-                    PoolType::ConstantProduct      => self.fetch_v2_state_live(&provider, pool).await,
-                    PoolType::ConcentratedLiquidity => self.fetch_v3_state_live(&provider, pool).await,
-                    PoolType::StableSwap           => self.fetch_v2_state_live(&provider, pool).await,
-                }
-            }
-            Err(e) => {
-                warn!(pool_id = %pool.id, error = %e, "WebSocket unavailable — using simulated state");
-                match pool.pool_type {
-                    PoolType::ConstantProduct      => Ok(self.simulated_v2_state()),
-                    PoolType::ConcentratedLiquidity => Ok(self.simulated_v3_state()),
-                    PoolType::StableSwap           => Ok(self.simulated_v2_state()),
-                }
-            }
+        // FIX: Use the stable HTTP provider for contract calls.
+        // The WebSocket provider drops periodically causing all fetches to fail during reconnect.
+        // HTTP is stateless and always available.
+        let provider = self.get_or_connect_http().await
+            .with_context(|| format!("HTTP provider unavailable for pool {}", pool.id))?;
+
+        match pool.pool_type {
+            PoolType::ConstantProduct | PoolType::StableSwap =>
+                self.fetch_v2_state_http(&provider, pool).await,
+            PoolType::ConcentratedLiquidity =>
+                self.fetch_v3_state_http(&provider, pool).await,
         }
     }
 
-    async fn fetch_v2_state_live(
+    /// Batches multiple pool state fetches into a single Multicall3 invocation.
+    pub async fn fetch_pool_states_multicall(&self, pools: &[Pool]) -> Result<Vec<PoolState>> {
+        if pools.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let provider = self.get_or_connect_http().await
+            .context("HTTP provider unavailable for multicall")?;
+
+        let multicall_addr = Address::from_str("0xcA11bde05977b3631167028862bE2a173976CA11")?;
+        let multicall = IMulticall3::new(multicall_addr, provider);
+
+        let mut calls = Vec::new();
+        for pool in pools {
+            let pool_addr = Address::from_str(&pool.id)?;
+            match pool.pool_type {
+                PoolType::ConstantProduct | PoolType::StableSwap => {
+                    calls.push(IMulticall3::Call3 {
+                        target: pool_addr,
+                        allowFailure: true,
+                        callData: Bytes::from(V2_GET_RESERVES_SELECTOR.to_vec()),
+                    });
+                }
+                PoolType::ConcentratedLiquidity => {
+                    calls.push(IMulticall3::Call3 {
+                        target: pool_addr,
+                        allowFailure: true,
+                        callData: Bytes::from(V3_SLOT0_SELECTOR.to_vec()),
+                    });
+                    calls.push(IMulticall3::Call3 {
+                        target: pool_addr,
+                        allowFailure: true,
+                        callData: Bytes::from(V3_LIQUIDITY_SELECTOR.to_vec()),
+                    });
+                }
+            }
+        }
+
+        let start = Instant::now();
+        let result = multicall.aggregate3(calls).call().await?;
+        let return_data = result.returnData;
+
+        let mut pool_states = Vec::with_capacity(pools.len());
+        let mut result_idx = 0;
+
+        for pool in pools {
+            match pool.pool_type {
+                PoolType::ConstantProduct | PoolType::StableSwap => {
+                    let res = &return_data[result_idx];
+                    result_idx += 1;
+                    if !res.success || res.returnData.len() < 64 {
+                        pool_states.push(PoolState::empty());
+                        continue;
+                    }
+                    let reserve0 = U256::from_big_endian(&res.returnData[0..32]);
+                    let reserve1 = U256::from_big_endian(&res.returnData[32..64]);
+                    pool_states.push(PoolState {
+                        reserve_a: reserve0,
+                        reserve_b: reserve1,
+                        sqrt_price_x96: None,
+                        tick: None,
+                        liquidity: None,
+                        amp_coeff: None,
+                    });
+                }
+                PoolType::ConcentratedLiquidity => {
+                    let slot0_res = &return_data[result_idx];
+                    let liq_res = &return_data[result_idx + 1];
+                    result_idx += 2;
+
+                    if !slot0_res.success || slot0_res.returnData.len() < 64 {
+                        pool_states.push(PoolState::empty());
+                        continue;
+                    }
+
+                    let sqrt_price_x96 = U256::from_big_endian(&slot0_res.returnData[0..32]);
+                    let tick_bytes: [u8; 4] = slot0_res.returnData[60..64].try_into().unwrap_or([0; 4]);
+                    let tick = i32::from_be_bytes(tick_bytes);
+
+                    let liquidity = if liq_res.success && liq_res.returnData.len() >= 32 {
+                        let mut buf = [0u8; 16];
+                        buf.copy_from_slice(&liq_res.returnData[16..32]);
+                        u128::from_be_bytes(buf)
+                    } else {
+                        0u128
+                    };
+
+                    pool_states.push(PoolState {
+                        reserve_a: U256::zero(),
+                        reserve_b: U256::zero(),
+                        sqrt_price_x96: Some(sqrt_price_x96),
+                        tick: Some(tick),
+                        liquidity: Some(liquidity),
+                        amp_coeff: None,
+                    });
+                }
+            }
+        }
+
+        debug!(
+            num_pools = pools.len(),
+            latency = ?start.elapsed(),
+            "Multicall3 pool state sync completed"
+        );
+
+        Ok(pool_states)
+    }
+
+    // ── HTTP-based pool state fetchers (stable, no reconnect issues) ──────────
+
+    async fn fetch_v2_state_http(
         &self,
-        provider: &RootProvider<PubSubFrontend>,
+        provider: &alloy::providers::RootProvider<alloy::transports::BoxTransport>,
         pool: &Pool,
     ) -> Result<PoolState> {
         let pool_addr = Address::from_str(&pool.id)
@@ -779,10 +907,6 @@ impl EvmAdapter {
         let reserve0 = U256::from_big_endian(&result_bytes[0..32]);
         let reserve1 = U256::from_big_endian(&result_bytes[32..64]);
 
-        if let Ok(block) = provider.get_block_number().await {
-            self.last_block.store(block, std::sync::atomic::Ordering::Relaxed);
-        }
-
         Ok(PoolState {
             reserve_a: reserve0,
             reserve_b: reserve1,
@@ -793,9 +917,9 @@ impl EvmAdapter {
         })
     }
 
-    async fn fetch_v3_state_live(
+    async fn fetch_v3_state_http(
         &self,
-        provider: &RootProvider<PubSubFrontend>,
+        provider: &alloy::providers::RootProvider<alloy::transports::BoxTransport>,
         pool: &Pool,
     ) -> Result<PoolState> {
         let pool_addr = Address::from_str(&pool.id)
@@ -833,10 +957,6 @@ impl EvmAdapter {
         } else {
             0u128
         };
-
-        if let Ok(block) = provider.get_block_number().await {
-            self.last_block.store(block, std::sync::atomic::Ordering::Relaxed);
-        }
 
         Ok(PoolState {
             reserve_a: U256::zero(),

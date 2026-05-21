@@ -20,6 +20,7 @@ pub async fn start_api_server(metrics: Arc<EngineMetrics>, port: u16) {
         let app = Router::new()
         .route("/api/metrics", get(get_metrics))
         .route("/api/mempool", get(get_mempool_txs))
+        .route("/api/opportunities", get(get_opportunities))
         .layer(cors)
         .with_state(metrics);
 
@@ -48,4 +49,9 @@ async fn get_metrics(State(metrics): State<Arc<EngineMetrics>>) -> Json<MetricsS
 async fn get_mempool_txs(State(metrics): State<Arc<EngineMetrics>>) -> Json<Vec<serde_json::Value>> {
     let txs = metrics.recent_mempool_txs.read().await;
     Json(txs.iter().cloned().collect())
+}
+
+async fn get_opportunities(State(metrics): State<Arc<EngineMetrics>>) -> Json<Vec<serde_json::Value>> {
+    let opps = metrics.recent_opportunities.read().await;
+    Json(opps.iter().cloned().collect())
 }

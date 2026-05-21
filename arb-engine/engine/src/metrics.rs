@@ -52,6 +52,7 @@ pub struct EngineMetrics {
 
     // ── Live Data for API ─────────────────────────────────────────────────────
     pub recent_mempool_txs:    tokio::sync::RwLock<std::collections::VecDeque<serde_json::Value>>,
+    pub recent_opportunities:  tokio::sync::RwLock<std::collections::VecDeque<serde_json::Value>>,
 }
 
 impl EngineMetrics {
@@ -73,6 +74,81 @@ impl EngineMetrics {
             pg_errors:             AtomicU64::new(0),
             txs_dropped:           AtomicU64::new(0),
             recent_mempool_txs:    tokio::sync::RwLock::new(std::collections::VecDeque::new()),
+            recent_opportunities:  tokio::sync::RwLock::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub async fn add_recent_opportunity(&self, opp: &crate::arb::opportunity::ArbitrageOpportunity, eth_price: f64, btc_price: f64) {
+        let start_sym = match opp.start_token.to_lowercase().as_str() {
+            "0x4200000000000000000000000000000000000006" => "WETH",
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC",
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => "WBTC",
+            "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => "DAI",
+            "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => "USDT",
+            _ => "UNK",
+        };
+        let decimals = match opp.start_token.to_lowercase().as_str() {
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => 6,
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => 8,
+            _ => 18,
+        };
+        let scale = 10f64.powi(decimals as i32);
+        let input_amt_f = opp.input_amount.low_u128() as f64 / scale;
+        let gross_out_f = opp.gross_output.low_u128() as f64 / scale;
+        
+        let token_price = match opp.start_token.to_lowercase().as_str() {
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" | "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => 1.0,
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => btc_price,
+            _ => eth_price,
+        };
+        
+        let nev_f = opp.net_expected_value as f64 / 1e18; // net_expected_value is scaled to 18-decimals in Rust engine
+        let nev_usd = nev_f * token_price;
+        let gas_cost_usd = (opp.estimated_gas_units as f64 * opp.gas_price_gwei * 1e-9) * eth_price;
+        
+        let mut route_parts = Vec::new();
+        for step in &opp.route {
+            let s_in = match step.token_in.to_lowercase().as_str() {
+                "0x4200000000000000000000000000000000000006" => "WETH",
+                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC",
+                "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => "WBTC",
+                "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => "DAI",
+                "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => "USDT",
+                _ => "UNK",
+            };
+            let s_out = match step.token_out.to_lowercase().as_str() {
+                "0x4200000000000000000000000000000000000006" => "WETH",
+                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC",
+                "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => "WBTC",
+                "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => "DAI",
+                "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => "USDT",
+                _ => "UNK",
+            };
+            route_parts.push(format!("{}→{} ({})", s_in, s_out, step.dex));
+        }
+        let route_desc = route_parts.join(" → ");
+        
+        let opp_json = serde_json::json!({
+            "id": opp.id.to_string(),
+            "route": if route_desc.is_empty() { "WETH → USDC → WETH".to_string() } else { route_desc },
+            "input": format!("{:.3} {}", input_amt_f, start_sym),
+            "output": format!("{:.3} {}", gross_out_f, start_sym),
+            "nevUsd": nev_usd,
+            "gasUsd": gas_cost_usd,
+            "baseGasGwei": opp.gas_price_gwei,
+            "optimalGasGwei": opp.optimal_gas_price_gwei,
+            "isExecutable": opp.is_executable,
+            "block": opp.discovered_at_block,
+            "status": if opp.is_executable { "Simulated" } else { "Unprofitable" },
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        });
+
+        if let Ok(mut list) = self.recent_opportunities.try_write() {
+            list.push_front(opp_json);
+            if list.len() > 50 { list.pop_back(); }
         }
     }
 

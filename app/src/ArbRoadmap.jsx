@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import ExecutionDashboard from "./ExecutionDashboard";
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
 
@@ -824,6 +825,7 @@ function PhasePanel({ phaseIndex, phase }) {
   if (phaseIndex === 1) return <NevFormula color={phase.color} />;
   if (phaseIndex === 2) return <ExecutionFlow color={phase.color} />;
   if (phaseIndex === 3) return <BridgeLatencyTable color={phase.color} />;
+  if (phaseIndex === 4) return <ExecutionDashboard color={phase.color} />;
   if (phaseIndex === 5) return <SecurityChecklist color={phase.color} />;
   return null;
 }
@@ -838,7 +840,7 @@ function computeOverallProgress(phases) {
 // ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
 
 export default function ArbRoadmap() {
-  const [active, setActive] = useState(0);
+  const [active, setActive] = useState(4);
   const [hoveredMilestone, setHoveredMilestone] = useState(null);
   const [phaseData, setPhaseData] = useState(phases);
 
@@ -877,6 +879,13 @@ export default function ArbRoadmap() {
         ::-webkit-scrollbar-thumb { background: #2D3748; border-radius: 2px; }
         .phase-btn { transition: all 0.2s ease; cursor: pointer; border: none; background: none; }
         .phase-btn:hover { opacity: 1 !important; }
+        .row-flash-purple {
+          animation: flashPurple 1.5s cubic-bezier(0.25, 0.46, 0.45, 0.94) both;
+        }
+        @keyframes flashPurple {
+          0% { background-color: rgba(167, 139, 250, 0.22); }
+          100% { background-color: transparent; }
+        }
         .milestone-card { transition: all 0.18s ease; cursor: pointer; }
         .milestone-card:hover { transform: translateY(-1px); }
         .stack-tag { display: inline-block; }

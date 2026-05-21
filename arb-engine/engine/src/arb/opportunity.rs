@@ -42,6 +42,8 @@ pub struct ArbitrageOpportunity {
     pub estimated_gas_units: u64,
     /// EIP-1559 effective gas price in gwei (base fee + priority tip)
     pub gas_price_gwei: f64,
+    /// Maximum gas price we can bid (in gwei) while still achieving min_profit_usd
+    pub optimal_gas_price_gwei: f64,
     /// Total swap protocol fees across all hops (in input token wei)
     pub total_swap_fees_wei: U256,
     /// Aggregate price impact in basis points
@@ -107,6 +109,7 @@ impl ArbitrageOpportunity {
             gross_output,
             estimated_gas_units,
             gas_price_gwei,
+            optimal_gas_price_gwei: gas_price_gwei,
             total_swap_fees_wei,
             price_impact_bps,
             net_expected_value: 0,
@@ -136,8 +139,32 @@ impl ArbitrageOpportunity {
         // Use f64 throughout for NEV — precision is sufficient for USD comparisons
         // and avoids i128 overflow on scaled values.
         let scale = 10f64.powi(decimals as i32);
-        let gross_out = self.gross_output.low_u128() as f64 / scale;
-        let input_amt = self.input_amount.low_u128() as f64 / scale;
+
+        // Safely convert U256 → f64 without truncation via to_string parsing
+        let gross_out_raw = self.gross_output.to_string().parse::<f64>().unwrap_or(0.0);
+        let input_amt_raw = self.input_amount.to_string().parse::<f64>().unwrap_or(0.0);
+        let gross_out = gross_out_raw / scale;
+        let input_amt = input_amt_raw / scale;
+
+        // ── Sanity guards: reject simulation artifacts ────────────────────────
+        // Guard 1: Input amount must be < $100,000 USD (hard cap on flash loan size)
+        let input_usd = input_amt * token_price;
+        if input_usd > 100_000.0 {
+            tracing::debug!(id = %self.id, input_usd, "❌ Rejected: input > $100k (simulation artifact)");
+            self.net_expected_value = 0;
+            self.is_executable = false;
+            return;
+        }
+        // Guard 2: Gross profit percentage > 2% is unrealistic for a 2-hop cycle
+        let gross_profit_pct = if input_amt > 0.0 { (gross_out / input_amt - 1.0) * 100.0 } else { 0.0 };
+        if gross_profit_pct > 2.0 {
+            tracing::debug!(id = %self.id, gross_profit_pct, "❌ Rejected: gross profit > 2% (simulation artifact)");
+            self.net_expected_value = 0;
+            self.is_executable = false;
+            return;
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         let gross_profit_token = gross_out - input_amt;
 
         // Gas cost in token units (gas_wei × eth_price / token_price / 1e18)
@@ -145,7 +172,7 @@ impl ArbitrageOpportunity {
             * self.gas_price_gwei * 1e-9; // ETH
         let gas_cost_token = gas_cost_eth * eth_price_usd / token_price;
 
-        let swap_fees_token = self.total_swap_fees_wei.low_u128() as f64 / scale;
+        let swap_fees_token = self.total_swap_fees_wei.to_string().parse::<f64>().unwrap_or(0.0) / scale;
 
         let impact_loss_token = input_amt * self.price_impact_bps as f64 / 10_000.0;
 
@@ -158,8 +185,27 @@ impl ArbitrageOpportunity {
             - aave_fee_token;
 
         let nev_usd = nev_token * token_price;
-        // Store as wei-equivalent i128 for DB (scale back to 18-dec)
-        self.net_expected_value = (nev_token * 10f64.powi(18)) as i128;
+
+        // PGA: Calculate optimal gas price (bribe) to outbid competitors while hitting minimum profit
+        let max_gas_spend_usd = (gross_profit_token - swap_fees_token - impact_loss_token - aave_fee_token) * token_price - min_profit_usd;
+        if max_gas_spend_usd > 0.0 && self.estimated_gas_units > 0 {
+            let max_gas_spend_eth = max_gas_spend_usd / eth_price_usd;
+            self.optimal_gas_price_gwei = max_gas_spend_eth * 1e9 / (self.estimated_gas_units as f64);
+        } else {
+            self.optimal_gas_price_gwei = self.gas_price_gwei;
+        }
+
+        // Sanity guard 3: nev_usd > $10,000 is almost certainly a simulation artifact
+        if nev_usd > 10_000.0 {
+            tracing::debug!(id = %self.id, nev_usd, "❌ Rejected: NEV > $10k (simulation artifact)");
+            self.net_expected_value = 0;
+            self.is_executable = false;
+            return;
+        }
+
+        // Store as wei-equivalent i128 for DB (always in 18-dec regardless of token)
+        let nev_wei_f64 = nev_token * token_price / eth_price_usd * 1e18;
+        self.net_expected_value = nev_wei_f64.clamp(i128::MIN as f64, i128::MAX as f64) as i128;
         self.is_executable = nev_usd >= min_profit_usd;
 
         // Logging
@@ -169,6 +215,8 @@ impl ArbitrageOpportunity {
                 nev_usd = format!("${:.4}", nev_usd),
                 gross_usd = format!("${:.4}", gross_profit_token * token_price),
                 gas_usd = format!("${:.4}", gas_cost_token * token_price),
+                optimal_gas = format!("{:.1} gwei", self.optimal_gas_price_gwei),
+                input_usd = format!("${:.2}", input_usd),
                 hops = self.route.len(),
                 impact_bps = self.price_impact_bps,
                 "✅ EXECUTABLE arbitrage opportunity found"
@@ -200,6 +248,16 @@ impl ArbitrageOpportunity {
             .map(|s| format!("{} → {} ({})", s.token_in, s.token_out, s.dex))
             .collect::<Vec<_>>()
             .join(" | ")
+    }
+
+    /// Deterministic signature for deduplication in Redis.
+    /// Format: "route:{hop1_pool}:{hop1_in}:{hop1_out}|...:{input_amount}"
+    pub fn route_dedup_key(&self) -> String {
+        let mut keys = Vec::new();
+        for step in &self.route {
+            keys.push(format!("{}:{}:{}", step.pool_id, step.token_in, step.token_out));
+        }
+        format!("route:{}:{}", keys.join("|"), self.input_amount)
     }
 }
 

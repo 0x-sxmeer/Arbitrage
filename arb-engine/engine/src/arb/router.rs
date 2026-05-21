@@ -182,6 +182,33 @@ impl LiquidityGraph {
     /// Computes both directed edges (A→B and B→A) using a 1-unit probe swap.
     /// Edges with rate ≤ 0 or NaN are silently dropped.
     pub fn upsert_pool(&mut self, pool: Pool) {
+        // ── Minimum liquidity guard ───────────────────────────────────────────
+        // Reject dust pools that cannot support a meaningful trade.
+        // These cause repeated phantom high-impact BF cycles every block.
+        // Threshold: at least 1000 units (in token's native decimals) on each side.
+        // E.g. USDT (6 dec) → 1000 * 10^6 = $1000 minimum. ETH (18 dec) → 0.001 ETH minimum.
+        let min_v2_reserve = {
+            let dec_a = pool.token_a.decimals as u32;
+            let dec_b = pool.token_b.decimals as u32;
+            let thresh_a = U256::from(1000u64) * U256::from(10u64).pow(U256::from(dec_a));
+            let thresh_b = U256::from(1000u64) * U256::from(10u64).pow(U256::from(dec_b));
+            match pool.pool_type {
+                PoolType::ConcentratedLiquidity => {
+                    // V3: check sqrt_price non-zero and liquidity > 0
+                    pool.state.sqrt_price_x96.map_or(true, |p| p.is_zero())
+                        || pool.state.liquidity.map_or(true, |l| l == 0)
+                }
+                _ => {
+                    // V2: both reserves must be above threshold
+                    pool.state.reserve_a < thresh_a || pool.state.reserve_b < thresh_b
+                }
+            }
+        };
+        if min_v2_reserve {
+            debug!(pool_id = %pool.id, "upsert_pool: skipping dust/empty pool");
+            return;
+        }
+
         let pool_arc = Arc::new(pool);
         self.ensure_token(&pool_arc.token_a.address);
         self.ensure_token(&pool_arc.token_b.address);
@@ -416,6 +443,12 @@ impl LiquidityGraph {
             "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => config.btc_price_usd,
             _ => config.eth_price_usd,
         };
+        
+        let max_usd = 50_000.0;
+        let max_tokens = max_usd / start_price;
+        let hard_cap_18 = U256::from(max_tokens as u64) * U256::from(1_000_000_000_000_000_000u64);
+        let upper_bound = if upper_bound > hard_cap_18 { hard_cap_18 } else { upper_bound };
+        
         let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
         let gas_cost_scaled = U256::from((gas_cost_wei.low_u128() as f64 * config.eth_price_usd / start_price) as u128);
 
@@ -651,7 +684,7 @@ fn reconstruct_and_evaluate(
     }
 
     if graph.tokens[current_vertex] != cycle_entry_token {
-        debug!("BF cycle rejected: could not trace closed cycle");
+        tracing::trace!("BF cycle rejected: could not trace closed cycle");
         return None;
     }
 
@@ -667,7 +700,7 @@ fn reconstruct_and_evaluate(
     let first_in = &cycle_edges.first()?.token_in;
     let last_out = &cycle_edges.last()?.token_out;
     if first_in != &cycle_entry_token || last_out != &cycle_entry_token {
-        debug!(
+        tracing::trace!(
             "BF cycle rejected: not closed ({} → ... → {})",
             first_in, last_out
         );
@@ -681,7 +714,7 @@ fn reconstruct_and_evaluate(
         .collect::<Vec<_>>()
         .join("|");
     if !seen_cycles.insert(cycle_key.clone()) {
-        debug!("BF cycle deduplicated: {}", cycle_key);
+        tracing::trace!("BF cycle deduplicated: {}", cycle_key);
         return None;
     }
 
@@ -746,6 +779,12 @@ fn reconstruct_and_evaluate(
         "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => config.btc_price_usd,
         _ => config.eth_price_usd,
     };
+    
+    let max_usd = 50_000.0;
+    let max_tokens = max_usd / start_price;
+    let hard_cap_18 = U256::from(max_tokens as u64) * U256::from(1_000_000_000_000_000_000u64);
+    let upper_bound = if upper_bound > hard_cap_18 { hard_cap_18 } else { upper_bound };
+    
     let gas_cost_wei = U256::from((config.gas_estimate as f64 * config.gas_price_gwei * 1_000_000_000.0) as u128);
     let gas_cost_scaled = U256::from((gas_cost_wei.low_u128() as f64 * config.eth_price_usd / start_price) as u128);
 
@@ -764,7 +803,7 @@ fn reconstruct_and_evaluate(
     let optimal_amount_wei = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_scaled) {
         Some(opt) => opt.amount,
         None => {
-            debug!("BF cycle rejected: no profitable input size found after gas");
+            tracing::trace!("BF cycle rejected: no profitable input size found after gas");
             return None;
         }
     };
@@ -779,7 +818,7 @@ fn reconstruct_and_evaluate(
         let out = sim_out(&edge.pool, current_amount, zfo)?;
         let impact = sim_impact(&edge.pool, current_amount, zfo);
         if impact > config.max_price_impact_bps {
-            debug!("BF cycle rejected: price impact {} bps > limit at optimal amount", impact);
+            tracing::trace!("BF cycle rejected: price impact {} bps > limit at optimal amount", impact);
             return None;
         }
         swap_steps.push(SwapStep {

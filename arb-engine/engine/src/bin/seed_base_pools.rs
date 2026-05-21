@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
     info!("✓ pool_registry table ready");
 
     // Curated high-volume tokens on Base L2
-    let tokens = vec![
+    let mut tokens = vec![
         KnownToken { address: Address::from_str("0x4200000000000000000000000000000000000006").unwrap(), symbol: "WETH".to_string(), decimals: 18 },
         KnownToken { address: Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap(), symbol: "USDC".to_string(), decimals: 6 },
         KnownToken { address: Address::from_str("0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA").unwrap(), symbol: "USDbC".to_string(), decimals: 6 },
@@ -142,6 +142,52 @@ async fn main() -> Result<()> {
         KnownToken { address: Address::from_str("0x9a86b3531efa8040d346ffdc66d1f97a59f5b206").unwrap(), symbol: "KEYCAT".to_string(), decimals: 18 },
         KnownToken { address: Address::from_str("0xB3298Ee2578025345997804ee9386c9A70807B14").unwrap(), symbol: "MIGGLES".to_string(), decimals: 18 },
     ];
+
+    // ── Fetch Trending Tokens from GeckoTerminal ────────────────────────────
+    info!("📈 Fetching trending tokens on Base from GeckoTerminal...");
+    let client = reqwest::Client::new();
+    let res = client.get("https://api.geckoterminal.com/api/v2/networks/base/trending_pools")
+        .send()
+        .await;
+
+    if let Ok(response) = res {
+        if let Ok(json) = response.json::<serde_json::Value>().await {
+            if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                let mut added = 0;
+                for pool_data in data {
+                    if let Some(rel) = pool_data.get("relationships") {
+                        if let Some(base_token) = rel.get("base_token").and_then(|b| b.get("data")) {
+                            if let Some(id) = base_token.get("id").and_then(|i| i.as_str()) {
+                                // id format is usually "base_0x..."
+                                let parts: Vec<&str> = id.split('_').collect();
+                                let addr_str = if parts.len() > 1 { parts[1] } else { parts[0] };
+                                
+                                if let Ok(addr) = Address::from_str(addr_str) {
+                                    if !tokens.iter().any(|t| t.address == addr) {
+                                        let name = pool_data.get("attributes")
+                                            .and_then(|a| a.get("name"))
+                                            .and_then(|n| n.as_str())
+                                            .unwrap_or("MEME");
+                                        let symbol = name.split(" /").next().unwrap_or("MEME").to_string();
+                                        
+                                        tokens.push(KnownToken {
+                                            address: addr,
+                                            symbol,
+                                            decimals: 18, // Assume 18 for meme coins
+                                        });
+                                        added += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                info!("✓ Added {} trending low-cap tokens from GeckoTerminal", added);
+            }
+        }
+    } else {
+        warn!("⚠ Failed to fetch from GeckoTerminal. Proceeding with hardcoded tokens.");
+    }
 
     // Build the query tasks list for all pairs
     let mut tasks = Vec::new();

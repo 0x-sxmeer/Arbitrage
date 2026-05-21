@@ -62,6 +62,19 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// Returns true if both tokens in the pool are core assets.
+    pub fn is_core_pool(&self) -> bool {
+        let a = self.token_a.symbol.to_uppercase();
+        let b = self.token_b.symbol.to_uppercase();
+        let is_core = |sym: &str| {
+            matches!(
+                sym,
+                "WETH" | "USDC" | "USDT" | "USDBC" | "DAI" | "WBTC" | "ETH" | "BTC"
+            )
+        };
+        is_core(&a) && is_core(&b)
+    }
+
     /// Returns true if the pool state is older than `max_blocks` blocks.
     pub fn is_stale(&self, current_block: u64, max_blocks: u64) -> bool {
         current_block.saturating_sub(self.last_updated_block) > max_blocks

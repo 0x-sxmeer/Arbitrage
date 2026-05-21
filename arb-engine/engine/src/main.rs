@@ -191,254 +191,17 @@ async fn main() {
 
     // ── Pool warm-up from PostgreSQL ──────────────────────────────────────────
     if let Some(ref pg) = pg_store {
-        match warm_up_graph_from_postgres(pg, &graph, &metrics).await {
+        match warm_up_and_sync_pools_from_postgres(pg, &graph, &metrics, active_chain, evm_adapter.as_deref().unwrap()).await {
             Ok(count) => {
                 if count > 0 {
-                    info!("✓ Graph warmed up with {} pools from PostgreSQL", count);
+                    info!("✓ Warmed up and synced {} pools from PostgreSQL", count);
                 } else {
-                    info!("  (no pools in registry — graph starts empty)");
+                    info!("  (no pools in registry for {:?} — run `cargo run --bin seed-base-pools`)", active_chain.name());
                 }
             }
             Err(e) => {
                 warn!("⚠ Pool warm-up failed: {} — graph starts empty", e);
             }
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  🔥 LIVE MAINNET WARMUP: Fetch real-time pool states from Alchemy
-    //  This is the critical bridge between "Brain" and "Blockchain"
-    // ─────────────────────────────────────────────────────────────────────────
-    {
-        use crate::pool::{Pool, PoolType, PoolState, Token, DexProtocol};
-        use crate::pool::U256;
-        
-        // ── Token definitions (checksummed addresses) ─────────────────────────
-        // ── Base L2 token addresses (checksummed) ─────────────────────────────
-        // Base canonical bridged tokens — identical ERC-20 interfaces, L2 addresses
-        let weth = Token { address: "0x4200000000000000000000000000000000000006".to_lowercase(), symbol: "WETH".into(), decimals: 18 };
-        let usdc = Token { address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_lowercase(), symbol: "USDC".into(), decimals: 6 };
-        let wbtc = Token { address: "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c".to_lowercase(), symbol: "WBTC".into(), decimals: 8 };
-        let dai  = Token { address: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb".to_lowercase(), symbol: "DAI".into(),  decimals: 18 };
-        let usdt = Token { address: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2".to_lowercase(), symbol: "USDT".into(), decimals: 6 };
-
-        // ── Base L2 Pool Addresses ─────────────────────────────────────────────
-        // Highest TVL pools on Base — primary arbitrage battleground.
-        // Uniswap V3 (CLMM) + Aerodrome Finance V2 (constant product, the
-        // dominant AMM on Base with >$500M TVL) give us rich cross-DEX gaps.
-        struct PoolDef<'a> {
-            address:  &'a str,
-            token_a:  &'a Token,
-            token_b:  &'a Token,
-            fee_bps:  u32,
-            label:    &'a str,
-        }
-
-        let pools_to_sync = [
-            // Uniswap V3 on Base — top-volume CLMM pools
-            PoolDef { address: "0xd0b53D9277642d899DF5C87A3966A349A798F224", token_a: &weth, token_b: &usdc, fee_bps: 5,    label: "UniV3 USDC/WETH 0.05% (Base)" },
-            PoolDef { address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B5", token_a: &wbtc, token_b: &weth, fee_bps: 30,   label: "UniV3 WBTC/WETH 0.3% (Base)"  },
-            PoolDef { address: "0x6c561B446416E1A00E8E93E221854d6eA4171372", token_a: &dai,  token_b: &usdc, fee_bps: 1,    label: "UniV3 DAI/USDC 0.01% (Base)"  },
-            PoolDef { address: "0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef", token_a: &weth, token_b: &usdt, fee_bps: 5,    label: "UniV3 USDT/WETH 0.05% (Base)" },
-        ];
-
-        let evm = evm_adapter.as_ref().unwrap();
-        let mut synced = 0u32;
-        let mut failed = 0u32;
-
-        info!("  ⏳ Fetching live pool states from Alchemy ({} V3 pools)...", pools_to_sync.len());
-
-        let fetch_v3_futures = pools_to_sync.iter().map(|def| {
-            let evm = evm.clone();
-            let addr = def.address;
-            async move { (def, evm.get_v3_pool_state(addr).await) }
-        });
-        let v3_results = futures_util::future::join_all(fetch_v3_futures).await;
-
-        let mut g = graph.write().await;
-
-        for (def, result) in v3_results {
-            match result {
-                Ok((sqrt_price, tick, liq)) => {
-                    g.upsert_pool(Pool {
-                        id: def.address.to_lowercase(),
-                        chain: active_chain,
-                        dex: DexProtocol::UniswapV3,
-                        token_a: def.token_a.clone(),
-                        token_b: def.token_b.clone(),
-                        pool_type: PoolType::ConcentratedLiquidity,
-                        fee_bps: def.fee_bps,
-                        last_updated_block: 0,
-                        last_updated_ts: chrono::Utc::now().timestamp(),
-                        state: PoolState {
-                            reserve_a:      U256::zero(),
-                            reserve_b:      U256::zero(),
-                            sqrt_price_x96: Some(sqrt_price),
-                            tick:           Some(tick),
-                            liquidity:      Some(liq),
-                            amp_coeff:      None,
-                        },
-                    });
-                    synced += 1;
-                    info!(
-                        pool  = %def.label,
-                        tick  = tick,
-                        liq   = liq,
-                        "  ✓ {} synced",
-                        def.label
-                    );
-                }
-                Err(e) => {
-                    failed += 1;
-                    warn!(
-                        pool  = %def.label,
-                        error = %e,
-                        "  ⚠ {} fetch failed — using simulated state",
-                        def.label
-                    );
-                    // Insert with simulated defaults so the graph still has connectivity
-                    g.upsert_pool(Pool {
-                        id: def.address.to_lowercase(),
-                        chain: active_chain,
-                        dex: DexProtocol::UniswapV3,
-                        token_a: def.token_a.clone(),
-                        token_b: def.token_b.clone(),
-                        pool_type: PoolType::ConcentratedLiquidity,
-                        fee_bps: def.fee_bps,
-                        last_updated_block: 0,
-                        last_updated_ts: 0,
-                        state: PoolState {
-                            reserve_a:      U256::zero(),
-                            reserve_b:      U256::zero(),
-                            sqrt_price_x96: Some(U256::from(1_936_540_681_085_355_540_000_000_000_000u128)),
-                            tick:           Some(201_210),
-                            liquidity:      Some(12_345_678_901_234_567_890),
-                            amp_coeff:      None,
-                        },
-                    });
-                }
-            }
-        }
-        drop(g);
-
-        // ── Phase C: V2 SushiSwap pool warm-up ────────────────────────────────
-        // These are the highest-volume V2 pairs and the primary cross-DEX
-        // arbitrage targets against the Uniswap V3 pools above.
-        struct V2PoolDef<'a> {
-            address:  &'a str,
-            token_a:  &'a Token,
-            token_b:  &'a Token,
-            fee_bps:  u32,
-            dex:      DexProtocol,
-            label:    &'a str,
-        }
-
-        // Aerodrome Finance V2 on Base — the dominant V2 AMM on Base (>$500M TVL).
-        // These are the primary cross-DEX arb targets against Uniswap V3 above.
-        // Aerodrome uses a 0.3% fee (30 bps) identical to Uniswap V2 math.
-        let v2_pools = [
-            V2PoolDef { address: "0xcDAC0d6c6C59727a65F871236188350531885C43", token_a: &weth, token_b: &usdc, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDC/WETH (Base)" },
-            V2PoolDef { address: "0x27Be19afF47d30d3CEDC098E36844a657a8953AE", token_a: &wbtc, token_b: &weth, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero WBTC/WETH (Base)" },
-            V2PoolDef { address: "0x67b00B46FA4f4F24c03855c5C8013C0B938B3eEc", token_a: &dai,  token_b: &usdc, fee_bps: 5,  dex: DexProtocol::UniswapV2, label: "Aero DAI/USDC (Base)"  },
-            V2PoolDef { address: "0xFFD4Ec4BD2211cBFD58C209FdEcC65F63f2b9e4c", token_a: &weth, token_b: &usdt, fee_bps: 30, dex: DexProtocol::UniswapV2, label: "Aero USDT/WETH (Base)" },
-        ];
-
-        info!("  ⏳ Fetching live V2 pool states ({} pools)...", v2_pools.len());
-
-        let fetch_v2_futures = v2_pools.iter().map(|def| {
-            let evm = evm.clone();
-            let addr = def.address;
-            async move { (def, evm.get_v2_pool_state(addr).await) }
-        });
-        let v2_results = futures_util::future::join_all(fetch_v2_futures).await;
-
-        let mut g = graph.write().await;
-        for (def, result) in v2_results {
-            match result {
-                Ok((reserve0, reserve1)) => {
-                    let (reserve_a, reserve_b) = if def.token_a.address.to_lowercase() < def.token_b.address.to_lowercase() {
-                        (reserve0, reserve1)
-                    } else {
-                        (reserve1, reserve0)
-                    };
-                    g.upsert_pool(Pool {
-                        id: def.address.to_lowercase(),
-                        chain: active_chain,
-                        dex: def.dex.clone(),
-                        token_a: def.token_a.clone(),
-                        token_b: def.token_b.clone(),
-                        pool_type: PoolType::ConstantProduct,
-                        fee_bps: def.fee_bps,
-                        last_updated_block: 0,
-                        last_updated_ts: chrono::Utc::now().timestamp(),
-                        state: PoolState {
-                            reserve_a,
-                            reserve_b,
-                            sqrt_price_x96: None,
-                            tick:       None,
-                            liquidity:  None,
-                            amp_coeff:  None,
-                        },
-                    });
-                    synced += 1;
-                    info!(
-                        pool     = %def.label,
-                        reserve0 = %reserve0,
-                        reserve1 = %reserve1,
-                        "  ✓ {} synced (V2)",
-                        def.label
-                    );
-                }
-                Err(e) => {
-                    failed += 1;
-                    warn!(
-                        pool  = %def.label,
-                        error = %e,
-                        "  ⚠ {} V2 fetch failed — using simulated reserves",
-                        def.label
-                    );
-                    g.upsert_pool(Pool {
-                        id: def.address.to_lowercase(),
-                        chain: active_chain,
-                        dex: def.dex.clone(),
-                        token_a: def.token_a.clone(),
-                        token_b: def.token_b.clone(),
-                        pool_type: PoolType::ConstantProduct,
-                        fee_bps: def.fee_bps,
-                        last_updated_block: 0,
-                        last_updated_ts: 0,
-                        state: PoolState {
-                            reserve_a: if def.token_a.symbol == "WETH" {
-                                U256::from(1_000_000_000_000_000_000_000u128) // ~1000 WETH (18 dec)
-                            } else if def.token_a.symbol == "WBTC" {
-                                U256::from(10_000_000_000u128) // ~100 WBTC (8 dec)
-                            } else if def.token_a.symbol == "DAI" {
-                                U256::from(3_000_000_000_000_000_000_000_000u128) // ~3M DAI (18 dec)
-                            } else {
-                                U256::from(3_000_000_000_000u128) // ~3M stables (USDC/USDT, 6 dec)
-                            },
-                            reserve_b: if def.token_b.symbol == "WETH" {
-                                U256::from(1_000_000_000_000_000_000_000u128) // ~1000 WETH (18 dec)
-                            } else {
-                                U256::from(3_000_000_000_000u128) // ~3M stables (6 dec)
-                            },
-                            sqrt_price_x96: None,
-                            tick:       None,
-                            liquidity:  None,
-                            amp_coeff:  None,
-                        },
-                    });
-                }
-            }
-        }
-        
-        metrics.set_graph_pools(g.pool_count() as u64);
-        metrics.set_graph_tokens(g.token_count() as u64);
-
-        if failed == 0 {
-            info!("✓ All {} pools synchronized with LIVE mainnet prices via Alchemy!", synced);
-        } else {
-            warn!("⚠ {}/{} pools synced ({} failed — using simulated fallbacks)", synced, synced + failed, failed);
         }
     }
 
@@ -516,27 +279,67 @@ async fn main() {
 //  Pool warm-up — pre-loads pool registry from Postgres into the LiquidityGraph
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn warm_up_graph_from_postgres(
+async fn warm_up_and_sync_pools_from_postgres(
     pg: &Arc<PostgresStore>,
     graph: &Arc<RwLock<LiquidityGraph>>,
     metrics: &Arc<EngineMetrics>,
+    active_chain: crate::pool::ChainId,
+    evm: &EvmAdapter,
 ) -> anyhow::Result<usize> {
-    let pools = pg.list_pools().await?;
-    let count = pools.len();
+    let all_pools = pg.list_pools().await?;
+    let mut pools = Vec::new();
+    for p in all_pools {
+        if p.chain == active_chain {
+            pools.push(p);
+        }
+    }
 
-    if count == 0 {
+    if pools.is_empty() {
         return Ok(0);
     }
 
-    let mut graph = graph.write().await;
-    for pool in pools {
-        graph.upsert_pool(pool);
+    info!("  ⏳ Fetching live pool states for {} pools via Multicall3...", pools.len());
+
+    let mut synced = 0usize;
+    let mut failed = 0usize;
+    let mut g = graph.write().await;
+
+    // Process in chunks of 50 to avoid RPC timeouts
+    for chunk in pools.chunks(50) {
+        match evm.fetch_pool_states_multicall(chunk).await {
+            Ok(states) => {
+                for (i, state) in states.into_iter().enumerate() {
+                    let mut p = chunk[i].clone();
+                    
+                    let is_empty = match p.pool_type {
+                        crate::pool::PoolType::ConcentratedLiquidity => state.sqrt_price_x96.is_none() || state.liquidity.map_or(true, |l| l == 0),
+                        _ => state.reserve_a.is_zero() && state.reserve_b.is_zero(),
+                    };
+
+                    if is_empty {
+                        failed += 1;
+                        continue;
+                    }
+
+                    p.state = state;
+                    p.last_updated_ts = chrono::Utc::now().timestamp();
+                    g.upsert_pool(p);
+                    synced += 1;
+                }
+            }
+            Err(e) => {
+                warn!("⚠ Multicall chunk fetch failed: {}", e);
+                failed += chunk.len();
+            }
+        }
     }
 
-    metrics.set_graph_pools(count as u64);
-    metrics.set_graph_tokens(graph.token_count() as u64);
+    metrics.set_graph_pools(g.pool_count() as u64);
+    metrics.set_graph_tokens(g.token_count() as u64);
+    
+    info!("✓ Synced {} pools successfully ({} empty/failed)", synced, failed);
 
-    Ok(count)
+    Ok(synced)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

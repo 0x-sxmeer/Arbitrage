@@ -122,35 +122,47 @@ pub fn get_tick_at_sqrt_ratio(sqrt_price_x96: U256) -> Result<i32, &'static str>
 //  FullMath — 512-bit safe mulDiv
 // ─────────────────────────────────────────────────────────────────────────────
 
+use primitive_types::U512;
+
 /// floor(a * b / denominator) without intermediate overflow.
 #[inline]
 pub fn mul_div(a: U256, b: U256, denom: U256) -> Option<U256> {
     if denom.is_zero() { return None; }
-    match a.checked_mul(b) {
-        Some(product) => Some(product / denom),
-        None => {
-            // Fallback: (a/denom)*b + (a%denom)*b/denom
-            let q = a / denom;
-            let r = a % denom;
-            match r.checked_mul(b) {
-                Some(rb) => q.checked_mul(b)?.checked_add(rb / denom),
-                None => q.checked_mul(b),
-            }
-        }
+    let a512 = U512::from(a);
+    let b512 = U512::from(b);
+    let denom512 = U512::from(denom);
+    let res512 = (a512 * b512) / denom512;
+    if res512 > U512::from(U256::MAX) {
+        None
+    } else {
+        let mut bytes = [0u8; 64];
+        res512.to_big_endian(&mut bytes);
+        Some(U256::from_big_endian(&bytes[32..64]))
     }
 }
 
 /// ceil(a * b / denominator).
 #[inline]
 pub fn mul_div_rounding_up(a: U256, b: U256, denom: U256) -> Option<U256> {
-    let result = mul_div(a, b, denom)?;
-    // Check if there's a remainder
-    if let Some(product) = a.checked_mul(b) {
-        if product % denom != U256::zero() {
-            return result.checked_add(U256::from(1u64));
-        }
+    if denom.is_zero() { return None; }
+    let a512 = U512::from(a);
+    let b512 = U512::from(b);
+    let denom512 = U512::from(denom);
+    let product = a512 * b512;
+    let res512 = product / denom512;
+    let rem512 = product % denom512;
+    let final_res = if rem512 > U512::zero() {
+        res512 + U512::from(1)
+    } else {
+        res512
+    };
+    if final_res > U512::from(U256::MAX) {
+        None
+    } else {
+        let mut bytes = [0u8; 64];
+        final_res.to_big_endian(&mut bytes);
+        Some(U256::from_big_endian(&bytes[32..64]))
     }
-    Some(result)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -439,11 +451,16 @@ pub fn simulate_swap_single_range(
     let fee_pips = fee_bps * 100;
     if fee_pips >= 1_000_000 { return U256::zero(); }
 
-    // Target: MIN or MAX depending on direction
+    // Cap the single-range simulation to a 2% price movement (approx 1% sqrt price movement)
+    // to prevent the simulator from assuming infinite liquidity at a distorted price.
     let target = if zero_for_one {
-        U256::from(MIN_SQRT_RATIO) + U256::from(1u64)
+        let limit = (sqrt_price_x96 * U256::from(99u64)) / U256::from(100u64);
+        let min_ratio = U256::from(MIN_SQRT_RATIO) + U256::from(1u64);
+        if limit < min_ratio { min_ratio } else { limit }
     } else {
-        U256::from_str_radix(MAX_SQRT_RATIO_STR, 10).unwrap() - U256::from(1u64)
+        let limit = (sqrt_price_x96 * U256::from(101u64)) / U256::from(100u64);
+        let max_ratio = U256::from_str_radix(MAX_SQRT_RATIO_STR, 10).unwrap() - U256::from(1u64);
+        if limit > max_ratio { max_ratio } else { limit }
     };
 
     let (_next_sqrt, _amount_in, amount_out, _fee) = compute_swap_step(

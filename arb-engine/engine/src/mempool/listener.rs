@@ -65,6 +65,18 @@ use crate::mempool::calldata_decoder::{
 };
 use crate::metrics::EngineMetrics;
 use crate::pool::{ChainId, DexProtocol, Pool, PoolState, PoolType, Token, U256};
+use alloy::sol_types::SolEvent;
+
+alloy::sol! {
+    #[sol(rpc)]
+    interface IUniswapV2Pair {
+        event Sync(uint112 reserve0, uint112 reserve1);
+    }
+    #[sol(rpc)]
+    interface IUniswapV3PoolEvents {
+        event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick);
+    }
+}
 
 // ── Reconnect policy ──────────────────────────────────────────────────────────
 const INITIAL_RECONNECT_MS: u64 = 500;
@@ -269,7 +281,8 @@ impl MempoolListener {
             Err(e)    => warn!("Could not fetch block number: {}", e),
         }
 
-        let (abort_tx, mut abort_rx) = mpsc::channel::<()>(1);
+        let (abort_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let mut abort_rx = abort_tx.subscribe();
         let provider_check = provider.clone();
         let abort_tx_check = abort_tx.clone();
         tokio::spawn(async move {
@@ -281,7 +294,7 @@ impl MempoolListener {
                     }
                     _ => {
                         warn!("Health check failed or timed out! Forcing WebSocket reconnect...");
-                        let _ = abort_tx_check.send(()).await;
+                        let _ = abort_tx_check.send(());
                         break;
                     }
                 }
@@ -298,249 +311,20 @@ impl MempoolListener {
                     let g = graph_clone.read().await;
                     g.get_all_pools().map(|(_, p)| (**p).clone()).collect()
                 };
-                for pool in pools {
-                    if let Ok(state) = evm.fetch_pool_state(&pool).await {
-                        let mut p = pool.clone();
-                        p.state = state;
+                // Process in chunks to avoid rate limiting and speed up refresh
+                for chunk in pools.chunks(50) {
+                    if let Ok(states) = evm.fetch_pool_states_multicall(chunk).await {
                         let mut g = graph_clone.write().await;
-                        g.upsert_pool(p);
+                        for (i, state) in states.into_iter().enumerate() {
+                            let mut p = chunk[i].clone();
+                            p.state = state;
+                            g.upsert_pool(p);
+                        }
                     }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
             }
         });
-
-        let active_chain = if let Some(ref adapter) = self.evm_adapter {
-            adapter.chain()
-        } else {
-            ChainId::Base
-        };
-
-        let is_l2 = match active_chain {
-            ChainId::Base | ChainId::Arbitrum => true,
-            _ => false,
-        };
-
-        if is_l2 {
-            info!("⛓ L2 Chain detected ({:?}). Activating Block-based Real-Time Ingestion.", active_chain);
-            let sub = provider
-                .subscribe_blocks()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to subscribe to L2 blocks: {}", e))?;
-
-            let (tx_sender, tx_receiver) = mpsc::channel::<RawTxPayload>(CHANNEL_CAPACITY);
-            let tx_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
-            let mut worker_handles = Vec::with_capacity(WORKER_CONCURRENCY);
-
-            for _ in 0..WORKER_CONCURRENCY {
-                let receiver = Arc::clone(&tx_receiver);
-                let ctx      = self.make_worker_ctx();
-                let handle   = tokio::spawn(async move {
-                    loop {
-                        let payload = { receiver.lock().await.recv().await };
-                        match payload {
-                            Some(p) => ctx.process_payload(p).await,
-                            None    => break,
-                        }
-                    }
-                });
-                worker_handles.push(handle);
-            }
-
-            let mut stream = sub.into_stream();
-            let mut block_count: u64 = 0;
-
-            loop {
-                tokio::select! {
-                    maybe_block = stream.next() => {
-                        let block = match maybe_block {
-                            Some(b) => b,
-                            None => break,
-                        };
-                        block_count += 1;
-                        let block_number = block.inner.number;
-
-                        info!(block = block_number, "📦 New L2 block received — refreshing pool states!");
-
-                        let pools: Vec<Pool> = {
-                            let graph = self.graph.read().await;
-                            graph.get_all_pools().map(|(_, p)| (**p).clone()).collect()
-                        };
-
-                        let evm_adapter = match self.evm_adapter {
-                            Some(ref adapter) => Arc::clone(adapter),
-                            None => continue,
-                        };
-                        let graph_arc = Arc::clone(&self.graph);
-                        let metrics = Arc::clone(&self.metrics);
-                        let redis_cache = Arc::clone(&self.redis_cache);
-                        let pg_store = self.pg_store.clone();
-                        let router_config = self.router_config.clone();
-
-                        tokio::spawn(async move {
-                            let start_time = std::time::Instant::now();
-                            let mut futures = Vec::new();
-                            for pool in pools {
-                                let evm = Arc::clone(&evm_adapter);
-                                futures.push(async move {
-                                    match evm.fetch_pool_state(&pool).await {
-                                        Ok(state) => {
-                                            let mut p = pool;
-                                            p.state = state;
-                                            p.last_updated_block = block_number;
-                                            p.last_updated_ts = chrono::Utc::now().timestamp();
-                                            Some(p)
-                                        }
-                                        Err(e) => {
-                                            debug!("Failed to fetch state for pool {}: {}", pool.id, e);
-                                            None
-                                        }
-                                    }
-                                });
-                            }
-
-                            let results = futures_util::future::join_all(futures).await;
-                            let mut updated_count = 0;
-
-                            let mut g = graph_arc.write().await;
-                            for pool_opt in results {
-                                if let Some(p) = pool_opt {
-                                    g.upsert_pool(p);
-                                    updated_count += 1;
-                                }
-                            }
-                            drop(g);
-
-                            debug!("Refreshed {} pool states in {:?}", updated_count, start_time.elapsed());
-
-                            // Tick metrics to make UI glow
-                            metrics.inc_txs_seen();
-                            metrics.inc_txs_filtered();
-                            metrics.inc_txs_decoded();
-
-                            // Visual visual green Emerald Row in the dashboard showing sync status!
-                            let tokens = [
-                                ("0x4200000000000000000000000000000000000006", "WETH"),
-                                ("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "USDC"),
-                                ("0x0555e30da8f98308edb960aa94c0db47230d2b9c", "WBTC"),
-                                ("0x50c5725949a6f0c72e6c4a641f24049a917db0cb", "DAI"),
-                                ("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2", "USDT"),
-                            ];
-                            let r_idx = block_number as usize;
-                            let sym_in = tokens[r_idx % tokens.len()].1;
-                            let sym_out = tokens[(r_idx + 1) % tokens.len()].1;
-                            let size = 15.0 + (block_number % 85) as f64 * 3.5;
-                            let hash = format!("0x{:04x}base{}", block_number, block_number);
-
-                            if let Ok(mut txs) = metrics.recent_mempool_txs.try_write() {
-                                let entry = serde_json::json!({
-                                    "id":      block_number,
-                                    "hash":    &hash[..12.min(hash.len())],
-                                    "type":    "BLOCK_SYNC",
-                                    "dex":     "Base L2 Block",
-                                    "token":   format!("{}/{}", sym_in, sym_out),
-                                    "size":    format!("${:.1}k", size),
-                                    "color":   "#10B981", // Emerald Green
-                                    "gasGwei": "0.15",
-                                    "ts": std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis(),
-                                });
-                                txs.push_front(entry);
-                                if txs.len() > 50 { txs.pop_back(); }
-                            }
-
-                            // Run the pathfinder scan!
-                            let start_tokens = [
-                                "0x4200000000000000000000000000000000000006", // WETH
-                                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
-                                "0x0555e30da8f98308edb960aa94c0db47230d2b9c", // WBTC
-                            ];
-
-                            let mut config = router_config.clone();
-                            config.gas_price_gwei = 0.15;
-                            metrics.inc_router_scans();
-
-                            let opportunities = {
-                                let graph = graph_arc.read().await;
-                                let mut opps = Vec::new();
-                                for start_token in start_tokens {
-                                    opps.extend(graph.find_opportunities(start_token, &config));
-                                }
-                                opps.extend(find_arbitrage_cycles(&graph, &config));
-                                opps
-                            };
-
-                            {
-                                let mut graph = graph_arc.write().await;
-                                reset_changed_tokens(&mut graph);
-                            }
-
-                            for opp in opportunities {
-                                metrics.inc_opportunities_found();
-                                if !opp.is_executable { continue; }
-                                metrics.inc_opportunities_executable();
-
-                                info!(
-                                    id      = %opp.id,
-                                    nev_wei = opp.net_expected_value,
-                                    route   = %opp.route_description(),
-                                    hops    = opp.route.len(),
-                                    "🚀 Executable L2 block arbitrage opportunity found!"
-                                );
-
-                                let is_new = redis_cache
-                                    .mark_opportunity_seen(&opp.id.to_string())
-                                    .await
-                                    .unwrap_or(true);
-                                if !is_new { continue; }
-
-                                if let Some(ref pg) = pg_store {
-                                    let _ = pg.insert_opportunity(&opp).await;
-                                }
-
-                                match evm_adapter.simulate_arbitrage(&opp).await {
-                                    Ok(()) => {
-                                        info!(id = %opp.id, "✓ Block simulation passed");
-                                        let adapter_clone = Arc::clone(&evm_adapter);
-                                        let opp_clone = opp.clone();
-                                        tokio::spawn(async move {
-                                            match adapter_clone.execute_arbitrage(&opp_clone).await {
-                                                Ok(()) => info!(id = %opp_clone.id, "✅ Block execution completed"),
-                                                Err(e) => error!(id = %opp_clone.id, error = %e, "❌ Block execution failed"),
-                                            }
-                                        });
-                                    }
-                                    Err(e) => {
-                                        warn!(id = %opp.id, error = %e, "❌ Simulation failed");
-                                    }
-                                }
-                            }
-                        });
-
-                        if block_count % 10 == 0 {
-                            let graph = self.graph.read().await;
-                            self.metrics.set_graph_pools(graph.pool_count() as u64);
-                            self.metrics.set_graph_tokens(graph.token_count() as u64);
-                            drop(graph);
-                            self.metrics.log_summary();
-                        }
-                    }
-                    _ = abort_rx.recv() => {
-                        anyhow::bail!("WebSocket connection health check failed. Aborting L2 stream.");
-                    }
-                }
-            }
-
-            drop(tx_sender);
-            for h in worker_handles { let _ = h.await; }
-            return Ok(());
-        }
-
-        let sub = provider
-            .subscribe_pending_transactions()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to subscribe to pending txs: {}", e))?;
 
         let (tx_sender, tx_receiver) = mpsc::channel::<RawTxPayload>(CHANNEL_CAPACITY);
         let tx_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
@@ -561,65 +345,319 @@ impl MempoolListener {
             worker_handles.push(handle);
         }
 
-        // ── FIX-4: Dashboard telemetry feed — reads from metrics ONLY ─────────
-        //
-        // The original background task wrote fake pool state into the production
-        // LiquidityGraph, causing phantom arbitrage signals.  This replacement
-        // writes only to `metrics.recent_mempool_txs` (the dashboard ring-buffer)
-        // and never touches the graph.
-        {
-            let metrics = Arc::clone(&self.metrics);
-            let tokens = [
-                ("0x4200000000000000000000000000000000000006", "WETH"),
-                ("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "USDC"),
-                ("0x0555e30da8f98308edb960aa94c0db47230d2b9c", "WBTC"),
-                ("0x50c5725949a6f0c72e6c4a641f24049a917db0cb", "DAI"),
-                ("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2", "USDT"),
-            ];
+        let active_chain = if let Some(ref adapter) = self.evm_adapter {
+            adapter.chain()
+        } else {
+            ChainId::Base
+        };
+
+
+        let is_l2 = match active_chain {
+            ChainId::Base | ChainId::Arbitrum => true,
+            _ => false,
+        };
+
+        if is_l2 {
+            info!("⛓ L2 Chain detected ({:?}). Activating Block-based Real-Time Ingestion.", active_chain);
+            let sub = provider
+                .subscribe_blocks()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to subscribe to L2 blocks: {}", e))?;
+
+            let mut stream = sub.into_stream();
+            let mut abort_rx_l2 = abort_tx.subscribe();
+            let self_clone = self.clone();
+            let tx_sender_l2 = tx_sender.clone();
+            let rpc_url_l2 = self.ws_url.clone();
 
             tokio::spawn(async move {
-                let mut sim_count = 0u64;
-                let mut interval  = tokio::time::interval(Duration::from_millis(800));
+                let provider_l2 = ProviderBuilder::new().on_ws(WsConnect::new(&rpc_url_l2)).await;
+                if let Ok(provider_l2) = provider_l2 {
+                    let mut block_count: u64 = 0;
+
                 loop {
-                    interval.tick().await;
-                    sim_count += 1;
+                    tokio::select! {
+                        maybe_block = stream.next() => {
+                            let block = match maybe_block {
+                                Some(b) => b,
+                                None => break,
+                            };
+                            block_count += 1;
+                            let block_number = block.inner.number;
 
-                    let sym_in  = tokens[sim_count as usize % tokens.len()].1;
-                    let sym_out = tokens[(sim_count as usize + 1) % tokens.len()].1;
-                    let gas     = 20.0 + (sim_count % 12) as f64 * 1.2;
-                    let size    = 25.0 + (sim_count % 75) as f64 * 4.5;
-                    let hash    = format!("0x{:04x}sim{}", sim_count, sim_count);
+                            info!(block = block_number, "📦 New L2 block received — refreshing pool states!");
 
-                    // Write only to the dashboard ring-buffer, never to the graph
-                    if let Ok(mut txs) = metrics.recent_mempool_txs.try_write() {
-                        let entry = serde_json::json!({
-                            "id":      sim_count,
-                            "hash":    &hash[..12.min(hash.len())],
-                            "type":    "SWAP",
-                            "dex":     "Uniswap V3",
-                            "token":   format!("{}/{}", sym_in, sym_out),
-                            "size":    format!("${:.1}k", size),
-                            "color":   "#00FFD1",
-                            "gasGwei": format!("{:.1}", gas),
-                            "ts": std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis(),
-                        });
-                        txs.push_front(entry);
-                        if txs.len() > 50 { txs.pop_back(); }
+                            let pools: Vec<Pool> = {
+                                let graph = self_clone.graph.read().await;
+                                graph
+                                    .get_all_pools()
+                                    .map(|(_, p)| (**p).clone())
+                                    .filter(|p| p.is_core_pool() || block_number % 15 == 0)
+                                    .collect()
+                            };
+
+                            let evm_adapter = match self_clone.evm_adapter {
+                                Some(ref adapter) => Arc::clone(adapter),
+                                None => continue,
+                            };
+                            let graph_arc = Arc::clone(&self_clone.graph);
+                            let metrics = Arc::clone(&self_clone.metrics);
+                            let redis_cache = Arc::clone(&self_clone.redis_cache);
+                            let pg_store = self_clone.pg_store.clone();
+                            let router_config = self_clone.router_config.clone();
+
+                            let provider_l2 = provider_l2.clone();
+                            let tx_sender_l2 = tx_sender_l2.clone();
+
+                            tokio::spawn(async move {
+                                let start_time = std::time::Instant::now();
+                                let mut updated_count = 0;
+                                if let Ok(states) = evm_adapter.fetch_pool_states_multicall(&pools).await {
+                                    let mut g = graph_arc.write().await;
+                                    for (i, state) in states.into_iter().enumerate() {
+                                        let mut p = pools[i].clone();
+                                        p.state = state;
+                                        p.last_updated_block = block_number;
+                                        p.last_updated_ts = chrono::Utc::now().timestamp();
+                                        g.upsert_pool(p);
+                                        updated_count += 1;
+                                    }
+                                }
+
+                                debug!("Refreshed {} pool states in {:?}", updated_count, start_time.elapsed());
+
+                                // Tick metrics to make UI glow
+                                metrics.inc_txs_seen();
+                                metrics.inc_txs_filtered();
+                                metrics.inc_txs_decoded();
+
+                                // Push a real BLOCK_SYNC event to the dashboard
+                                if let Ok(mut txs) = metrics.recent_mempool_txs.try_write() {
+                                    let hash = format!("BLOCK #{}", block_number);
+                                    let entry = serde_json::json!({
+                                        "id":      block_number,
+                                        "hash":    hash,
+                                        "type":    "BLOCK_SYNC",
+                                        "dex":     "Base L2",
+                                        "token":   format!("{} pools", updated_count),
+                                        "size":    "L2 Sync",
+                                        "color":   "#10B981", 
+                                        "gasGwei": "-",
+                                        "ts": std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis(),
+                                    });
+                                    txs.push_front(entry);
+                                    if txs.len() > 50 { txs.pop_back(); }
+                                }
+
+                                // Run the pathfinder scan!
+                                let start_tokens = [
+                                    "0x4200000000000000000000000000000000000006", // WETH
+                                    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
+                                    "0x0555e30da8f98308edb960aa94c0db47230d2b9c", // WBTC
+                                ];
+
+                                let mut config = router_config.clone();
+                                config.gas_price_gwei = 0.15;
+                                metrics.inc_router_scans();
+
+                                // -- Inject block txs into the worker pipeline --
+                                use alloy::providers::Provider;
+                                if let Ok(Some(full_block)) = provider_l2.get_block_by_number(block_number.into(), alloy::rpc::types::BlockTransactionsKind::Full).await {
+                                    if let alloy::rpc::types::BlockTransactions::Full(txs) = full_block.transactions {
+                                        tracing::info!("📦 Block {} has {} full txs", block_number, txs.len());
+                                        for (i, tx) in txs.into_iter().enumerate() {
+                                            use alloy::consensus::Transaction;
+                                            let to_addr = match tx.inner.to() {
+                                                Some(addr) => addr.to_string().to_lowercase(),
+                                                None => continue,
+                                            };
+                                            
+                                            let tx_hash = tx.inner.tx_hash().to_string();
+                                            let gas_price_gwei = tx.inner.gas_price()
+                                                .map(|g| g as f64 / 1e9)
+                                                .unwrap_or_else(|| tx.inner.max_fee_per_gas() as f64 / 1e9);
+                                            
+                                            // DEBUG
+                                            if i < 5 {
+                                                tracing::debug!("DEBUG: tx to_addr is: '{}'", to_addr);
+                                            }
+                                                
+                                            let payload = RawTxPayload {
+                                                to_addr,
+                                                input: tx.inner.input().to_vec(),
+                                                value: tx.inner.value().to::<u128>(),
+                                                gas_price_gwei,
+                                                tx_hash,
+                                                tx_count: 0,
+                                            };
+                                            let _ = tx_sender_l2.send(payload).await;
+                                        }
+                                    } else {
+                                        tracing::warn!("⚠️ Block {} did NOT return full txs!", block_number);
+                                    }
+                                }
+
+                                let opportunities = {
+                                    let graph = graph_arc.read().await;
+                                    let mut opps = Vec::new();
+                                    for start_token in start_tokens {
+                                        opps.extend(graph.find_opportunities(start_token, &config));
+                                    }
+                                    opps.extend(find_arbitrage_cycles(&graph, &config));
+                                    opps.sort_by(|a, b| b.net_expected_value.cmp(&a.net_expected_value));
+                                    opps.truncate(3);
+                                    opps
+                                };
+
+                                {
+                                    let mut graph = graph_arc.write().await;
+                                    reset_changed_tokens(&mut graph);
+                                }
+
+                                for opp in opportunities {
+                                    metrics.inc_opportunities_found();
+                                    metrics.add_recent_opportunity(&opp, router_config.eth_price_usd, router_config.btc_price_usd).await;
+                                    if !opp.is_executable { continue; }
+                                    metrics.inc_opportunities_executable();
+
+                                    info!(
+                                        id      = %opp.id,
+                                        nev_wei = opp.net_expected_value,
+                                        route   = %opp.route_description(),
+                                        hops    = opp.route.len(),
+                                        "🚀 Executable L2 block arbitrage opportunity found!"
+                                    );
+
+                                    let is_new = redis_cache
+                                        .mark_opportunity_seen(&opp.route_dedup_key())
+                                        .await
+                                        .unwrap_or(true);
+                                    if !is_new { continue; }
+
+                                    if let Some(ref pg) = pg_store {
+                                        let _ = pg.insert_opportunity(&opp).await;
+                                    }
+
+                                    match evm_adapter.simulate_arbitrage(&opp).await {
+                                        Ok(()) => {
+                                            info!(id = %opp.id, "✓ Block simulation passed");
+                                            let adapter_clone = Arc::clone(&evm_adapter);
+                                            let opp_clone = opp.clone();
+                                            tokio::spawn(async move {
+                                                match adapter_clone.execute_arbitrage(&opp_clone).await {
+                                                    Ok(()) => info!(id = %opp_clone.id, "✅ Block execution completed"),
+                                                    Err(e) => error!(id = %opp_clone.id, error = %e, "❌ Block execution failed"),
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            warn!(id = %opp.id, error = %e, "❌ Simulation failed");
+                                        }
+                                    }
+                                }
+                            });
+
+                            if block_count % 10 == 0 {
+                                let graph = self_clone.graph.read().await;
+                                self_clone.metrics.set_graph_pools(graph.pool_count() as u64);
+                                self_clone.metrics.set_graph_tokens(graph.token_count() as u64);
+                                drop(graph);
+                                self_clone.metrics.log_summary();
+                            }
+                        }
+                        _ = abort_rx_l2.recv() => {
+                            warn!("WebSocket connection health check failed. Aborting L2 block stream.");
+                            break;
+                        }
                     }
+                }
                 }
             });
         }
 
+        let sub = provider
+            .subscribe_pending_transactions()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to subscribe to pending txs: {}", e))?;
+
+        let pool_addresses: Vec<alloy::primitives::Address> = {
+            let g = self.graph.read().await;
+            g.get_all_pools().filter_map(|(_, p)| alloy::primitives::Address::from_str(&p.id).ok()).collect()
+        };
+        
+        let filter = alloy::rpc::types::Filter::new()
+            .address(pool_addresses)
+            .event_signature(vec![
+                IUniswapV2Pair::Sync::SIGNATURE_HASH,
+                IUniswapV3PoolEvents::Swap::SIGNATURE_HASH,
+            ]);
+            
+        let log_sub = provider
+            .subscribe_logs(&filter)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to subscribe to logs: {}", e))?;
+
         // ── Producer: stream pending tx hashes ────────────────────────────────
         let mut stream = sub.into_stream();
+        let mut log_stream = log_sub.into_stream();
         let mut tx_count: u64 = 0;
         let mut gas_ewa: f64  = 20.0;
 
         loop {
             tokio::select! {
+                maybe_log = log_stream.next() => {
+                    let log = match maybe_log {
+                        Some(l) => l,
+                        None => break,
+                    };
+                    
+                    let address_str = log.address().to_string().to_lowercase();
+                    
+                    // Decode Sync or Swap events
+                    let mut g = self.graph.write().await;
+                    if let Some(mut p_ref) = g.get_pool(&address_str).map(|p| (**p).clone()) {
+                        let mut state_changed = false;
+                        
+                        if let Ok(sync_event) = IUniswapV2Pair::Sync::decode_log(&log.inner, true) {
+                            p_ref.state.reserve_a = U256::from_dec_str(&sync_event.reserve0.to_string()).unwrap_or_default();
+                            p_ref.state.reserve_b = U256::from_dec_str(&sync_event.reserve1.to_string()).unwrap_or_default();
+                            state_changed = true;
+                        } else if let Ok(swap_event) = IUniswapV3PoolEvents::Swap::decode_log(&log.inner, true) {
+                            p_ref.state.sqrt_price_x96 = Some(U256::from_dec_str(&swap_event.sqrtPriceX96.to_string()).unwrap_or_default());
+                            p_ref.state.liquidity = Some(swap_event.liquidity);
+                            p_ref.state.tick = Some(swap_event.tick.to_string().parse::<i32>().unwrap_or(0));
+                            state_changed = true;
+                        }
+
+                        if state_changed {
+                            p_ref.last_updated_ts = chrono::Utc::now().timestamp();
+                            g.upsert_pool(p_ref);
+                            
+                            // Optional: dispatch event to dashboard
+                            if let Ok(mut txs) = self.metrics.recent_mempool_txs.try_write() {
+                                let entry = serde_json::json!({
+                                    "id":      chrono::Utc::now().timestamp_millis(),
+                                    "hash":    format!("LOG EVENT"),
+                                    "type":    "POOL_SYNC",
+                                    "dex":     "Base L2",
+                                    "token":   address_str[..8].to_string(),
+                                    "size":    "-",
+                                    "color":   "#F59E0B",
+                                    "gasGwei": "-",
+                                    "ts": std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis(),
+                                });
+                                txs.push_front(entry);
+                                if txs.len() > 50 { txs.pop_back(); }
+                            }
+                        }
+                    }
+                }
                 maybe_hash = stream.next() => {
                     let raw_hash = match maybe_hash {
                         Some(h) => h,
@@ -738,13 +776,17 @@ struct WorkerCtx {
 impl WorkerCtx {
     async fn process_payload(&self, payload: RawTxPayload) {
         if !is_known_dex_router(&payload.to_addr) { return; }
+        
+        let sel = if payload.input.len() >= 4 { &payload.input[0..4] } else { &[] };
+        debug!("Payload for known router {} with selector {:x?}", payload.to_addr, sel);
+
         self.metrics.inc_txs_filtered();
         if payload.input.len() < 4 { return; }
 
         let decoded = match decode_swap(&payload.input, &payload.to_addr) {
             Some(d) => d,
             None    => {
-                debug!("Calldata decode failed for {}", payload.tx_hash);
+                debug!("Calldata decode failed for {} (router: {}, selector: {:x?})", payload.tx_hash, payload.to_addr, sel);
                 return;
             }
         };
@@ -768,6 +810,44 @@ impl WorkerCtx {
             gas_gwei  = payload.gas_price_gwei,
             "🔍 Decoded swap — running pathfinder"
         );
+
+        let hash_short = if payload.tx_hash.len() > 10 {
+            format!("{}…{}", &payload.tx_hash[0..6], &payload.tx_hash[payload.tx_hash.len()-4..])
+        } else {
+            payload.tx_hash.clone()
+        };
+        let token_symbol = match token_in.as_str() {
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC",
+            "0x4200000000000000000000000000000000000006" => "WETH",
+            "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => "DAI",
+            "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b" => "VIRTUAL",
+            "0x532f27101965dd16442e59d40670faf5abe12269" => "AERO",
+            "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => "WBTC",
+            _ => "Token"
+        };
+        
+        let type_label = if payload.tx_count == 0 { "SWAP" } else { "PENDING" };
+        let color = if payload.tx_count == 0 { "#3B82F6" } else { "#8B5CF6" };
+
+        if let Ok(mut txs) = self.metrics.recent_mempool_txs.try_write() {
+            let entry = serde_json::json!({
+                "id":      payload.tx_count,
+                "hash":    hash_short,
+                "type":    type_label,
+                "dex":     format!("{:?}", decoded.dex_version),
+                "token":   token_symbol,
+                "size":    format!("{:.4}", amount_in.to_string().parse::<f64>().unwrap_or(0.0) / 1e18),
+                "color":   color,
+                "gasGwei": format!("{:.2}", payload.gas_price_gwei),
+                "ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            });
+            txs.push_front(entry);
+            if txs.len() > 50 { txs.pop_back(); }
+        }
+
 
         self.evaluate_arb_opportunity(
             &token_in,
@@ -815,6 +895,8 @@ impl WorkerCtx {
         };
 
         // ── Step 2: Resolve pool ──────────────────────────────────────────────
+        // CRITICAL FIX: Placeholder pools with fake state must NEVER enter the graph.
+        // Only pools with successfully fetched on-chain state are upserted.
         let mut pool = match cached_pool {
             Some(p) => p,
             None => {
@@ -832,6 +914,7 @@ impl WorkerCtx {
                 };
 
                 if let Some(ref adapter) = self.evm_adapter {
+                    // Build a base pool struct so we have an address to call
                     let base_pool = graph_pool.unwrap_or_else(|| {
                         build_placeholder_pool(token_in, token_out, fee_bps, active_chain)
                     });
@@ -850,14 +933,20 @@ impl WorkerCtx {
                             p
                         }
                         Err(e) => {
-                            debug!("On-chain fetch failed ({}), using placeholder", e);
-                            build_placeholder_pool(token_in, token_out, fee_bps, active_chain)
+                            // On-chain fetch failed — do NOT use placeholder.
+                            // Skip this transaction entirely rather than poison the graph.
+                            debug!("On-chain fetch failed for {}/{} fee={}: {} — skipping tx", token_in, token_out, fee_bps, e);
+                            return;
                         }
                     }
                 } else {
-                    graph_pool.unwrap_or_else(|| {
-                        build_placeholder_pool(token_in, token_out, fee_bps, active_chain)
-                    })
+                    match graph_pool {
+                        Some(p) => p,
+                        None => {
+                            debug!("No EVM adapter and no graph pool for {}/{} — skipping tx", token_in, token_out);
+                            return;
+                        }
+                    }
                 }
             }
         };
@@ -924,6 +1013,8 @@ impl WorkerCtx {
                 opps.extend(graph.find_opportunities(start_token, &config));
             }
             opps.extend(find_arbitrage_cycles(&graph, &config));
+            opps.sort_by(|a, b| b.net_expected_value.cmp(&a.net_expected_value));
+            opps.truncate(3);
             opps
             // read lock dropped here
         };
@@ -939,6 +1030,7 @@ impl WorkerCtx {
         // ── Step 5: Handle each opportunity ───────────────────────────────────
         for opp in opportunities {
             self.metrics.inc_opportunities_found();
+            self.metrics.add_recent_opportunity(&opp, self.router_config.eth_price_usd, self.router_config.btc_price_usd).await;
             if !opp.is_executable { continue; }
             self.metrics.inc_opportunities_executable();
 
@@ -951,7 +1043,7 @@ impl WorkerCtx {
             );
 
             let is_new = self.redis_cache
-                .mark_opportunity_seen(&opp.id.to_string())
+                .mark_opportunity_seen(&opp.route_dedup_key())
                 .await
                 .unwrap_or(true);
             if !is_new { continue; }

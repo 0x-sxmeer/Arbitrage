@@ -555,13 +555,14 @@ pub fn classify_router(addr: &str) -> DexVersion {
 
 /// Check if an address belongs to any known EVM DEX router.
 pub fn is_known_dex_router(addr: &str) -> bool {
-    classify_router(addr) != DexVersion::Unknown
+    classify_router(&addr.to_lowercase()) != DexVersion::Unknown
 }
 
 /// Specifically detect Uniswap V3 (or compatible) routers.
 pub fn is_uniswap_router(addr: &str) -> bool {
+    let lower = addr.to_lowercase();
     matches!(
-        addr,
+        lower.as_str(),
         RouterRegistry::UNISWAP_V3_ROUTER_V1
             | RouterRegistry::UNISWAP_V3_ROUTER_V2
             | RouterRegistry::UNISWAP_V3_ROUTER_BASE

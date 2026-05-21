@@ -82,31 +82,24 @@ const Q128_SHIFT: u32 = 128;
 ///
 /// Panics if denominator is zero.  Returns None if result > U256::MAX.
 /// For our use-case (amounts < 2^128, Q96 denominators < 2^128) the result
-/// always fits in a U256.
+use primitive_types::U512;
+
+/// Calculates (a * b) / denominator with 512-bit precision.
+/// This prevents intermediate overflow when a * b exceeds 256 bits,
+/// ensuring accurate swap outputs for large liquidity/price swings.
 #[inline]
 fn full_mul_div(a: U256, b: U256, denominator: U256) -> Option<U256> {
-    if denominator.is_zero() {
-        return None;
-    }
-
-    // Uniswap's FullMath algorithm uses 512-bit phantom math.
-    // We exploit the fact that primitive_types U256 gives us 256-bit mul,
-    // and for our domain (amounts ≤ 2^128, ratios ≤ Q96 = 2^96) the product
-    // a*b fits in 256 bits almost always.  When it would overflow, we use the
-    // equivalent "multiply-then-divide" with intermediate truncation, which
-    // introduces at most 1 ULP error (acceptable for NEV estimation).
-    match a.checked_mul(b) {
-        Some(product) => Some(product / denominator),
-        None => {
-            // Fallback: compute as (a / denominator) * b + (a % denominator * b / denominator)
-            // This is safe for our ranges.
-            let q = a / denominator;
-            let r = a % denominator;
-            match r.checked_mul(b) {
-                Some(rb) => q.checked_mul(b)?.checked_add(rb / denominator),
-                None     => q.checked_mul(b), // best-effort truncation
-            }
-        }
+    if denominator.is_zero() { return None; }
+    let a512 = U512::from(a);
+    let b512 = U512::from(b);
+    let denom512 = U512::from(denominator);
+    let res512 = (a512 * b512) / denom512;
+    if res512 > U512::from(U256::MAX) {
+        None
+    } else {
+        let mut bytes = [0u8; 64];
+        res512.to_big_endian(&mut bytes);
+        Some(U256::from_big_endian(&bytes[32..64]))
     }
 }
 
@@ -387,12 +380,26 @@ impl Pool {
     /// Only operates on `ConcentratedLiquidity` pools.
     /// Uses integer Q64.96 math — no floating-point.
     pub fn simulate_swap(&mut self, token_in: String, amount_in: U256) {
-        if self.pool_type != crate::pool::PoolType::ConcentratedLiquidity {
-            return;
-        }
         if amount_in.is_zero() { return; }
 
         let zero_for_one = token_in.to_lowercase() == self.token_a.address.to_lowercase();
+
+        if self.pool_type == crate::pool::PoolType::ConstantProduct {
+            if let Ok(amount_out) = crate::pool::v2::get_amount_out(self, amount_in, zero_for_one) {
+                if zero_for_one {
+                    self.state.reserve_a = self.state.reserve_a.saturating_add(amount_in);
+                    self.state.reserve_b = self.state.reserve_b.saturating_sub(amount_out);
+                } else {
+                    self.state.reserve_b = self.state.reserve_b.saturating_add(amount_in);
+                    self.state.reserve_a = self.state.reserve_a.saturating_sub(amount_out);
+                }
+            }
+            return;
+        }
+
+        if self.pool_type != crate::pool::PoolType::ConcentratedLiquidity {
+            return;
+        }
 
         let (Some(sqrt_price_x96), Some(liquidity)) =
             (self.state.sqrt_price_x96, self.state.liquidity)
