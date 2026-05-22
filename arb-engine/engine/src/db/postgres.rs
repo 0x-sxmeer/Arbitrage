@@ -248,6 +248,8 @@ impl PoolRegistryRow {
             "Orca Whirlpool" => DexProtocol::OrcaWhirlpool,
             "Osmosis"        => DexProtocol::Osmosis,
             "Curve"          => DexProtocol::Curve,
+            "Aerodrome V2"   => DexProtocol::AerodromeV2,
+            "Aerodrome"      => DexProtocol::Aerodrome,
             _                => DexProtocol::UniswapV3,
         };
 

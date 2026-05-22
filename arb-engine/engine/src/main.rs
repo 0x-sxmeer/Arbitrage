@@ -242,6 +242,14 @@ async fn main() {
     info!("═══════════════════════════════════════════════════════════════");
 
     // Use the active chain WS URL for mempool streaming (Base if configured)
+    let execute_enabled = config.execute_enabled;
+    if execute_enabled {
+        warn!("🔥 LIVE EXECUTION MODE: Engine will broadcast transactions on-chain!");
+    } else {
+        info!("🔍 MONITORING MODE: Engine will detect & simulate but NOT execute trades.");
+        info!("   Set EXECUTE_ENABLED=true in .env to enable live execution.");
+    }
+
     let listener = MempoolListener::new(
         active_ws_url.clone(),
         config.solana_ws_url.clone(),
@@ -251,6 +259,7 @@ async fn main() {
         pg_store,
         evm_adapter,
         metrics.clone(),
+        execute_enabled,
     );
 
     // Spawn metrics dashboard logger (every 60 seconds)
@@ -265,7 +274,7 @@ async fn main() {
 
     // Start local API server for the React dashboard
     tokio::spawn(async move {
-        api::start_api_server(metrics.clone(), 3000).await;
+        api::start_api_server(metrics.clone(), graph.clone(), 3000).await;
     });
 
     // Run listener (blocks forever)
@@ -304,16 +313,38 @@ async fn warm_up_and_sync_pools_from_postgres(
     let mut failed = 0usize;
     let mut g = graph.write().await;
 
-    // Process in chunks of 50 to avoid RPC timeouts
-    for chunk in pools.chunks(50) {
+    // Process in smaller chunks of 5 to avoid RPC timeouts and Alchemy 429 rate limits
+    for chunk in pools.chunks(5) {
         match evm.fetch_pool_states_multicall(chunk).await {
             Ok(states) => {
                 for (i, state) in states.into_iter().enumerate() {
                     let mut p = chunk[i].clone();
+                    let t0 = p.token_a.address.to_lowercase();
+                    let t1 = p.token_b.address.to_lowercase();
                     
+                    let weth = "0x4200000000000000000000000000000000000006".to_string();
+                    let usdc = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string();
+                    let cbbtc = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf".to_string();
+
+                    let mut is_dust = false;
+                    let usdbc = "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca".to_string();
+                    
+                    // Filter out pools with < $50,000 liquidity
+                    if t0 == weth && state.reserve_a < primitive_types::U256::from(15_000_000_000_000_000_000u128) { is_dust = true; }
+                    if t1 == weth && state.reserve_b < primitive_types::U256::from(15_000_000_000_000_000_000u128) { is_dust = true; }
+                    
+                    if t0 == usdc && state.reserve_a < primitive_types::U256::from(50_000_000_000u128) { is_dust = true; }
+                    if t1 == usdc && state.reserve_b < primitive_types::U256::from(50_000_000_000u128) { is_dust = true; }
+
+                    if t0 == usdbc && state.reserve_a < primitive_types::U256::from(50_000_000_000u128) { is_dust = true; }
+                    if t1 == usdbc && state.reserve_b < primitive_types::U256::from(50_000_000_000u128) { is_dust = true; }
+
+                    if t0 == cbbtc && state.reserve_a < primitive_types::U256::from(50_000_000u128) { is_dust = true; }
+                    if t1 == cbbtc && state.reserve_b < primitive_types::U256::from(50_000_000u128) { is_dust = true; }
+
                     let is_empty = match p.pool_type {
-                        crate::pool::PoolType::ConcentratedLiquidity => state.sqrt_price_x96.is_none() || state.liquidity.map_or(true, |l| l == 0),
-                        _ => state.reserve_a.is_zero() && state.reserve_b.is_zero(),
+                        crate::pool::PoolType::ConcentratedLiquidity => state.sqrt_price_x96.is_none() || state.liquidity.map_or(true, |l| l < 1_000_000) || is_dust,
+                        _ => state.reserve_a < primitive_types::U256::from(1000u64) || state.reserve_b < primitive_types::U256::from(1000u64) || is_dust,
                     };
 
                     if is_empty {
@@ -332,6 +363,8 @@ async fn warm_up_and_sync_pools_from_postgres(
                 failed += chunk.len();
             }
         }
+        // Sleep to prevent blowing through Alchemy's Compute Units / sec limit!
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
 
     metrics.set_graph_pools(g.pool_count() as u64);

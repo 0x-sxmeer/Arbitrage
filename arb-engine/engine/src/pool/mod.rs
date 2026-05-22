@@ -264,6 +264,8 @@ pub enum DexProtocol {
     OrcaWhirlpool,
     Osmosis,
     Curve,
+    AerodromeV2,
+    Aerodrome,
 }
 
 impl DexProtocol {
@@ -277,6 +279,8 @@ impl DexProtocol {
             DexProtocol::OrcaWhirlpool  => "Orca Whirlpool",
             DexProtocol::Osmosis        => "Osmosis",
             DexProtocol::Curve          => "Curve",
+            DexProtocol::AerodromeV2    => "Aerodrome V2",
+            DexProtocol::Aerodrome      => "Aerodrome",
         }
     }
 
@@ -284,7 +288,7 @@ impl DexProtocol {
     pub fn is_clmm(&self) -> bool {
         matches!(
             self,
-            DexProtocol::UniswapV3 | DexProtocol::PancakeSwapV3 | DexProtocol::OrcaWhirlpool
+            DexProtocol::UniswapV3 | DexProtocol::PancakeSwapV3 | DexProtocol::OrcaWhirlpool | DexProtocol::Aerodrome
         )
     }
 }

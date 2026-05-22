@@ -71,6 +71,11 @@ pub struct Config {
     pub btc_price_usd: f64,
     /// Current effective gas price in gwei (default; overridden by Redis cache)
     pub gas_price_gwei: f64,
+
+    // ── Execution gate ────────────────────────────────────────────────────────
+    /// Master kill-switch: set EXECUTE_ENABLED=true in .env to enable live on-chain execution.
+    /// When false (default), opportunities are detected & simulated but never broadcast.
+    pub execute_enabled: bool,
 }
 
 impl Config {
@@ -151,6 +156,11 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(95000.0),
+
+            execute_enabled: std::env::var("EXECUTE_ENABLED")
+                .ok()
+                .map(|s| s.to_lowercase() == "true" || s == "1")
+                .unwrap_or(false),
         };
 
         cfg.validate()?;
@@ -293,6 +303,12 @@ impl Config {
         }
         if self.private_key.is_none() {
             tracing::warn!("PRIVATE_KEY not set — execution disabled (monitoring only)");
+        }
+        if !self.execute_enabled {
+            tracing::warn!("⚠️  EXECUTE_ENABLED=false — running in MONITORING ONLY mode (no live trades)");
+            tracing::warn!("    Set EXECUTE_ENABLED=true in .env when you are ready for live execution.");
+        } else {
+            tracing::warn!("🔥 EXECUTE_ENABLED=true — LIVE EXECUTION MODE ACTIVE. Real money will be spent!");
         }
     }
 }

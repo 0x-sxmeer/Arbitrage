@@ -78,8 +78,8 @@ pub fn find_optimal_input<F: Fn(U256) -> U256>(
     let mut x1 = golden_subtract(a, b);
     let mut x2 = golden_add(a, b);
 
-    let mut f1 = profit(simulate, x1, gas_cost_wei);
-    let mut f2 = profit(simulate, x2, gas_cost_wei);
+    let mut f1 = profit(simulate, x1, upper);
+    let mut f2 = profit(simulate, x2, upper);
 
     let mut iters = 0u32;
 
@@ -92,14 +92,14 @@ pub fn find_optimal_input<F: Fn(U256) -> U256>(
             x2 = x1;
             f2 = f1;
             x1 = golden_subtract(a, b);
-            f1 = profit(simulate, x1, gas_cost_wei);
+            f1 = profit(simulate, x1, upper);
         } else {
             // Maximum is in [x1, b]
             a = x1;
             x1 = x2;
             f1 = f2;
             x2 = golden_add(a, b);
-            f2 = profit(simulate, x2, gas_cost_wei);
+            f2 = profit(simulate, x2, upper);
         }
     }
 
@@ -129,20 +129,12 @@ pub fn find_optimal_input<F: Fn(U256) -> U256>(
 }
 
 /// Evaluate the net profit at a given input amount.
-/// Returns a signed-like value using a (profit, is_positive) tuple encoded in U256.
-/// We use saturating subtraction so negative profits → 0.
+/// We use a shifted score to avoid U256 underflow while preserving the exact gradient:
+/// score(x) = output(x) + upper_bound - x
 #[inline]
-fn profit<F: Fn(U256) -> U256>(simulate: &F, input: U256, gas_cost_wei: U256) -> U256 {
+fn profit<F: Fn(U256) -> U256>(simulate: &F, input: U256, upper_bound: U256) -> U256 {
     let output = simulate(input);
-    if output <= input {
-        return U256::zero();
-    }
-    let gross_profit = output - input;
-    if gross_profit <= gas_cost_wei {
-        U256::zero()
-    } else {
-        gross_profit - gas_cost_wei
-    }
+    output.saturating_add(upper_bound).saturating_sub(input)
 }
 
 /// Compute the left interior point: a + (1 - φ)(b - a)

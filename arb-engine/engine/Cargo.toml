@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["ARB-DAPP Team"]
 description = "Cross-Chain Arbitrage Engine — Phase 1 Backend"
+default-run = "arb-engine"
 
 [[bin]]
 name = "arb-engine"

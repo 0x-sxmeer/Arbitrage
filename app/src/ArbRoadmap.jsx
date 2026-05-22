@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import ExecutionDashboard from "./ExecutionDashboard";
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
@@ -356,28 +356,21 @@ function ProgressBar({ value, color, height = 3 }) {
 
 // ─── MEMPOOL STREAM (Phase 1 live feed simulation) ────────────────────────────
 
-const TX_TEMPLATES = [
-  { type: "SWAP", dex: "Uniswap V3", token: "USDC→ETH", size: () => `$${(Math.random() * 200 + 10).toFixed(0)}k`, color: "#00FFD1" },
-  { type: "SWAP", dex: "Curve", token: "USDT→USDC", size: () => `$${(Math.random() * 500 + 50).toFixed(0)}k`, color: "#00FFD1" },
-  { type: "SWAP", dex: "Raydium", token: "SOL→USDC", size: () => `$${(Math.random() * 100 + 5).toFixed(0)}k`, color: "#9945FF" },
-  { type: "ADD_LIQ", dex: "Uniswap V3", token: "ETH/USDC", size: () => `$${(Math.random() * 50 + 10).toFixed(0)}k`, color: "#FFD700" },
-  { type: "REMOVE_LIQ", dex: "Balancer", token: "WBTC/ETH", size: () => `$${(Math.random() * 80 + 20).toFixed(0)}k`, color: "#FB923C" },
-  { type: "ARB", dex: "Flashbots", token: "ETH→USDC→ETH", size: () => `$${(Math.random() * 300 + 100).toFixed(0)}k`, color: "#FF6B6B" },
-];
+// TX_TEMPLATES removed as it is no longer used
 
-function MempoolStream() {
+export function MempoolStream() {
   const [txs, setTxs] = useState([]);
 
   useEffect(() => {
     const fetchTxs = async () => {
       try {
-        const res = await fetch("http://localhost:3000/api/mempool");
+        const res = await fetch(`http://localhost:3000/api/mempool?t=${Date.now()}`, { cache: 'no-store' });
         if (!res.ok) return;
         const data = await res.json();
         if (Array.isArray(data)) {
           setTxs(data);
         }
-      } catch (err) {
+      } catch {
         // Fallback or silent fail if backend is down
       }
     };
@@ -390,6 +383,13 @@ function MempoolStream() {
 
   return (
     <div style={{ border: "1px solid #1A2233", borderRadius: 8, overflow: "hidden" }}>
+      <style>{`
+        @keyframes mempoolPulse {
+          0% { box-shadow: 0 0 0 0 rgba(0, 255, 209, 0.6); }
+          70% { box-shadow: 0 0 0 6px rgba(0, 255, 209, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(0, 255, 209, 0); }
+        }
+      `}</style>
       <div style={{
         padding: "10px 16px",
         borderBottom: "1px solid #1A2233",
@@ -399,35 +399,84 @@ function MempoolStream() {
         background: "#0A0E14",
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div className="live-dot" style={{ width: 6, height: 6, borderRadius: "50%", background: "#00FFD1", flexShrink: 0 }} />
+          <div style={{ 
+            width: 6, height: 6, borderRadius: "50%", background: "#00FFD1", flexShrink: 0,
+            animation: "mempoolPulse 2s infinite"
+          }} />
           <span style={{ fontSize: 10, color: "#64748B", letterSpacing: "0.15em" }}>MEMPOOL STREAM</span>
         </div>
-        <span style={{ fontSize: 10, color: "#00FFD1", fontFamily: "monospace" }}>
-          LIVE FEED
-        </span>
+        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+          <span style={{ fontSize: 9, color: "#475569", fontFamily: "monospace" }}>
+            {txs.length} RECENT EVENTS
+          </span>
+          <span style={{ fontSize: 10, color: "#00FFD1", fontFamily: "monospace", textShadow: "0 0 5px rgba(0,255,209,0.3)" }}>
+            ● LIVE
+          </span>
+        </div>
       </div>
-      <div style={{ maxHeight: 210, overflowY: "hidden", padding: "8px 0" }}>
-        {txs.map((tx, i) => (
+      {/* Mempool Headers */}
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "75px 85px 100px 90px 1fr 65px",
+        gap: 8,
+        padding: "6px 16px",
+        fontSize: 9,
+        fontWeight: 700,
+        color: "#64748B",
+        borderBottom: "1px solid #1A2233",
+        background: "rgba(10, 14, 20, 0.8)",
+        letterSpacing: "0.1em"
+      }}>
+        <span title="Local system time the event was detected in the mempool stream">TIME</span>
+        <span title="Type of network event (e.g., Block Sync, Pool Update, Swap)">EVENT TYPE</span>
+        <span title="The unique transaction or block hash">TX HASH</span>
+        <span title="The chain or rollup network (e.g., Base L2, Arbitrum)">NETWORK</span>
+        <span title="The specific pool or token contract address targeted">TARGET</span>
+        <span style={{ textAlign: "right" }} title="Transaction size or Gas Fee (Gwei) if applicable">SIZE/GAS</span>
+      </div>
+      <div style={{ maxHeight: 180, overflowY: "hidden", padding: "4px 0" }}>
+        {txs.map((tx, i) => {
+          const timeStr = tx.ts ? new Date(tx.ts).toISOString().split('T')[1].slice(0, 12) : "00:00:00.000";
+          return (
           <div
-            key={tx.id || i}
+            key={`${tx.id}-${i}`}
             style={{
               display: "grid",
-              gridTemplateColumns: "65px 90px 130px 1fr 55px",
+              gridTemplateColumns: "75px 85px 100px 90px 1fr 65px",
               gap: 8,
-              padding: "5px 16px",
-              opacity: 1 - i * 0.065,
+              padding: "6px 16px",
+              opacity: 1 - i * 0.05,
               fontSize: 10,
+              fontFamily: "monospace",
               borderBottom: i < txs.length - 1 ? "1px solid #0D1117" : "none",
-              transition: "opacity 0.3s",
+              transition: "all 0.3s ease",
+              background: tx.type === "BLOCK_SYNC" ? "rgba(16, 185, 129, 0.05)" : (i === 0 ? "rgba(0, 255, 209, 0.03)" : "transparent"),
             }}
           >
-            <span style={{ color: tx.color, fontWeight: 600, letterSpacing: "0.08em" }}>{tx.type}</span>
-            <span style={{ color: "#94A3B8" }}>{tx.hash}…</span>
-            <span style={{ color: "#475569" }}>{tx.dex}</span>
-            <span style={{ color: "#64748B" }}>{tx.token}</span>
-            <span style={{ color: "#94A3B8", textAlign: "right" }}>{tx.size}</span>
+            <span style={{ color: "#475569" }}>{timeStr}</span>
+            <span style={{ 
+              color: tx.color, 
+              fontWeight: 600, 
+              background: `${tx.color}15`,
+              padding: "2px 6px",
+              borderRadius: "4px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: "fit-content",
+              fontSize: 9,
+              border: `1px solid ${tx.color}30`
+            }}>{tx.type}</span>
+            <span style={{ color: tx.type === "BLOCK_SYNC" ? "#10B981" : "#94A3B8", fontWeight: tx.type === "BLOCK_SYNC" ? 700 : 400 }} title={tx.hash}>
+              {tx.hash.length > 15 ? tx.hash.substring(0,15) + "…" : tx.hash}
+            </span>
+            <span style={{ color: "#64748B" }}>{tx.dex}</span>
+            <span style={{ color: tx.type === "POOL_SYNC" ? "#F59E0B" : "#E2E8F0" }}>{tx.token}</span>
+            <span style={{ color: tx.size !== "-" ? "#00FFD1" : "#475569", textAlign: "right" }}>
+              {tx.size !== "-" ? tx.size : (tx.gasGwei !== "-" ? `${tx.gasGwei} gw` : "—")}
+            </span>
           </div>
-        ))}
+        )})}
       </div>
     </div>
   );
@@ -591,7 +640,7 @@ function IndexerStatsPanel() {
           redisKeys: data.opportunities_found,
           pgWrites: data.txs_decoded,
         });
-      } catch (err) {
+      } catch {
         // Backend not running, default to 0
       }
     };

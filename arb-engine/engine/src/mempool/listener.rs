@@ -110,14 +110,16 @@ struct RawTxPayload {
 // ─────────────────────────────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct MempoolListener {
-    ws_url:        String,
-    solana_ws_url: Option<String>,
-    redis_cache:   Arc<RedisCache>,
-    graph:         Arc<RwLock<LiquidityGraph>>,
-    router_config: RouterConfig,
-    pg_store:      Option<Arc<PostgresStore>>,
-    evm_adapter:   Option<Arc<EvmAdapter>>,
-    metrics:       Arc<EngineMetrics>,
+    ws_url:          String,
+    solana_ws_url:   Option<String>,
+    redis_cache:     Arc<RedisCache>,
+    graph:           Arc<RwLock<LiquidityGraph>>,
+    router_config:   RouterConfig,
+    pg_store:        Option<Arc<PostgresStore>>,
+    evm_adapter:     Option<Arc<EvmAdapter>>,
+    metrics:         Arc<EngineMetrics>,
+    execute_enabled: bool,
+    live_gas_gwei:   Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MempoolListener {
@@ -130,6 +132,7 @@ impl MempoolListener {
         pg_store: Option<Arc<PostgresStore>>,
         evm_adapter: Option<Arc<EvmAdapter>>,
         metrics: Arc<EngineMetrics>,
+        execute_enabled: bool,
     ) -> Self {
         Self {
             ws_url: ws_url.into(),
@@ -140,6 +143,8 @@ impl MempoolListener {
             pg_store,
             evm_adapter,
             metrics,
+            execute_enabled,
+            live_gas_gwei: Arc::new(std::sync::atomic::AtomicU64::new(f64::to_bits(20.0))),
         }
     }
 
@@ -312,7 +317,7 @@ impl MempoolListener {
                     g.get_all_pools().map(|(_, p)| (**p).clone()).collect()
                 };
                 // Process in chunks to avoid rate limiting and speed up refresh
-                for chunk in pools.chunks(50) {
+                for chunk in pools.chunks(5) {
                     if let Ok(states) = evm.fetch_pool_states_multicall(chunk).await {
                         let mut g = graph_clone.write().await;
                         for (i, state) in states.into_iter().enumerate() {
@@ -408,20 +413,56 @@ impl MempoolListener {
 
                             let provider_l2 = provider_l2.clone();
                             let tx_sender_l2 = tx_sender_l2.clone();
+                            let live_gas_gwei_arc = Arc::clone(&self_clone.live_gas_gwei);
 
                             tokio::spawn(async move {
                                 let start_time = std::time::Instant::now();
                                 let mut updated_count = 0;
-                                if let Ok(states) = evm_adapter.fetch_pool_states_multicall(&pools).await {
-                                    let mut g = graph_arc.write().await;
-                                    for (i, state) in states.into_iter().enumerate() {
-                                        let mut p = pools[i].clone();
-                                        p.state = state;
-                                        p.last_updated_block = block_number;
-                                        p.last_updated_ts = chrono::Utc::now().timestamp();
-                                        g.upsert_pool(p);
-                                        updated_count += 1;
+                                // Fetch pools in chunks of 5 to prevent Alchemy 429 Rate Limits!
+                                for chunk in pools.chunks(5) {
+                                    if let Ok(states) = evm_adapter.fetch_pool_states_multicall(chunk).await {
+                                        let mut g = graph_arc.write().await;
+                                        for (i, state) in states.into_iter().enumerate() {
+                                            let mut p = chunk[i].clone();
+
+                                            let t0 = p.token_a.address.to_lowercase();
+                                            let t1 = p.token_b.address.to_lowercase();
+                                            let weth = "0x4200000000000000000000000000000000000006".to_string();
+                                            let usdc = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string();
+                                            let cbbtc = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf".to_string();
+
+                                            let mut is_dust = false;
+                                            let usdbc = "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca".to_string();
+
+                                            if t0 == weth && state.reserve_a < primitive_types::U256::from(15_000_000_000_000_000_000u128) { is_dust = true; }
+                                            if t1 == weth && state.reserve_b < primitive_types::U256::from(15_000_000_000_000_000_000u128) { is_dust = true; }
+                                            
+                                            if t0 == usdc && state.reserve_a < primitive_types::U256::from(50_000_000_000u128) { is_dust = true; }
+                                            if t1 == usdc && state.reserve_b < primitive_types::U256::from(50_000_000_000u128) { is_dust = true; }
+
+                                            if t0 == usdbc && state.reserve_a < primitive_types::U256::from(50_000_000_000u128) { is_dust = true; }
+                                            if t1 == usdbc && state.reserve_b < primitive_types::U256::from(50_000_000_000u128) { is_dust = true; }
+
+                                            if t0 == cbbtc && state.reserve_a < primitive_types::U256::from(50_000_000u128) { is_dust = true; }
+                                            if t1 == cbbtc && state.reserve_b < primitive_types::U256::from(50_000_000u128) { is_dust = true; }
+
+                                            if is_dust {
+                                                // Zero out state so the math engine mathematically ignores it permanently
+                                                p.state.reserve_a = primitive_types::U256::zero();
+                                                p.state.reserve_b = primitive_types::U256::zero();
+                                                p.state.liquidity = Some(0);
+                                                p.state.sqrt_price_x96 = None;
+                                            } else {
+                                                p.state = state;
+                                            }
+
+                                            p.last_updated_block = block_number;
+                                            p.last_updated_ts = chrono::Utc::now().timestamp();
+                                            g.upsert_pool(p);
+                                            updated_count += 1;
+                                        }
                                     }
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                                 }
 
                                 debug!("Refreshed {} pool states in {:?}", updated_count, start_time.elapsed());
@@ -460,7 +501,8 @@ impl MempoolListener {
                                 ];
 
                                 let mut config = router_config.clone();
-                                config.gas_price_gwei = 0.15;
+                                let live_gas = f64::from_bits(live_gas_gwei_arc.load(std::sync::atomic::Ordering::Relaxed));
+                                config.gas_price_gwei = if live_gas > 0.1 { live_gas } else { router_config.gas_price_gwei };
                                 metrics.inc_router_scans();
 
                                 // -- Inject block txs into the worker pipeline --
@@ -500,7 +542,7 @@ impl MempoolListener {
                                     }
                                 }
 
-                                let opportunities = {
+                                let mut opportunities = {
                                     let graph = graph_arc.read().await;
                                     let mut opps = Vec::new();
                                     for start_token in start_tokens {
@@ -511,6 +553,8 @@ impl MempoolListener {
                                     opps.truncate(3);
                                     opps
                                 };
+
+
 
                                 {
                                     let mut graph = graph_arc.write().await;
@@ -681,6 +725,7 @@ impl MempoolListener {
                         .map(|g| g as f64 / 1e9)
                         .unwrap_or_else(|| tx.inner.max_fee_per_gas() as f64 / 1e9);
                     gas_ewa = gas_ewa * 0.95 + gas_price_gwei * 0.05;
+                    self.live_gas_gwei.store(gas_ewa.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
                     self.maybe_update_dashboard(&tx_hash, &to_addr, &tx, gas_price_gwei, tx_count);
 
@@ -749,12 +794,13 @@ impl MempoolListener {
 
     fn make_worker_ctx(&self) -> WorkerCtx {
         WorkerCtx {
-            redis_cache:   Arc::clone(&self.redis_cache),
-            graph:         Arc::clone(&self.graph),
-            router_config: self.router_config.clone(),
-            pg_store:      self.pg_store.clone(),
-            evm_adapter:   self.evm_adapter.clone(),
-            metrics:       Arc::clone(&self.metrics),
+            redis_cache:     Arc::clone(&self.redis_cache),
+            graph:           Arc::clone(&self.graph),
+            router_config:   self.router_config.clone(),
+            pg_store:        self.pg_store.clone(),
+            evm_adapter:     self.evm_adapter.clone(),
+            metrics:         Arc::clone(&self.metrics),
+            execute_enabled: self.execute_enabled,
         }
     }
 }
@@ -765,12 +811,13 @@ impl MempoolListener {
 
 #[derive(Clone)]
 struct WorkerCtx {
-    redis_cache:   Arc<RedisCache>,
-    graph:         Arc<RwLock<LiquidityGraph>>,
-    router_config: RouterConfig,
-    pg_store:      Option<Arc<PostgresStore>>,
-    evm_adapter:   Option<Arc<EvmAdapter>>,
-    metrics:       Arc<EngineMetrics>,
+    redis_cache:     Arc<RedisCache>,
+    graph:           Arc<RwLock<LiquidityGraph>>,
+    router_config:   RouterConfig,
+    pg_store:        Option<Arc<PostgresStore>>,
+    evm_adapter:     Option<Arc<EvmAdapter>>,
+    metrics:         Arc<EngineMetrics>,
+    execute_enabled: bool,
 }
 
 impl WorkerCtx {
@@ -1066,6 +1113,17 @@ impl WorkerCtx {
                         continue;
                     }
                 }
+            }
+
+            // ── Execution gate ─────────────────────────────────────────────────
+            if !self.execute_enabled {
+                info!(
+                    id = %opp.id,
+                    nev_usd = format!("${:.4}", opp.net_expected_value as f64 / 1e18 * self.router_config.eth_price_usd),
+                    optimal_gas = format!("{:.1} gwei", opp.optimal_gas_price_gwei),
+                    "🔍 MONITORING MODE: Profitable opportunity found but EXECUTE_ENABLED=false. Skipping broadcast."
+                );
+                continue;
             }
 
             if let Some(ref adapter) = self.evm_adapter {

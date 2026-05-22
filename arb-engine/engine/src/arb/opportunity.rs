@@ -155,10 +155,11 @@ impl ArbitrageOpportunity {
             self.is_executable = false;
             return;
         }
-        // Guard 2: Gross profit percentage > 2% is unrealistic for a 2-hop cycle
+        // Guard 2: Gross profit percentage > 5% is unrealistic for liquid on-chain pools
+        // (2% was too tight — real 3-hop arbs can legitimately show 2-4% spread during high volatility)
         let gross_profit_pct = if input_amt > 0.0 { (gross_out / input_amt - 1.0) * 100.0 } else { 0.0 };
-        if gross_profit_pct > 2.0 {
-            tracing::debug!(id = %self.id, gross_profit_pct, "❌ Rejected: gross profit > 2% (simulation artifact)");
+        if gross_profit_pct > 5.0 {
+            // Silently drop simulation artifacts without spamming the logs
             self.net_expected_value = 0;
             self.is_executable = false;
             return;
@@ -222,13 +223,13 @@ impl ArbitrageOpportunity {
                 "✅ EXECUTABLE arbitrage opportunity found"
             );
         } else {
-            tracing::debug!(
+            tracing::info!(
                 id = %self.id,
                 nev_usd = format!("${:.4}", nev_usd),
                 reason = if gross_profit_token <= 0.0 { "no spread" }
                          else if gas_cost_token > gross_profit_token { "gas > spread" }
                          else { "below threshold" },
-                "❌ Non-profitable opportunity"
+                "❌ Non-profitable opportunity (math arb found, but rejected due to slippage/gas)"
             );
         }
     }

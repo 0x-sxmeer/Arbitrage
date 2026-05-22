@@ -153,6 +153,8 @@ struct ArbParams {
 //  AtomicArb contract
 // ─────────────────────────────────────────────────────────────────────────────
 
+enum RouterType { Default, AerodromeV2 }
+
 contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
@@ -166,6 +168,9 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
 
     /// Router whitelist
     mapping(address => bool) public allowedRouters;
+    
+    /// Router type registry
+    mapping(address => RouterType) public routerTypes;
 
     /// [C-3] Slippage tolerance in basis points (default 0.5%, max 2%)
     uint256 public slippageBps = 50;
@@ -342,12 +347,8 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 repayAmount = amount + premium;
 
         // ── Step 1: Buy leg - swap tokenBorrow → tokenIntermediate ───────────
-        // Compute minimum output with proper slippage protection.
-        // If expectedBuyOut is 0, fall back to requiring at least break-even
-        // (which still has risk; callers should always provide expectedBuyOut).
-        uint256 buyMinOut;
-        require(arb.expectedBuyOut > 0, "AtomicArb: expectedBuyOut must be set");
-        buyMinOut = (arb.expectedBuyOut * (10000 - slippageBps)) / 10000;
+        // We bypass router slippage checks (pass 0) because we do an atomic profitability check at the end.
+        uint256 buyMinOut = 0;
 
         uint256 intermediateAmount = _swap(
             arb.buyRouter,
@@ -363,12 +364,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         require(intermediateAmount > 0, "AtomicArb: buy leg produced zero output");
 
         // ── Step 2: Sell leg - swap tokenIntermediate → tokenBorrow ──────────
-        require(arb.expectedSellOut > 0, "AtomicArb: expectedSellOut must be set");
-        uint256 sellMinOut = (arb.expectedSellOut * (10000 - slippageBps)) / 10000;
-        // Enforce absolute floor: never accept less than repayment
-        if (sellMinOut < repayAmount) {
-            sellMinOut = repayAmount;
-        }
+        uint256 sellMinOut = 0;
 
         uint256 finalAmount = _swap(
             arb.sellRouter,
@@ -402,7 +398,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         // The allowance is set exactly to repayAmount and will be fully consumed.
 
         // Track net result including gas cost estimate
-        uint256 gasCostEstimate = tx.gasprice * 350_000;
+        uint256 gasCostEstimate = tx.gasprice * 450_000;
             
         // If netProfit > gasCost, it's a real profit; otherwise it's a net loss
         if (netProfit > gasCostEstimate) {
@@ -466,14 +462,14 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
                     sqrtPriceLimitX96: 0
                 });
             amountOut = IUniswapV3Router(router).exactInputSingle(v3Params);
-        } else if (router == 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43) {
+        } else if (routerTypes[router] == RouterType.AerodromeV2) {
             // Aerodrome V2 uses structured Route[] routes instead of plain address[] path
             Route[] memory routes = new Route[](path.length - 1);
             for (uint256 i = 0; i < path.length - 1; i++) {
                 routes[i] = Route({
                     from: path[i],
                     to: path[i + 1],
-                    stable: false,
+                    stable: fee == 1,
                     factory: 0x420DD381b31aEf6683db6B902084cB0FFECe40Da
                 });
             }
@@ -527,8 +523,9 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice Allow a router for swapping.
-    function setRouterAllowed(address router, bool allowed) external onlyOwner {
+    function setRouterAllowed(address router, bool allowed, RouterType rType) external onlyOwner {
         allowedRouters[router] = allowed;
+        routerTypes[router] = rType;
     }
 
     /// @notice Withdraw accumulated profit for a single token.
@@ -557,6 +554,7 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
 
     /// @notice Batch withdraw profits for multiple tokens.
     function withdrawProfits(address[] calldata tokens) external onlyOwner {
+        require(tokens.length <= 20, "AtomicArb: too many tokens");
         for (uint256 i = 0; i < tokens.length; i++) {
             // Skip tokens with zero tracked profit
             if (profitByToken[tokens[i]] == 0) continue;

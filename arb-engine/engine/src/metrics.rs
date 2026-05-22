@@ -106,16 +106,8 @@ impl EngineMetrics {
         let nev_usd = nev_f * token_price;
         let gas_cost_usd = (opp.estimated_gas_units as f64 * opp.gas_price_gwei * 1e-9) * eth_price;
         
-        let mut route_parts = Vec::new();
+        let mut route_array = Vec::new();
         for step in &opp.route {
-            let s_in = match step.token_in.to_lowercase().as_str() {
-                "0x4200000000000000000000000000000000000006" => "WETH",
-                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC",
-                "0x0555e30da8f98308edb960aa94c0db47230d2b9c" => "WBTC",
-                "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" => "DAI",
-                "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => "USDT",
-                _ => "UNK",
-            };
             let s_out = match step.token_out.to_lowercase().as_str() {
                 "0x4200000000000000000000000000000000000006" => "WETH",
                 "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC",
@@ -124,13 +116,15 @@ impl EngineMetrics {
                 "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => "USDT",
                 _ => "UNK",
             };
-            route_parts.push(format!("{}→{} ({})", s_in, s_out, step.dex));
+            route_array.push(serde_json::json!({
+                "dex": step.dex,
+                "tokenOut": s_out
+            }));
         }
-        let route_desc = route_parts.join(" → ");
         
         let opp_json = serde_json::json!({
             "id": opp.id.to_string(),
-            "route": if route_desc.is_empty() { "WETH → USDC → WETH".to_string() } else { route_desc },
+            "route": route_array,
             "input": format!("{:.3} {}", input_amt_f, start_sym),
             "output": format!("{:.3} {}", gross_out_f, start_sym),
             "nevUsd": nev_usd,

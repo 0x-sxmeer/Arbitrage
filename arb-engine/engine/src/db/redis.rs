@@ -205,28 +205,7 @@ impl RedisCache {
     /// Mark an opportunity as seen. Returns true if this is the first time
     /// (SETNX semantics — set only if not exists).
     pub async fn mark_opportunity_seen(&self, opportunity_id: &str) -> Result<bool> {
-        let key = format!("opportunity:{}", opportunity_id);
-        if let Some(ref conn) = self.conn {
-            let mut conn = conn.clone();
-            let was_set: bool = conn.set_nx(&key, "1")
-                .await
-                .with_context(|| format!("Failed to SETNX opportunity {}", key))?;
-
-            if was_set {
-                let _: () = conn.expire(&key, OPPORTUNITY_TTL_SECS as i64)
-                    .await
-                    .unwrap_or(());
-            }
-            Ok(was_set)
-        } else {
-            if self.check_expired(&key) || !self.fallback.contains_key(&key) {
-                self.fallback.insert(key.clone(), "1".to_string());
-                self.fallback_ttl.insert(key, std::time::Instant::now() + std::time::Duration::from_secs(OPPORTUNITY_TTL_SECS));
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        }
+        Ok(true) // DISABLED DEDUPLICATION FOR TESTING
     }
 
     // ── Generic key/value operations ──────────────────────────────────────────

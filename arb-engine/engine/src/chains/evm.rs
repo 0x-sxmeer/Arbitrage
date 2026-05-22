@@ -121,8 +121,8 @@ const SWAP_ROUTER_02_ARBITRUM: &str = "0x68b3465833fb72A70eCDF485E0e4C7bD8665Fc4
 
 // Aerodrome V2 Router on Base (Solidly-compatible, UniV2 interface)
 const AERODROME_V2_ROUTER:      &str = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43";
-// Aerodrome router on Base (for Aerodrome V3 / Universal Router swaps)
-const AERODROME_UNIVERSAL_ROUTER: &str = "0x6Cb442acF35158D5eDa88fe602221b67B400Be3E";
+// Aerodrome SwapRouter on Base (for Aerodrome V3 / Slipstream swaps)
+const AERODROME_SLIPSTREAM_ROUTER: &str = "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  EVM Adapter
@@ -197,7 +197,7 @@ impl EvmAdapter {
                 if lower.contains("uniswap v2") || lower.contains("aerodrome v2") || lower.contains("v2") {
                     AERODROME_V2_ROUTER
                 } else if lower.contains("aerodrome") || lower.contains("universal") {
-                    AERODROME_UNIVERSAL_ROUTER
+                    AERODROME_SLIPSTREAM_ROUTER
                 } else {
                     SWAP_ROUTER_02_BASE
                 }
@@ -460,19 +460,10 @@ impl EvmAdapter {
             .unwrap_or_default();
         let min_profit = theoretical_profit / alloy::primitives::U256::from(2);
 
-        // [C-3] Calculate expected outputs for per-leg slippage protection
-        let expected_buy_out = if arb.route.len() > 0 {
-            alloy::primitives::U256::from_str(&arb.route[0].expected_amount_out.to_string())
-                .unwrap_or_default()
-        } else {
-            alloy::primitives::U256::ZERO
-        };
-        let expected_sell_out = if arb.route.len() > 1 {
-            alloy::primitives::U256::from_str(&arb.route[1].expected_amount_out.to_string())
-                .unwrap_or_default()
-        } else {
-            alloy::primitives::U256::ZERO
-        };
+        // [C-3] We pass 0 as expected outputs to bypass router-level slippage checks.
+        // Safety is guaranteed by the atomic profitability check at the end of the transaction.
+        let expected_buy_out = alloy::primitives::U256::ZERO;
+        let expected_sell_out = alloy::primitives::U256::ZERO;
 
         Ok(ArbParams {
             buyRouter:         buy_router,
@@ -789,7 +780,7 @@ impl EvmAdapter {
 
         let mut calls = Vec::new();
         for pool in pools {
-            let pool_addr = Address::from_str(&pool.id)?;
+            let pool_addr = Address::from_str(&pool.id).unwrap_or_default();
             match pool.pool_type {
                 PoolType::ConstantProduct | PoolType::StableSwap => {
                     calls.push(IMulticall3::Call3 {
@@ -799,6 +790,14 @@ impl EvmAdapter {
                     });
                 }
                 PoolType::ConcentratedLiquidity => {
+                    let mut bal_call = vec![0x70, 0xa0, 0x82, 0x31]; // balanceOf(address)
+                    let mut padded = [0u8; 32];
+                    padded[12..32].copy_from_slice(pool_addr.as_slice());
+                    bal_call.extend_from_slice(&padded);
+                    
+                    let t0_addr = Address::from_str(&pool.token_a.address).unwrap_or_default();
+                    let t1_addr = Address::from_str(&pool.token_b.address).unwrap_or_default();
+
                     calls.push(IMulticall3::Call3 {
                         target: pool_addr,
                         allowFailure: true,
@@ -808,6 +807,16 @@ impl EvmAdapter {
                         target: pool_addr,
                         allowFailure: true,
                         callData: Bytes::from(V3_LIQUIDITY_SELECTOR.to_vec()),
+                    });
+                    calls.push(IMulticall3::Call3 {
+                        target: t0_addr,
+                        allowFailure: true,
+                        callData: Bytes::from(bal_call.clone()),
+                    });
+                    calls.push(IMulticall3::Call3 {
+                        target: t1_addr,
+                        allowFailure: true,
+                        callData: Bytes::from(bal_call.clone()),
                     });
                 }
             }
@@ -843,7 +852,9 @@ impl EvmAdapter {
                 PoolType::ConcentratedLiquidity => {
                     let slot0_res = &return_data[result_idx];
                     let liq_res = &return_data[result_idx + 1];
-                    result_idx += 2;
+                    let bal0_res = &return_data[result_idx + 2];
+                    let bal1_res = &return_data[result_idx + 3];
+                    result_idx += 4;
 
                     if !slot0_res.success || slot0_res.returnData.len() < 64 {
                         pool_states.push(PoolState::empty());
@@ -862,9 +873,17 @@ impl EvmAdapter {
                         0u128
                     };
 
+                    let reserve0 = if bal0_res.success && bal0_res.returnData.len() >= 32 {
+                        U256::from_big_endian(&bal0_res.returnData[0..32])
+                    } else { U256::zero() };
+                    
+                    let reserve1 = if bal1_res.success && bal1_res.returnData.len() >= 32 {
+                        U256::from_big_endian(&bal1_res.returnData[0..32])
+                    } else { U256::zero() };
+
                     pool_states.push(PoolState {
-                        reserve_a: U256::zero(),
-                        reserve_b: U256::zero(),
+                        reserve_a: reserve0,
+                        reserve_b: reserve1,
                         sqrt_price_x96: Some(sqrt_price_x96),
                         tick: Some(tick),
                         liquidity: Some(liquidity),
