@@ -281,6 +281,48 @@ impl MempoolListener {
                 if let Ok(provider_l2) = provider_l2 {
                     let mut block_count: u64 = 0;
 
+                    // ── [FIXED] Spin up Event Log Listener for real-time Sync & Swap reserves ──
+                    let filter = alloy::rpc::types::Filter::new()
+                        .event_signature(vec![
+                            IUniswapV2Pair::Sync::SIGNATURE_HASH,
+                            IUniswapV3PoolEvents::Swap::SIGNATURE_HASH,
+                        ]);
+                    
+                    if let Ok(sub_logs) = provider_l2.subscribe_logs(&filter).await {
+                        let mut log_stream = sub_logs.into_stream();
+                        let graph_arc_logs = Arc::clone(&self_clone.graph);
+                        
+                        tokio::spawn(async move {
+                            while let Some(log) = log_stream.next().await {
+                                let pool_address = log.address().to_string().to_lowercase();
+
+                                let mut g = graph_arc_logs.write().await;
+                                if let Some(ep) = g.get_pool(&pool_address) {
+                                    let mut up = (**ep).clone();
+                                    
+                                    if log.topics().first() == Some(&IUniswapV2Pair::Sync::SIGNATURE_HASH) {
+                                        if let Ok(sync) = IUniswapV2Pair::Sync::decode_log(&log.inner, true) {
+                                            up.state.reserve_a = crate::pool::U256::from_str_radix(&sync.reserve0.to_string(), 10).unwrap_or_default();
+                                            up.state.reserve_b = crate::pool::U256::from_str_radix(&sync.reserve1.to_string(), 10).unwrap_or_default();
+                                            up.last_updated_ts = chrono::Utc::now().timestamp();
+                                            g.upsert_pool(up);
+                                            tracing::info!("Updated pool {} reserves: A: {}, B: {}", pool_address, sync.reserve0, sync.reserve1);
+                                        }
+                                    } else if log.topics().first() == Some(&IUniswapV3PoolEvents::Swap::SIGNATURE_HASH) {
+                                        if let Ok(swap) = IUniswapV3PoolEvents::Swap::decode_log(&log.inner, true) {
+                                            up.state.sqrt_price_x96 = Some(crate::pool::U256::from_str_radix(&swap.sqrtPriceX96.to_string(), 10).unwrap_or_default());
+                                            up.state.liquidity = Some(swap.liquidity.to_string().parse::<u128>().unwrap_or_default());
+                                            up.state.tick = Some(swap.tick.to_string().parse::<i32>().unwrap_or_default());
+                                            up.last_updated_ts = chrono::Utc::now().timestamp();
+                                            g.upsert_pool(up);
+                                            tracing::info!("Updated pool {} reserves: sqrtPriceX96: {}, liquidity: {}", pool_address, swap.sqrtPriceX96, swap.liquidity);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+
                     while let Some(block) = stream.next().await {
                         block_count += 1;
                         let block_number = block.inner.number;
@@ -319,27 +361,37 @@ impl MempoolListener {
                         }
 
                         // ── Step 2: Extract Block Txs to discover dynamic shifting loops ──
-                        if let Ok(Some(full_block)) = provider_l2.get_block_by_number(block_number.into(), alloy::rpc::types::BlockTransactionsKind::Full).await {
-                            if let alloy::rpc::types::BlockTransactions::Full(block_txs) = full_block.transactions {
-                                for tx in block_txs {
-                                    let to_addr = match tx.inner.to() {
-                                        Some(addr) => addr.to_string().to_lowercase(),
-                                        None => continue,
-                                    };
-                                    let tx_hash = tx.inner.tx_hash().to_string();
-                                    let gas_price_gwei = tx.inner.gas_price().map(|g| g as f64 / 1e9).unwrap_or(0.1);
-                                    
-                                    let payload = RawTxPayload {
-                                        to_addr,
-                                        input: tx.inner.input().to_vec(),
-                                        value: tx.inner.value().to::<u128>(),
-                                        gas_price_gwei,
-                                        tx_hash,
-                                        tx_count: block_number,
-                                    };
-                                    let _ = tx_sender_l2.send(payload).await;
+                        match provider_l2.get_block_by_number(block_number.into(), alloy::rpc::types::BlockTransactionsKind::Hashes).await {
+                            Ok(Some(block_with_hashes)) => {
+                                let mut sent = 0;
+                                if let alloy::rpc::types::BlockTransactions::Hashes(hashes) = block_with_hashes.transactions {
+                                    for hash in hashes {
+                                        // Fetch each transaction individually to bypass deserialization errors on L1 deposit txs
+                                        if let Ok(Some(tx)) = provider_l2.get_transaction_by_hash(hash).await {
+                                            let to_addr = match tx.inner.to() {
+                                                Some(addr) => addr.to_string().to_lowercase(),
+                                                None => continue,
+                                            };
+                                            let tx_hash = tx.inner.tx_hash().to_string();
+                                            let gas_price_gwei = tx.inner.gas_price().map(|g| g as f64 / 1e9).unwrap_or(0.1);
+                                            
+                                            let payload = RawTxPayload {
+                                                to_addr,
+                                                input: tx.inner.input().to_vec(),
+                                                value: tx.inner.value().to::<u128>(),
+                                                gas_price_gwei,
+                                                tx_hash,
+                                                tx_count: block_number,
+                                            };
+                                            let _ = tx_sender_l2.send(payload).await;
+                                            sent += 1;
+                                        }
+                                    }
                                 }
+                                tracing::debug!("Extracted {} txs from block {}", sent, block_number);
                             }
+                            Ok(None) => tracing::warn!("Block {} returned None", block_number),
+                            Err(e) => tracing::warn!("Failed to fetch block {}: {}", block_number, e),
                         }
 
                         // ── Step 3: Run Engine Pathfinder IMMEDIATELY after syncing block state ──
@@ -508,7 +560,7 @@ impl WorkerCtx {
         .await;
     }
 
-    async fn evaluate_arb_opportunity(&self, token_in: &str, token_out: &str, fee_bps: u32, gas_gwei: f64, amount_in: U256, _dex_version: &DexVersion) {
+    async fn evaluate_arb_opportunity(&self, token_in: &str, token_out: &str, fee_bps: u32, gas_gwei: f64, amount_in: U256, dex_version: &DexVersion) {
         let active_chain = self.evm_adapter.as_ref().map(|a| a.chain()).unwrap_or(ChainId::Base);
         let pool_cache_key = format!("pool:{}:{}:{}:{}", active_chain.name(), token_in, token_out, fee_bps);
 
@@ -532,7 +584,27 @@ impl WorkerCtx {
                 };
 
                 if let Some(ref adapter) = self.evm_adapter {
-                    let base_pool = graph_pool.unwrap_or_else(|| build_placeholder_pool(token_in, token_out, fee_bps, active_chain));
+                    let base_pool = if let Some(p) = graph_pool {
+                        p
+                    } else {
+                        let mut p = build_placeholder_pool(token_in, token_out, fee_bps, active_chain);
+                        if let Ok(real_address) = adapter.query_pool_address(token_in, token_out, fee_bps, dex_version).await {
+                            p.id = real_address;
+                            p.pool_type = match dex_version {
+                                DexVersion::UniswapV3 | DexVersion::AerodromeV3 => crate::pool::PoolType::ConcentratedLiquidity,
+                                _ => crate::pool::PoolType::ConstantProduct,
+                            };
+                            p.dex = match dex_version {
+                                DexVersion::AerodromeV2 | DexVersion::UniswapV2 | DexVersion::BaseSwap => crate::pool::DexProtocol::UniswapV2,
+                                DexVersion::AerodromeV3 | DexVersion::UniswapV3 => crate::pool::DexProtocol::UniswapV3,
+                                _ => crate::pool::DexProtocol::UniswapV3,
+                            };
+                            p
+                        } else {
+                            return;
+                        }
+                    };
+                    
                     match adapter.fetch_pool_state(&base_pool).await {
                         Ok(state) => {
                             let mut p = base_pool;

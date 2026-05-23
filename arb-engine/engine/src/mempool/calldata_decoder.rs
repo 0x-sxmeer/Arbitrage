@@ -75,6 +75,38 @@ sol! {
         ) external payable returns (uint256[] memory amounts);
     }
 
+    // ── Aerodrome V2 Router ──────────────────────────────────────────────────
+    interface IAerodromeV2Router {
+        struct Route {
+            address from;
+            address to;
+            bool stable;
+            address factory;
+        }
+        function swapExactTokensForTokens(
+            uint256 amountIn,
+            uint256 amountOutMin,
+            Route[] calldata routes,
+            address to,
+            uint256 deadline
+        ) external returns (uint256[] memory amounts);
+        
+        function swapExactETHForTokens(
+            uint256 amountOutMin,
+            Route[] calldata routes,
+            address to,
+            uint256 deadline
+        ) external payable returns (uint256[] memory amounts);
+        
+        function swapExactTokensForETH(
+            uint256 amountIn,
+            uint256 amountOutMin,
+            Route[] calldata routes,
+            address to,
+            uint256 deadline
+        ) external returns (uint256[] memory amounts);
+    }
+
     // ── Uniswap V3 / PancakeSwap V3 Router ───────────────────────────────────
     interface IUniswapV3Router {
         struct ExactInputSingleParams {
@@ -269,6 +301,34 @@ pub fn decode_v2_swap(input_data: &[u8], dex: DexVersion) -> Option<DecodedSwap>
 fn decode_v2_family(input_data: &[u8], sel: [u8; 4], dex: DexVersion) -> Option<DecodedSwap> {
     let fee_bps = dex.default_fee_bps();
 
+    // Specific Aerodrome V2 fallback check before Uniswap V2 checks
+    if dex == DexVersion::AerodromeV2 {
+        if let Ok(call) = IAerodromeV2Router::swapExactTokensForTokensCall::abi_decode(input_data, true) {
+            if !call.routes.is_empty() {
+                let mut path = Vec::new();
+                path.push(call.routes[0].from);
+                for r in &call.routes { path.push(r.to); }
+                return v2_path_to_swap(path, call.amountIn, fee_bps, dex);
+            }
+        }
+        if let Ok(call) = IAerodromeV2Router::swapExactETHForTokensCall::abi_decode(input_data, true) {
+            if !call.routes.is_empty() {
+                let mut path = Vec::new();
+                path.push(call.routes[0].from);
+                for r in &call.routes { path.push(r.to); }
+                return v2_path_to_swap(path, U256::ZERO, fee_bps, dex);
+            }
+        }
+        if let Ok(call) = IAerodromeV2Router::swapExactTokensForETHCall::abi_decode(input_data, true) {
+            if !call.routes.is_empty() {
+                let mut path = Vec::new();
+                path.push(call.routes[0].from);
+                for r in &call.routes { path.push(r.to); }
+                return v2_path_to_swap(path, call.amountIn, fee_bps, dex);
+            }
+        }
+    }
+
     match sel {
         SEL_V2_EXACT_IN => {
             let call = IUniswapV2Router::swapExactTokensForTokensCall::abi_decode(input_data, true).ok()?;
@@ -434,7 +494,7 @@ fn decode_v3_path(path: &[u8], amount_in: U256, dex: DexVersion) -> Option<Decod
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn decode_universal_router(input_data: &[u8]) -> Option<DecodedSwap> {
-    if input_data.len() < 8 { return None; }
+    if input_data.len() < 47 { return None; } // 4 bytes selector + at least 43 bytes path
 
     let data = &input_data[4..];
 
@@ -453,9 +513,9 @@ fn decode_universal_router(input_data: &[u8]) -> Option<DecodedSwap> {
         let token_in  = Address::from_slice(&data[offset..offset + 20]);
         let token_out = Address::from_slice(&data[offset + 23..offset + 43]);
 
-        if token_in  == Address::ZERO { continue; }
-        if token_out == Address::ZERO { continue; }
-        if token_in  == token_out     { continue; }
+        // Filter out garbage tokens
+        if token_in.is_zero() || token_out.is_zero() || token_in == token_out { continue; }
+        if token_in[..8].iter().all(|&x| x == 0) || token_out[..8].iter().all(|&x| x == 0) { continue; }
 
         debug!(
             ?token_in, ?token_out, fee = fee_raw,

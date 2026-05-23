@@ -56,6 +56,26 @@ sol! {
     }
 
     #[sol(rpc)]
+    interface IUniswapV2Pair {
+        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    }
+
+    #[sol(rpc)]
+    interface IUniswapV3Factory {
+        function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+    }
+
+    #[sol(rpc)]
+    interface IUniswapV2Factory {
+        function getPair(address tokenA, address tokenB) external view returns (address pair);
+    }
+
+    #[sol(rpc)]
+    interface IAerodromeV2Factory {
+        function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
+    }
+
+    #[sol(rpc)]
     interface IAtomicArb {
         function aavePool() external view returns (address);
         
@@ -275,6 +295,50 @@ impl EvmAdapter {
         let mut guard = self.http_provider.write().await;
         *guard = Some(provider.clone());
         Ok(provider)
+    }
+
+    /// Dynamically resolve a pool address from its respective factory.
+    pub async fn query_pool_address(&self, token_a: &str, token_b: &str, fee_bps: u32, dex: &crate::mempool::calldata_decoder::DexVersion) -> Result<String> {
+        let t_a = Address::from_str(token_a)?;
+        let t_b = Address::from_str(token_b)?;
+        let provider = self.get_or_connect_http().await?;
+
+        let pool_addr = match dex {
+            crate::mempool::calldata_decoder::DexVersion::AerodromeV2 => {
+                let factory_addr = Address::from_str("0x420DD381b31aEf6683db6B902084cB0FFeCE40Da")?;
+                let factory = IAerodromeV2Factory::new(factory_addr, provider);
+                // Assume volatile unless fee is 1 (Aerodrome V2 stable pools use 1 bps or similar)
+                let stable = fee_bps == 1;
+                factory.getPool(t_a, t_b, stable).call().await?.pool
+            }
+            crate::mempool::calldata_decoder::DexVersion::AerodromeV3 => {
+                let factory_addr = Address::from_str("0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A")?;
+                let factory = IUniswapV3Factory::new(factory_addr, provider);
+                factory.getPool(t_a, t_b, alloy::primitives::Uint::<24, 1>::from(fee_bps)).call().await?.pool
+            }
+            crate::mempool::calldata_decoder::DexVersion::UniswapV3 => {
+                let factory_addr = Address::from_str("0x33128a8fC17869897dcE68Ed026d694621f6FDfD")?;
+                let factory = IUniswapV3Factory::new(factory_addr, provider);
+                factory.getPool(t_a, t_b, alloy::primitives::Uint::<24, 1>::from(fee_bps * 100)).call().await?.pool
+            }
+            crate::mempool::calldata_decoder::DexVersion::BaseSwap => {
+                let factory_addr = Address::from_str("0xF9ce93839b1398F40209673273eE0FEE76865610")?;
+                let factory = IUniswapV2Factory::new(factory_addr, provider);
+                factory.getPair(t_a, t_b).call().await?.pair
+            }
+            crate::mempool::calldata_decoder::DexVersion::UniswapV2 => {
+                let factory_addr = Address::from_str("0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6")?;
+                let factory = IUniswapV2Factory::new(factory_addr, provider);
+                factory.getPair(t_a, t_b).call().await?.pair
+            }
+            _ => return Err(anyhow::anyhow!("Unsupported dex {:?} for dynamic pool query", dex)),
+        };
+
+        if pool_addr.is_zero() {
+            return Err(anyhow::anyhow!("Pool not found in factory"));
+        }
+
+        Ok(pool_addr.to_string().to_lowercase())
     }
 
     /// Dynamically query the Aave FLASHLOAN_PREMIUM_TOTAL via the AtomicArb contract.
@@ -752,11 +816,6 @@ impl EvmAdapter {
             r#type  = ?pool.pool_type,
             "Fetching pool state from chain"
         );
-
-        // Reject placeholder pool IDs — they have no real on-chain address
-        if pool.id.contains(':') {
-            anyhow::bail!("Pool {} is a placeholder with no on-chain address — skipping", pool.id);
-        }
 
         // FIX: Use the stable HTTP provider for contract calls.
         // The WebSocket provider drops periodically causing all fetches to fail during reconnect.

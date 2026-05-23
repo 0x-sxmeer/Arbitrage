@@ -110,13 +110,22 @@ fn parse_symbols_from_name(name: &str) -> (String, String) {
     }
 }
 
-/// Extract address from GeckoTerminal token ID like "base_0x833589fcd6..."
 fn extract_address(token_id: &str) -> String {
     let parts: Vec<&str> = token_id.split('_').collect();
-    if parts.len() > 1 {
-        parts[1].to_lowercase()
+    let raw = if parts.len() > 1 {
+        parts[1]
     } else {
-        parts[0].to_lowercase()
+        parts[0]
+    };
+    get_normalized_address(raw)
+}
+
+fn get_normalized_address(raw_address: &str) -> String {
+    use alloy::primitives::Address;
+    use std::str::FromStr;
+    match Address::from_str(raw_address) {
+        Ok(addr) => addr.to_string().to_lowercase(),
+        Err(_) => raw_address.to_lowercase(),
     }
 }
 
@@ -126,7 +135,7 @@ fn parse_pool_from_api(pool_data: &serde_json::Value) -> Option<PoolSeed> {
     let rels = pool_data.get("relationships")?;
 
     // Pool address
-    let address = attrs.get("address")?.as_str()?.to_lowercase();
+    let address = get_normalized_address(attrs.get("address")?.as_str()?);
 
     // Pool name (for symbol + fee parsing)
     let name = attrs.get("name")?.as_str()?;

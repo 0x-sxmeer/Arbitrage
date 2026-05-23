@@ -187,6 +187,37 @@ pub fn estimate_upper_bound(smallest_reserve: U256, max_trade_pct: f64) -> U256 
     smallest_reserve * U256::from(pct_bps) / U256::from(10_000u64)
 }
 
+/// Calculates the optimal input amount for a 2-hop V2 arbitrage (A -> B -> A)
+/// Returns None if the path is not profitable after fees.
+pub fn calculate_optimal_input_v2(
+    res_1_in: f64, res_1_out: f64, fee_1: f64,
+    res_2_in: f64, res_2_out: f64, fee_2: f64,
+) -> Option<f64> {
+    let f1 = 1.0 - fee_1; // e.g., 0.997
+    let f2 = 1.0 - fee_2;
+
+    let a = f1 * f2 * res_1_out * res_2_out;
+    let b = res_1_in * res_2_in;
+
+    // If a <= b, the product of the marginal rates (accounting for fees) is <= 1.0.
+    // No profit is possible.
+    if a <= b {
+        return None; 
+    }
+
+    // Derivative of the constant product formula set to 0
+    let numerator = f64::sqrt(a * b) - b;
+    let denominator = f1 * (f2 * res_1_out + res_2_in);
+    
+    let optimal_input = numerator / denominator;
+
+    if optimal_input > 0.0 {
+        Some(optimal_input)
+    } else {
+        None
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Tests
 // ─────────────────────────────────────────────────────────────────────────────

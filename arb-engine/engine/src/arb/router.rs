@@ -348,12 +348,7 @@ impl LiquidityGraph {
         let dec_out = if zero_for_one { pool.token_b.decimals } else { pool.token_a.decimals };
         let decimal_adj = 10f64.powi(dec_in as i32 - dec_out as i32);
         
-        // ── ARTIFICIAL SPREAD INJECTION FOR DEMONSTRATION ──────────────
-        // We artificially boost the rate by 1% so Bellman-Ford ignores swap fees
-        // and aggressively finds cycles. The Golden Section Search optimizer will
-        // still use the real `sim_out` math with true fees and slippage to 
-        // accurately reject these as non-profitable.
-        let rate = (out_u128 as f64 / in_u128 as f64) * decimal_adj * 1.01;
+        let rate = (out_u128 as f64 / in_u128 as f64) * decimal_adj;
 
         if rate <= 0.0 || !rate.is_finite() { None } else { Some(rate) }
     }
