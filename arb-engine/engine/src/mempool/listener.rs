@@ -12,12 +12,10 @@ use futures_util::StreamExt;
 use anyhow::Result;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
-use crate::arb::opportunity::ArbitrageOpportunity;
 use crate::arb::router::{
     find_arbitrage_cycles, reset_changed_tokens,
-    cross_chain_fetch_specs,
     LiquidityGraph, RouterConfig,
 };
 use crate::chains::evm::EvmAdapter;
@@ -25,7 +23,7 @@ use crate::db::postgres::PostgresStore;
 use crate::db::redis::RedisCache;
 use crate::mempool::calldata_decoder::{
     classify_router, decode_swap,
-    is_known_dex_router, DexVersion,
+    DexVersion,
 };
 use crate::metrics::EngineMetrics;
 use crate::pool::{ChainId, DexProtocol, Pool, PoolState, PoolType, Token, U256};
@@ -48,15 +46,12 @@ const BACKOFF_MULTIPLIER:   f64 = 2.0;
 
 const WORKER_CONCURRENCY: usize = 8;
 const CHANNEL_CAPACITY:   usize = 1024; // Expanded for block bursts
-const METRICS_LOG_INTERVAL: u64 = 100;
-const SQRT_PRICE_STALENESS_THRESHOLD: f64 = 0.0001; // Tightened threshold
 
 const POOL_CACHE_TTL_SECS: usize = 288;
 
 struct RawTxPayload {
     to_addr:        String,
     input:          Vec<u8>,
-    value:          u128,
     gas_price_gwei: f64,
     tx_hash:        String,
     tx_count:       u64,
@@ -271,7 +266,6 @@ impl MempoolListener {
                 .map_err(|e| anyhow::anyhow!("Failed to subscribe to L2 blocks: {}", e))?;
 
             let mut stream = sub.into_stream();
-            let mut abort_rx_l2 = abort_tx.subscribe();
             let self_clone = self.clone();
             let tx_sender_l2 = tx_sender.clone();
             let rpc_url_l2 = self.ws_url.clone();
@@ -279,7 +273,6 @@ impl MempoolListener {
             tokio::spawn(async move {
                 let provider_l2 = ProviderBuilder::new().on_ws(WsConnect::new(&rpc_url_l2)).await;
                 if let Ok(provider_l2) = provider_l2 {
-                    let mut block_count: u64 = 0;
 
                     // ── [FIXED] Spin up Event Log Listener for real-time Sync & Swap reserves ──
                     let filter = alloy::rpc::types::Filter::new()
@@ -306,7 +299,7 @@ impl MempoolListener {
                                             up.state.reserve_b = crate::pool::U256::from_str_radix(&sync.reserve1.to_string(), 10).unwrap_or_default();
                                             up.last_updated_ts = chrono::Utc::now().timestamp();
                                             g.upsert_pool(up);
-                                            tracing::info!("Updated pool {} reserves: A: {}, B: {}", pool_address, sync.reserve0, sync.reserve1);
+                                            tracing::debug!("Updated pool {} reserves: A: {}, B: {}", pool_address, sync.reserve0, sync.reserve1);
                                         }
                                     } else if log.topics().first() == Some(&IUniswapV3PoolEvents::Swap::SIGNATURE_HASH) {
                                         if let Ok(swap) = IUniswapV3PoolEvents::Swap::decode_log(&log.inner, true) {
@@ -315,7 +308,7 @@ impl MempoolListener {
                                             up.state.tick = Some(swap.tick.to_string().parse::<i32>().unwrap_or_default());
                                             up.last_updated_ts = chrono::Utc::now().timestamp();
                                             g.upsert_pool(up);
-                                            tracing::info!("Updated pool {} reserves: sqrtPriceX96: {}, liquidity: {}", pool_address, swap.sqrtPriceX96, swap.liquidity);
+                                            tracing::debug!("Updated pool {} reserves: sqrtPriceX96: {}, liquidity: {}", pool_address, swap.sqrtPriceX96, swap.liquidity);
                                         }
                                     }
                                 }
@@ -324,7 +317,6 @@ impl MempoolListener {
                     }
 
                     while let Some(block) = stream.next().await {
-                        block_count += 1;
                         let block_number = block.inner.number;
 
                         // ── Step 1: Update on-chain states FIRST ──
@@ -378,7 +370,6 @@ impl MempoolListener {
                                             let payload = RawTxPayload {
                                                 to_addr,
                                                 input: tx.inner.input().to_vec(),
-                                                value: tx.inner.value().to::<u128>(),
                                                 gas_price_gwei,
                                                 tx_hash,
                                                 tx_count: block_number,
@@ -479,7 +470,6 @@ impl MempoolListener {
                 let payload = RawTxPayload {
                     to_addr,
                     input: tx.inner.input().to_vec(),
-                    value: tx.inner.value().to::<u128>(),
                     gas_price_gwei,
                     tx_hash,
                     tx_count: tx_count,
@@ -489,26 +479,6 @@ impl MempoolListener {
         }
 
         Ok(())
-    }
-
-    fn maybe_update_dashboard(&self, tx_hash: &str, to_addr: &str, tx: &alloy::rpc::types::Transaction, gas_price_gwei: f64, tx_count: u64) {
-        let dex = classify_router(to_addr);
-        let is_swap = dex != DexVersion::Unknown;
-        if let Ok(mut txs) = self.metrics.recent_mempool_txs.try_write() {
-            let entry = serde_json::json!({
-                "id":      tx_count,
-                "hash":    &tx_hash[..12],
-                "type":    if is_swap { "SWAP" } else { "PENDING" },
-                "dex":     format!("{:?}", dex),
-                "token":   "UNI/AERO",
-                "size":    "-",
-                "color":   if is_swap { "#00FFD1" } else { "#64748B" },
-                "gasGwei": format!("{:.2}", gas_price_gwei),
-                "ts":      chrono::Utc::now().timestamp_millis(),
-            });
-            txs.push_front(entry);
-            if txs.len() > 50 { txs.pop_back(); }
-        }
     }
 
     fn make_worker_ctx(&self) -> WorkerCtx {
@@ -524,6 +494,7 @@ impl MempoolListener {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct WorkerCtx {
     redis_cache:     Arc<RedisCache>,
@@ -597,7 +568,7 @@ impl WorkerCtx {
         .await;
     }
 
-    async fn evaluate_arb_opportunity(&self, token_in: &str, token_out: &str, fee_bps: u32, gas_gwei: f64, amount_in: U256, dex_version: &DexVersion) {
+    async fn evaluate_arb_opportunity(&self, token_in: &str, token_out: &str, fee_bps: u32, _gas_gwei: f64, amount_in: U256, dex_version: &DexVersion) {
         let active_chain = self.evm_adapter.as_ref().map(|a| a.chain()).unwrap_or(ChainId::Base);
         let pool_cache_key = format!("pool:{}:{}:{}:{}", active_chain.name(), token_in, token_out, fee_bps);
 
