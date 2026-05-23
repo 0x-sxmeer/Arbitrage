@@ -149,11 +149,26 @@ struct ArbParams {
     uint256 expectedSellOut;  // expected output from sell leg (0 = use global slippageBps)
 }
 
+// ── Aerodrome Slipstream Router ────────────────────────────────────────────────
+interface IAerodromeSlipstreamRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        int24   tickSpacing;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  AtomicArb contract
 // ─────────────────────────────────────────────────────────────────────────────
 
-enum RouterType { Default, AerodromeV2 }
+enum RouterType { Default, AerodromeV2, AerodromeSlipstream }
 
 contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -451,17 +466,32 @@ contract AtomicArb is IFlashLoanSimpleReceiver, IWormholeReceiver, Ownable, Reen
         uint256 swapDeadline = block.timestamp + 30;
 
         if (isV3) {
-            IUniswapV3Router.ExactInputSingleParams memory v3Params =
-                IUniswapV3Router.ExactInputSingleParams({
-                    tokenIn:           tokenIn,
-                    tokenOut:          tokenOut,
-                    fee:               fee,
-                    recipient:         address(this),
-                    amountIn:          amountIn,
-                    amountOutMinimum:  amountOutMin,
-                    sqrtPriceLimitX96: 0
-                });
-            amountOut = IUniswapV3Router(router).exactInputSingle(v3Params);
+            if (routerTypes[router] == RouterType.AerodromeSlipstream) {
+                IAerodromeSlipstreamRouter.ExactInputSingleParams memory slipstreamParams =
+                    IAerodromeSlipstreamRouter.ExactInputSingleParams({
+                        tokenIn:           tokenIn,
+                        tokenOut:          tokenOut,
+                        tickSpacing:       int24(fee),
+                        recipient:         address(this),
+                        deadline:          swapDeadline,
+                        amountIn:          amountIn,
+                        amountOutMinimum:  amountOutMin,
+                        sqrtPriceLimitX96: 0
+                    });
+                amountOut = IAerodromeSlipstreamRouter(router).exactInputSingle(slipstreamParams);
+            } else {
+                IUniswapV3Router.ExactInputSingleParams memory v3Params =
+                    IUniswapV3Router.ExactInputSingleParams({
+                        tokenIn:           tokenIn,
+                        tokenOut:          tokenOut,
+                        fee:               fee,
+                        recipient:         address(this),
+                        amountIn:          amountIn,
+                        amountOutMinimum:  amountOutMin,
+                        sqrtPriceLimitX96: 0
+                    });
+                amountOut = IUniswapV3Router(router).exactInputSingle(v3Params);
+            }
         } else if (routerTypes[router] == RouterType.AerodromeV2) {
             // Aerodrome V2 uses structured Route[] routes instead of plain address[] path
             Route[] memory routes = new Route[](path.length - 1);

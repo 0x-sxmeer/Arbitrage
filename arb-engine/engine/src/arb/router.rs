@@ -181,7 +181,15 @@ impl LiquidityGraph {
     ///
     /// Computes both directed edges (A→B and B→A) using a 1-unit probe swap.
     /// Edges with rate ≤ 0 or NaN are silently dropped.
-    pub fn upsert_pool(&mut self, pool: Pool) {
+    pub fn upsert_pool(&mut self, mut pool: Pool) {
+        // Aerodrome V2 volatile pools have dynamic fees (up to 1%).
+        // To prevent hallucinated profits and on-chain reverts, we conservatively assume 1%
+        if pool.dex == crate::pool::DexProtocol::UniswapV2 && pool.id.to_lowercase().contains("aerodrome") {
+            if pool.fee_bps != 1 {
+                pool.fee_bps = 300;
+            }
+        }
+
         // ── Minimum liquidity guard ───────────────────────────────────────────
         // Reject dust pools that cannot support a meaningful trade.
         // These cause repeated phantom high-impact BF cycles every block.
@@ -596,6 +604,7 @@ fn bellman_ford_from(
         let mut relaxed = false;
         for (eidx, edge) in graph.edges.iter().enumerate() {
             if edge.pool.last_updated_ts == 0 { continue; } // Skip stale placeholder pools
+            if edge.pool.fee_bps == 1 { continue; } // Skip Aerodrome V2 Stable pools (hallucinated arbs due to math mismatch)
 
             let u = match graph.token_index.get(&edge.token_in) {
                 Some(&i) => i,
@@ -829,7 +838,10 @@ fn reconstruct_and_evaluate(
                 None => return U256::zero(),
             }
         }
-        amount.checked_mul(scaling_factor).unwrap_or(U256::zero())
+        // Deduct 0.05% Aave V3 flash loan fee
+        let flash_loan_fee = amount_wei.checked_div(scaling_factor).unwrap_or(U256::zero()) * U256::from(5) / U256::from(10000);
+        let final_amount = amount.saturating_sub(flash_loan_fee);
+        final_amount.checked_mul(scaling_factor).unwrap_or(U256::zero())
     };
 
     let optimal_amount_wei = match find_optimal_input(&sim_cycle, lower_bound, upper_bound, gas_cost_scaled) {

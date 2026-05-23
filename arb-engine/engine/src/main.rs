@@ -328,6 +328,7 @@ async fn warm_up_and_sync_pools_from_postgres(
 
                     let mut is_dust = false;
                     let usdbc = "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca".to_string();
+                    let aero = "0x940181a94a35a4569e4529a3cdfb74e38fd98631".to_string();
                     
                     // Filter out pools with < $50,000 liquidity
                     if t0 == weth && state.reserve_a < primitive_types::U256::from(15_000_000_000_000_000_000u128) { is_dust = true; }
@@ -341,6 +342,9 @@ async fn warm_up_and_sync_pools_from_postgres(
 
                     if t0 == cbbtc && state.reserve_a < primitive_types::U256::from(50_000_000u128) { is_dust = true; }
                     if t1 == cbbtc && state.reserve_b < primitive_types::U256::from(50_000_000u128) { is_dust = true; }
+
+                    if t0 == aero && state.reserve_a < primitive_types::U256::from(40_000_000_000_000_000_000_000u128) { is_dust = true; }
+                    if t1 == aero && state.reserve_b < primitive_types::U256::from(40_000_000_000_000_000_000_000u128) { is_dust = true; }
 
                     let is_empty = match p.pool_type {
                         crate::pool::PoolType::ConcentratedLiquidity => state.sqrt_price_x96.is_none() || state.liquidity.map_or(true, |l| l < 1_000_000) || is_dust,

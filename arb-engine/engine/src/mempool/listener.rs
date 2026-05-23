@@ -542,7 +542,7 @@ impl MempoolListener {
                                     }
                                 }
 
-                                let mut opportunities = {
+                                let opportunities = {
                                     let graph = graph_arc.read().await;
                                     let mut opps = Vec::new();
                                     for start_token in start_tokens {

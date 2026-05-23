@@ -405,22 +405,28 @@ impl EvmAdapter {
         let buy_router  = Address::from_str(buy_router_str).context("Invalid buy router address")?;
         let sell_router = Address::from_str(sell_router_str).context("Invalid sell router address")?;
 
-        // Determine if each leg is V3 or V2
-        let buy_is_v3 = {
-            let lower = arb.route[0].dex.to_lowercase();
-            lower.contains("v3") || lower.contains("concentrated") || lower.contains("universal")
+        let is_v3 = |dex: &str| -> bool {
+            let lower = dex.to_lowercase();
+            lower.contains("v3") 
+                || lower.contains("concentrated") 
+                || lower.contains("universal") 
+                || lower.contains("slipstream") 
+                || (lower.contains("aerodrome") && !lower.contains("v2"))
         };
-        let sell_is_v3 = {
-            let lower = arb.route[1].dex.to_lowercase();
-            lower.contains("v3") || lower.contains("concentrated") || lower.contains("universal")
-        };
+        let buy_is_v3 = is_v3(&arb.route[0].dex);
+        let sell_is_v3 = is_v3(&arb.route[1].dex);
 
-        // Normalize fee units: handle both mempool basis points (e.g. 5, 30)
-        // and main.rs initialized Uniswap V3 units (e.g. 500, 3000)
-        let normalize_fee = |fee: u32, is_v3: bool| -> u32 {
+        let normalize_fee = |fee: u32, is_v3: bool, dex: &str| -> u32 {
             if !is_v3 {
-                return 0;
+                return fee;
             }
+            
+            let lower_dex = dex.to_lowercase();
+            if lower_dex.contains("slipstream") || (lower_dex.contains("aerodrome") && !lower_dex.contains("v2")) {
+                // Slipstream router expects tickSpacing directly as the fee parameter
+                return fee;
+            }
+            
             match fee {
                 1 => 100,
                 5 => 500,
@@ -439,8 +445,8 @@ impl EvmAdapter {
             }
         };
 
-        let buy_fee_units  = normalize_fee(arb.route[0].fee_bps, buy_is_v3);
-        let sell_fee_units = normalize_fee(arb.route[1].fee_bps, sell_is_v3);
+        let buy_fee_units  = normalize_fee(arb.route[0].fee_bps, buy_is_v3, &arb.route[0].dex);
+        let sell_fee_units = normalize_fee(arb.route[1].fee_bps, sell_is_v3, &arb.route[1].dex);
         let buy_fee  = alloy::primitives::Uint::<24, 1>::from(buy_fee_units);
         let sell_fee = alloy::primitives::Uint::<24, 1>::from(sell_fee_units);
 

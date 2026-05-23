@@ -47,7 +47,7 @@ contract SetupRouters is Script {
 
         _whitelist(arb, UNISWAP_V3_ROUTER, "Uniswap V3 SwapRouter02", 0);
         _whitelist(arb, AERODROME_V2,      "Aerodrome V2 Router", 1); // RouterType.AerodromeV2
-        _whitelist(arb, AERODROME_SLIPSTREAM, "Aerodrome Slipstream Router", 0);
+        _whitelist(arb, AERODROME_SLIPSTREAM, "Aerodrome Slipstream Router", 2); // RouterType.AerodromeSlipstream
         _whitelist(arb, UNISWAP_UNIV,      "Uniswap Universal Router", 0);
 
         vm.stopBroadcast();

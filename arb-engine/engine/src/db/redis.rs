@@ -204,7 +204,7 @@ impl RedisCache {
 
     /// Mark an opportunity as seen. Returns true if this is the first time
     /// (SETNX semantics — set only if not exists).
-    pub async fn mark_opportunity_seen(&self, opportunity_id: &str) -> Result<bool> {
+    pub async fn mark_opportunity_seen(&self, _opportunity_id: &str) -> Result<bool> {
         Ok(true) // DISABLED DEDUPLICATION FOR TESTING
     }
 
