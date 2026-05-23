@@ -537,13 +537,50 @@ struct WorkerCtx {
 
 impl WorkerCtx {
     async fn process_payload(&self, payload: RawTxPayload) {
+        self.metrics.inc_txs_seen();
+
         // Broaden execution decoding criteria to catch non-standard contract proxy trades
         let decoded = match decode_swap(&payload.input, &payload.to_addr) {
             Some(d) => d,
-            None => return,
+            None => {
+                // Populate mempool dashboard with pending tx
+                if let Ok(mut txs) = self.metrics.recent_mempool_txs.try_write() {
+                    let entry = serde_json::json!({
+                        "id":      format!("{}-{}", payload.tx_hash, payload.tx_count),
+                        "hash":    &payload.tx_hash[..12],
+                        "type":    "PENDING",
+                        "dex":     "UNK",
+                        "token":   "-",
+                        "size":    "-",
+                        "color":   "#64748B",
+                        "gasGwei": format!("{:.2}", payload.gas_price_gwei),
+                        "ts":      chrono::Utc::now().timestamp_millis(),
+                    });
+                    txs.push_front(entry);
+                    if txs.len() > 50 { txs.pop_back(); }
+                }
+                return;
+            }
         };
 
         self.metrics.inc_txs_decoded();
+
+        let dex = classify_router(&payload.to_addr);
+        if let Ok(mut txs) = self.metrics.recent_mempool_txs.try_write() {
+            let entry = serde_json::json!({
+                "id":      format!("{}-{}", payload.tx_hash, payload.tx_count),
+                "hash":    &payload.tx_hash[..12],
+                "type":    "SWAP",
+                "dex":     format!("{:?}", dex),
+                "token":   "ERC20",
+                "size":    "-",
+                "color":   "#00FFD1",
+                "gasGwei": format!("{:.2}", payload.gas_price_gwei),
+                "ts":      chrono::Utc::now().timestamp_millis(),
+            });
+            txs.push_front(entry);
+            if txs.len() > 50 { txs.pop_back(); }
+        }
 
         let token_in  = decoded.token_in.to_string().to_lowercase();
         let token_out = decoded.token_out.to_string().to_lowercase();
