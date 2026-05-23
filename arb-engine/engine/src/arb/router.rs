@@ -190,9 +190,10 @@ impl LiquidityGraph {
     ///
     /// Computes both directed edges (A→B and B→A) using a 1-unit probe swap.
     /// Edges with rate ≤ 0 or NaN are silently dropped.
-    pub fn upsert_pool(&mut self, mut pool: Pool) {
+    /// Returns true if the pool was inserted, false if it was skipped (e.g. dust/empty).
+    pub fn upsert_pool(&mut self, mut pool: Pool) -> bool {
         if self.blacklisted_pools.contains(&pool.id) {
-            return;
+            return false;
         }
 
         // Aerodrome V2 volatile pools have dynamic fees (up to 1%).
@@ -227,7 +228,7 @@ impl LiquidityGraph {
         };
         if min_v2_reserve {
             debug!(pool_id = %pool.id, "upsert_pool: skipping dust/empty pool");
-            return;
+            return false;
         }
 
         let pool_arc = Arc::new(pool);
@@ -279,7 +280,8 @@ impl LiquidityGraph {
             self.changed_tokens.insert(idx_b);
         }
 
-        self.pools.insert(pool_arc.id.clone(), pool_arc);
+        self.pools.insert(pool_arc.id.clone(), Arc::clone(&pool_arc));
+        true
     }
 
     pub fn remove_pool(&mut self, pool_id: &str) {

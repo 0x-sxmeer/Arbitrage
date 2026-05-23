@@ -173,22 +173,20 @@ impl ArbitrageOpportunity {
             * self.gas_price_gwei * 1e-9; // ETH
         let gas_cost_token = gas_cost_eth * eth_price_usd / token_price;
 
-        let swap_fees_token = self.total_swap_fees_wei.to_string().parse::<f64>().unwrap_or(0.0) / scale;
-
-        let impact_loss_token = input_amt * self.price_impact_bps as f64 / 10_000.0;
-
+        // Note: swap_fees_token and impact_loss_token are already accounted for 
+        // inside the AMM simulation (gross_out). We ONLY deduct external costs here.
         let aave_fee_token = input_amt * aave_fee_bps as f64 / 10_000.0;
 
+        // CORRECTED NEV CALCULATION
         let nev_token = gross_profit_token
             - gas_cost_token
-            - swap_fees_token
-            - impact_loss_token
             - aave_fee_token;
 
         let nev_usd = nev_token * token_price;
 
-        // PGA: Calculate optimal gas price (bribe) to outbid competitors while hitting minimum profit
-        let max_gas_spend_usd = (gross_profit_token - swap_fees_token - impact_loss_token - aave_fee_token) * token_price - min_profit_usd;
+        // CORRECTED PGA GAS (Bribe) CALCULATION
+        // Max USD we can spend on gas while preserving the minimum required profit
+        let max_gas_spend_usd = (gross_profit_token - aave_fee_token) * token_price - min_profit_usd;
         if max_gas_spend_usd > 0.0 && self.estimated_gas_units > 0 {
             let max_gas_spend_eth = max_gas_spend_usd / eth_price_usd;
             self.optimal_gas_price_gwei = max_gas_spend_eth * 1e9 / (self.estimated_gas_units as f64);

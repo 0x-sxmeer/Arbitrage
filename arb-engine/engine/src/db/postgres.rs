@@ -182,6 +182,16 @@ impl PostgresStore {
         Ok(rows.into_iter().map(|r| r.to_pool()).collect())
     }
 
+    /// Delete a pool from the registry (e.g. if it has no liquidity or is toxic).
+    pub async fn delete_pool(&self, pool_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pool_registry WHERE pool_id = $1")
+            .bind(pool_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to delete pool")?;
+        Ok(())
+    }
+
     /// Pool count (for startup logging).
     pub async fn pool_count(&self) -> i64 {
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pool_registry")
