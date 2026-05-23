@@ -598,7 +598,11 @@ impl MempoolListener {
                                             });
                                         }
                                         Err(e) => {
-                                            warn!(id = %opp.id, error = %e, "❌ Simulation failed");
+                                            warn!(id = %opp.id, error = %e, "⚠ Block simulation failed — blacklisting toxic pools");
+                                            let mut graph_lock = graph_arc.write().await;
+                                            for step in &opp.route {
+                                                graph_lock.blacklist_pool(&step.pool_id);
+                                            }
                                         }
                                     }
                                 }
@@ -1109,7 +1113,11 @@ impl WorkerCtx {
                 match adapter.simulate_arbitrage(&opp).await {
                     Ok(()) => info!(id = %opp.id, "✓ Simulation passed"),
                     Err(e) => {
-                        warn!(id = %opp.id, error = %e, "⚠ Simulation failed — skipping");
+                        warn!(id = %opp.id, error = %e, "⚠ Simulation failed — blacklisting toxic pools in this route");
+                        let mut graph = self.graph.write().await;
+                        for step in &opp.route {
+                            graph.blacklist_pool(&step.pool_id);
+                        }
                         continue;
                     }
                 }

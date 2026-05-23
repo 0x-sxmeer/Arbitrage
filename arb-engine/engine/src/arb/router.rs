@@ -139,6 +139,8 @@ pub struct LiquidityGraph {
     pub changed_tokens: std::collections::HashSet<usize>,
     /// Token decimals cache: address → decimals (for decimal-aware probing).
     token_decimals: HashMap<String, u8>,
+    /// Pools that failed simulation and should be permanently ignored.
+    blacklisted_pools: std::collections::HashSet<String>,
 }
 
 impl Default for LiquidityGraph {
@@ -154,6 +156,7 @@ impl LiquidityGraph {
             pools:          HashMap::new(),
             changed_tokens: std::collections::HashSet::new(),
             token_decimals: HashMap::new(),
+            blacklisted_pools: std::collections::HashSet::new(),
         }
     }
 
@@ -175,6 +178,12 @@ impl LiquidityGraph {
         self.changed_tokens.clear();
     }
 
+    /// Permanently blacklist a pool (e.g. if it causes simulation reverts).
+    pub fn blacklist_pool(&mut self, pool_id: &str) {
+        self.blacklisted_pools.insert(pool_id.to_string());
+        self.edges.retain(|e| e.pool.id != pool_id);
+    }
+
     // ── Pool management ───────────────────────────────────────────────────────
 
     /// Insert or update a pool.  Replaces existing edges for this pool_id.
@@ -182,6 +191,10 @@ impl LiquidityGraph {
     /// Computes both directed edges (A→B and B→A) using a 1-unit probe swap.
     /// Edges with rate ≤ 0 or NaN are silently dropped.
     pub fn upsert_pool(&mut self, mut pool: Pool) {
+        if self.blacklisted_pools.contains(&pool.id) {
+            return;
+        }
+
         // Aerodrome V2 volatile pools have dynamic fees (up to 1%).
         // To prevent hallucinated profits and on-chain reverts, we conservatively assume 1%
         if pool.dex == crate::pool::DexProtocol::UniswapV2 && pool.id.to_lowercase().contains("aerodrome") {
