@@ -342,7 +342,7 @@ contract AtomicArbV2 is
                 mstore(ptr, 0x08c379a000000000000000000000000000000000000000000000000000000000)
                 mstore(add(ptr, 0x04), 0x20)
                 mstore(add(ptr, 0x24), 18)
-                mstore(add(ptr, 0x44), 0x56323a206e6f742070726f66697461626c6500000000000000000000000000)
+                mstore(add(ptr, 0x44), 0x56323a206e6f742070726f66697461626c650000000000000000000000000000)
                 revert(ptr, 0x64)
             }
             netProfit := sub(runningAmount, repayAmount)
@@ -398,8 +398,8 @@ contract AtomicArbV2 is
                 let ptr := mload(0x40)
                 mstore(ptr, 0x08c379a000000000000000000000000000000000000000000000000000000000)
                 mstore(add(ptr, 0x04), 0x20)
-                mstore(add(ptr, 0x24), 22)
-                mstore(add(ptr, 0x44), 0x56323a20726f75746572206e6f742077686974656c697374656400000000000000)
+                mstore(add(ptr, 0x24), 26)
+                mstore(add(ptr, 0x44), 0x56323a20726f75746572206e6f742077686974656c6973746564000000000000)
                 revert(ptr, 0x64)
             }
         }
